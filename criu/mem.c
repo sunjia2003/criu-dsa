@@ -5,6 +5,11 @@
 #include <fcntl.h>
 #include <sys/syscall.h>
 #include <sys/prctl.h>
+#include <dirent.h>
+#include <limits.h>
+#include <stdlib.h>
+#include <string.h>
+#include <linux/memfd.h>
 
 #include "types.h"
 #include "cr_options.h"
@@ -30,6 +35,7 @@
 #include "pagemap-cache.h"
 #include "fault-injection.h"
 #include "prctl.h"
+#include "memfd.h"
 #include "compel/infect-util.h"
 #include "pidfd-store.h"
 
@@ -325,10 +331,288 @@ prep_dump_pages_args(struct parasite_ctl *ctl, struct vm_area_list *vma_area_lis
 	return args;
 }
 
+#define DSA_SHARED_BUF_SIZE	(2U * 1024U * 1024U)
+
+static bool dsa_dump_enabled(void)
+{
+	const char *env;
+
+	env = getenv("CRIU_DSA_DUMP");
+	if (!env)
+		return false;
+
+	return atoi(env) > 0;
+}
+
+static int dsa_open_workqueues(int *wq_fds, int max_wq)
+{
+	DIR *dir;
+	struct dirent *de;
+	int nr = 0;
+	char path[128];
+	int fd;
+
+	dir = opendir("/dev/dsa");
+	if (!dir)
+		return 0;
+
+	while ((de = readdir(dir)) && nr < max_wq) {
+		int n;
+
+		if (strncmp(de->d_name, "wq", 2))
+			continue;
+
+		n = snprintf(path, sizeof(path), "/dev/dsa/%.*s",
+			     (int)(sizeof(path) - sizeof("/dev/dsa/")), de->d_name);
+		if (n < 0 || n >= sizeof(path))
+			continue;
+
+		fd = open(path, O_RDWR | O_CLOEXEC);
+		if (fd < 0)
+			continue;
+
+		wq_fds[nr++] = fd;
+	}
+
+	closedir(dir);
+	return nr;
+}
+
+static int dsa_write_to_pipe(int pipe_fd, const void *buf, size_t len)
+{
+	const char *p = buf;
+	size_t done = 0;
+	ssize_t wr;
+
+	while (done < len) {
+		wr = write(pipe_fd, p + done, len - done);
+		if (wr < 0) {
+			if (errno == EINTR)
+				continue;
+			pr_perror("Can't write DSA buffer into page pipe");
+			return -1;
+		}
+		if (!wr) {
+			pr_err("Pipe closed unexpectedly while writing DSA buffer\n");
+			return -1;
+		}
+
+		done += wr;
+	}
+
+	return 0;
+}
+
+/*
+ * Return values:
+ *  0  - DSA path used successfully.
+ *  1  - DSA path unavailable, caller should use legacy drain path.
+ * <0  - DSA path selected but failed.
+ */
+static int drain_pages_dsa(struct page_pipe *pp, struct parasite_ctl *ctl,
+			   struct parasite_dump_pages_args *args)
+{
+	struct page_pipe_buf *ppb;
+	int ret = 0;
+	bool wrote_data = false;
+	int wq_fds[DSA_DUMP_MAX_WQ];
+	int wq_count;
+	int i;
+	int shared_fd = -1;
+	void *shared_buf = MAP_FAILED;
+	unsigned int seg_off;
+	unsigned int seg_pos;
+	unsigned int batch_nr;
+	unsigned int j;
+	unsigned int fill_off;
+	unsigned int fill_pos;
+	u64 batch_src_addr[DSA_DUMP_BATCH_SIZE];
+	u32 batch_copy_len[DSA_DUMP_BATCH_SIZE];
+	size_t batch_bytes;
+	size_t rem;
+	size_t max_chunk;
+	size_t len;
+	unsigned long args_sz;
+	struct parasite_dsa_dump_pages_args *dargs;
+	struct dsa_dump_descriptor *ddesc;
+	struct iovec *src_iov;
+	int htlb_flags;
+
+	for (i = 0; i < DSA_DUMP_MAX_WQ; i++)
+		wq_fds[i] = -1;
+
+	if (!dsa_dump_enabled())
+		return 1;
+
+	wq_count = dsa_open_workqueues(wq_fds, DSA_DUMP_MAX_WQ);
+	if (wq_count <= 0) {
+		pr_info("DSA dump requested, but no /dev/dsa workqueue is available\n");
+		return 1;
+	}
+
+	htlb_flags = MFD_CLOEXEC | MFD_HUGETLB | MFD_HUGE_2MB;
+	shared_fd = memfd_create("criu_dsa_dump", htlb_flags);
+	if (shared_fd < 0)
+		shared_fd = memfd_create("criu_dsa_dump", MFD_CLOEXEC);
+	if (shared_fd < 0) {
+		pr_perror("Can't create DSA shared memfd, fallback to legacy path");
+		ret = 1;
+		goto out;
+	}
+
+	if (ftruncate(shared_fd, DSA_SHARED_BUF_SIZE)) {
+		pr_perror("Can't resize DSA shared memfd, fallback to legacy path");
+		ret = 1;
+		goto out;
+	}
+
+	shared_buf = mmap(NULL, DSA_SHARED_BUF_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, shared_fd, 0);
+	if (shared_buf == MAP_FAILED) {
+		pr_perror("Can't map DSA shared memfd, fallback to legacy path");
+		ret = 1;
+		goto out;
+	}
+
+	debug_show_page_pipe(pp);
+
+	list_for_each_entry(ppb, &pp->bufs, l) {
+		args->nr_segs = ppb->nr_segs;
+		args->nr_pages = ppb->pages_in;
+		src_iov = pargs_iovs(args) + args->off;
+		seg_off = 0;
+		seg_pos = 0;
+
+		pr_debug("PPB(DSA): %ld pages %d segs %u pipe %d off\n",
+			 args->nr_pages, args->nr_segs, ppb->pipe_size, args->off);
+
+		while (seg_off < args->nr_segs) {
+			batch_nr = 0;
+			batch_bytes = 0;
+			fill_off = seg_off;
+			fill_pos = seg_pos;
+
+			while (batch_nr < DSA_DUMP_BATCH_SIZE && fill_off < args->nr_segs) {
+				while (fill_off < args->nr_segs && fill_pos >= src_iov[fill_off].iov_len) {
+					fill_off++;
+					fill_pos = 0;
+				}
+				if (fill_off >= args->nr_segs)
+					break;
+
+				rem = src_iov[fill_off].iov_len - fill_pos;
+				max_chunk = DSA_SHARED_BUF_SIZE - batch_bytes;
+				if (!max_chunk)
+					break;
+
+				len = rem;
+				if (len > (size_t)UINT_MAX)
+					len = (size_t)UINT_MAX;
+				if (len > max_chunk)
+					len = max_chunk;
+				if (!len)
+					break;
+
+				batch_src_addr[batch_nr] = (u64)(unsigned long)
+					((char *)src_iov[fill_off].iov_base + fill_pos);
+				batch_copy_len[batch_nr] = (u32)len;
+				batch_bytes += len;
+				fill_pos += len;
+				batch_nr++;
+			}
+
+			if (!batch_nr) {
+				pr_err("Single iovec is larger than DSA shared buffer\n");
+				ret = -1;
+				goto out;
+			}
+
+			args_sz = sizeof(*dargs) + batch_nr * sizeof(struct dsa_dump_descriptor);
+			dargs = xzalloc(args_sz);
+			if (!dargs) {
+				ret = -1;
+				goto out;
+			}
+
+			dargs->shared_buf_addr = 0;
+			dargs->shared_buf_size = DSA_SHARED_BUF_SIZE;
+			dargs->nr_descriptors = batch_nr;
+			dargs->buf_write_offset = 0;
+			while (fill_off < args->nr_segs && fill_pos >= src_iov[fill_off].iov_len) {
+				fill_off++;
+				fill_pos = 0;
+			}
+
+			dargs->is_last_batch = (fill_off >= args->nr_segs);
+			dargs->wq_count = wq_count;
+			dargs->use_shared_buf_fd = 1;
+			dargs->use_wq_fd = 1;
+			dargs->wq_policy = DSA_WQ_POLICY_LPT;
+
+			ddesc = pdpa_descriptors(dargs);
+			for (j = 0; j < batch_nr; j++) {
+				ddesc[j].src_addr = batch_src_addr[j];
+				ddesc[j].copy_len = batch_copy_len[j];
+			}
+
+			ret = parasite_dsa_dump_pages_seized(ctl, dargs, shared_fd, wq_fds, wq_count);
+			if (ret) {
+				pr_err("DSA page dump RPC failed\n");
+				xfree(dargs);
+				goto out;
+			}
+
+			if (dargs->total_copied != batch_bytes || dargs->new_buf_offset != batch_bytes) {
+				pr_err("DSA copied size mismatch: expected %zu got %u/%u\n",
+				       batch_bytes, dargs->total_copied, dargs->new_buf_offset);
+				xfree(dargs);
+				ret = -1;
+				goto out;
+			}
+
+			if (dsa_write_to_pipe(ppb->p[1], shared_buf, batch_bytes)) {
+				xfree(dargs);
+				ret = -1;
+				goto out;
+			}
+			wrote_data = true;
+
+			xfree(dargs);
+			seg_off = fill_off;
+			seg_pos = fill_pos;
+		}
+
+		args->off += args->nr_segs;
+	}
+
+	ret = 0;
+out:
+	if (shared_buf != MAP_FAILED)
+		munmap(shared_buf, DSA_SHARED_BUF_SIZE);
+	if (shared_fd >= 0)
+		close(shared_fd);
+
+	for (i = 0; i < DSA_DUMP_MAX_WQ; i++) {
+		if (wq_fds[i] >= 0)
+			close(wq_fds[i]);
+	}
+
+	if (ret < 0 && !wrote_data)
+		return 1;
+
+	return ret;
+}
+
 static int drain_pages(struct page_pipe *pp, struct parasite_ctl *ctl, struct parasite_dump_pages_args *args)
 {
 	struct page_pipe_buf *ppb;
 	int ret = 0;
+	int dsa_ret;
+
+	dsa_ret = drain_pages_dsa(pp, ctl, args);
+	if (dsa_ret == 0)
+		return 0;
+	if (dsa_ret < 0)
+		return dsa_ret;
 
 	debug_show_page_pipe(pp);
 

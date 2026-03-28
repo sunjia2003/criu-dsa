@@ -37,7 +37,7 @@ enum {
 	PARASITE_CMD_CHECK_VDSO_MARK,
 	PARASITE_CMD_CHECK_AIOS,
 	PARASITE_CMD_DUMP_CGROUP,
-	PARASITE_CMD_DSA_COPY,
+	PARASITE_CMD_DSA_DUMP_PAGES,
 
 	PARASITE_CMD_MAX,
 };
@@ -256,25 +256,53 @@ struct parasite_dump_cgroup_args {
 	char thread_cgrp[32];
 };
 
-struct parasite_dsa_copy_args {
-	u64 src_addr;
-	u32 copy_len;
-	u32 use_wq_fd;
-	u32 prefer_hugetlb;
-	char wq_path[64];
+/* DSA dump pages batch structure */
+#define DSA_DUMP_BATCH_SIZE    128
+#define DSA_DUMP_MAX_WQ        16
 
-	s32 op_ret;
-	s32 stage;
-	s32 detail;
-	u32 dsa_status;
-	u32 bytes_completed;
-	u32 used_hugetlb;
-	u32 checksum_before;
-	u32 checksum_after;
-	u64 fault_addr;
-	u32 comp_result;
+enum dsa_wq_policy {
+	DSA_WQ_POLICY_LPT = 0,
+	DSA_WQ_POLICY_RR = 1,
 };
+
+struct dsa_dump_descriptor {
+	u64 src_addr;		/* Source address in target process */
+	u32 copy_len;		/* Length to copy */
+	u32 reserved0;
+};
+
+struct parasite_dsa_dump_pages_args {
+	/* Input from CRIU */
+	u64 shared_buf_addr;	/* Shared buffer address in parasite */
+	u32 shared_buf_size;	/* Total shared buffer size */
+	u32 nr_descriptors;	/* Number of descriptors in this batch */
+	u32 buf_write_offset;	/* Current buffer write position */
+	u32 is_last_batch;	/* Is this the last batch */
+	u32 wq_count;		/* Number of available DSA workqueues */
+	u32 use_shared_buf_fd;  /* Shared buffer is passed as FD and mmap-ed in parasite */
+	u32 use_wq_fd;		/* Use FD instead of path */
+	u32 wq_policy;		/* enum dsa_wq_policy, default LPT */
+	char wq_paths[DSA_DUMP_MAX_WQ][64];  /* WQ paths or empty if using FD */
+
+	/* Output from PARASITE */
+	s32 op_ret;		/* Operation result (0 = success) */
+	u32 total_copied;	/* Total bytes copied in this batch */
+	u32 completed_count;	/* Number of completed descriptors */
+	s32 failed_idx;		/* Failed descriptor index (-1 = all success) */
+	u32 failed_status;	/* Failed descriptor DSA status */
+	u32 new_buf_offset;	/* New buffer write offset after this batch */
+
+	/* Descriptor array follows after this structure */
+	/* struct dsa_dump_descriptor descriptors[nr_descriptors]; */
+};
+
+static inline struct dsa_dump_descriptor *
+pdpa_descriptors(struct parasite_dsa_dump_pages_args *a)
+{
+	return (struct dsa_dump_descriptor *)(a + 1);
+}
 
 #endif /* !__ASSEMBLY__ */
 
 #endif /* __CR_PARASITE_H__ */
+

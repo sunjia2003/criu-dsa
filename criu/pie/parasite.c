@@ -126,197 +126,358 @@ static inline void dsa_prefault_range(uint8_t *buf, uint32_t len)
 	(void)sink;
 }
 
-static uint32_t dsa_checksum32(const uint8_t *buf, uint32_t len)
+
+/*
+ * Batch DSA dump pages to shared buffer
+ * This function performs bulk copy of memory pages using DSA hardware acceleration
+ * to a shared memory buffer managed by CRIU.
+ */
+static int parasite_dsa_dump_pages(struct parasite_dsa_dump_pages_args *a)
 {
+	int wq_fds[DSA_DUMP_MAX_WQ];
+	int use_portal[DSA_DUMP_MAX_WQ];
+	unsigned long portal_mask[DSA_DUMP_MAX_WQ];
+	unsigned long portal_offset[DSA_DUMP_MAX_WQ];
+	void *portals[DSA_DUMP_MAX_WQ];
+	uint32_t active_wq_idx[DSA_DUMP_MAX_WQ];
+	uint64_t active_wq_load[DSA_DUMP_MAX_WQ];
+	uint32_t lpt_order[DSA_DUMP_BATCH_SIZE];
+	uint32_t submitted_idx[DSA_DUMP_BATCH_SIZE];
+	uint32_t active_wq_count = 0;
 	uint32_t i;
-	uint32_t acc = 0;
+	uint32_t j;
+	uint32_t k;
+	uint32_t desc_idx;
+	uint32_t order_cnt;
+	uint32_t wq_sel;
+	uint32_t total_size = 0;
+	uint8_t *shared_buf;
+	uint32_t buf_write_offset;
+	struct dsa_dump_descriptor *descriptors;
+	struct dsa_hw_desc dsa_descs[DSA_DUMP_BATCH_SIZE];
+	volatile struct dsa_completion_record dsa_comps[DSA_DUMP_BATCH_SIZE];
+	uint32_t submitted = 0;
+	uint32_t completed = 0;
+	uint32_t timeout_count = 0;
+	const uint32_t max_timeout_retries = 1000000;  /* Prevent infinite loops */
+	uint8_t comp_status;
+	uint8_t comp_code;
+	void *portal_va;
+	int tsock;
+	int shared_buf_fd = -1;
+	void *shared_map = (void *)-1;
 
-	for (i = 0; i < len; ++i)
-		acc = (acc * 16777619u) ^ buf[i];
-
-	return acc;
-}
-
-static int parasite_dsa_copy(struct parasite_dsa_copy_args *a)
-{
-	int wq_fd = -1;
-	int memfd = -1;
-	int use_portal = 0;
-	uint8_t *src;
-	uint8_t *dst = (uint8_t *)-1;
-	unsigned long map_len;
-	unsigned long portal_mask = 0;
-	unsigned long portal_offset = 0;
-	void *portal = (void *)-1;
-	struct dsa_hw_desc desc __attribute__((aligned(64)));
-	volatile struct dsa_completion_record comp __attribute__((aligned(32)));
-	uint32_t i;
-
+	/* Initialize output fields */
 	a->op_ret = -1;
-	a->stage = 0;
-	a->detail = 0;
-	a->dsa_status = 0;
-	a->bytes_completed = 0;
-	a->used_hugetlb = 0;
-	a->checksum_before = 0;
-	a->checksum_after = 0;
-	a->fault_addr = 0;
-	a->comp_result = 0;
+	a->total_copied = 0;
+	a->completed_count = 0;
+	a->failed_idx = -1;
+	a->failed_status = 0;
+	a->new_buf_offset = a->buf_write_offset;
 
-	if (!a->src_addr || !a->copy_len || !a->wq_path[0]) {
-		a->stage = 1;
+	/* Validate input parameters */
+	if ((!a->use_shared_buf_fd && !a->shared_buf_addr) || !a->shared_buf_size || !a->nr_descriptors ||
+	    a->nr_descriptors > DSA_DUMP_BATCH_SIZE || !a->wq_count ||
+	    a->wq_count > DSA_DUMP_MAX_WQ || a->buf_write_offset >= a->shared_buf_size) {
 		a->op_ret = -EINVAL;
 		return 0;
 	}
 
+	if (a->use_shared_buf_fd) {
+		tsock = parasite_get_rpc_sock();
+		shared_buf_fd = recv_fd(tsock);
+		if (shared_buf_fd < 0) {
+			a->op_ret = -EIO;
+			return 0;
+		}
+
+		shared_map = (void *)sys_mmap(NULL, a->shared_buf_size,
+					     PROT_READ | PROT_WRITE,
+					     MAP_SHARED | MAP_POPULATE, shared_buf_fd, 0);
+		if ((long)shared_map < 0)
+			shared_map = (void *)sys_mmap(NULL, a->shared_buf_size,
+						     PROT_READ | PROT_WRITE,
+						     MAP_SHARED, shared_buf_fd, 0);
+
+		if ((long)shared_map < 0) {
+			a->op_ret = -ENOMEM;
+			goto out_cleanup;
+		}
+
+		shared_buf = (uint8_t *)shared_map;
+	} else {
+		shared_buf = (uint8_t *)(unsigned long)a->shared_buf_addr;
+	}
+
+	buf_write_offset = a->buf_write_offset;
+	descriptors = pdpa_descriptors(a);
+
+	/* Initialize all WQ pointers */
+	for (i = 0; i < a->wq_count; i++) {
+		wq_fds[i] = -1;
+		use_portal[i] = 0;
+		portal_mask[i] = 0;
+		portal_offset[i] = 0;
+		portals[i] = (void *)-1;
+	}
+
+	/* Acquire WQ file descriptors */
 	if (a->use_wq_fd) {
-		a->stage = 2;
-		wq_fd = recv_fd(parasite_get_rpc_sock());
-		if (wq_fd < 0) {
-			a->op_ret = wq_fd;
-			a->detail = wq_fd;
-			return 0;
-		}
-	} else {
-		a->stage = 3;
-		wq_fd = sys_open(a->wq_path, O_RDWR, 0);
-		if (wq_fd < 0) {
-			a->op_ret = wq_fd;
-			a->detail = wq_fd;
-			return 0;
-		}
-	}
-
-	a->stage = 4;
-	portal = (void *)sys_mmap(NULL, DSA_PORTAL_MAP_SIZE, PROT_WRITE, MAP_SHARED | MAP_POPULATE, wq_fd, 0);
-	if ((long)portal < 0)
-		portal = (void *)sys_mmap(NULL, DSA_PORTAL_MAP_SIZE, PROT_WRITE, MAP_SHARED, wq_fd, 0);
-
-	if ((long)portal >= 0) {
-		use_portal = 1;
-		portal_mask = ((unsigned long)portal) & ~0xfffUL;
-		portal_offset = ((unsigned long)portal) & 0xfffUL;
-	} else {
-		a->stage = 5;
-	}
-
-	a->stage = 6;
-	map_len = dsa_align_up(a->copy_len, HUGEPAGE_2MB_SIZE);
-	if (a->prefer_hugetlb) {
-		memfd = sys_memfd_create("criu_dsa_copy_huge", MFD_CLOEXEC | MFD_HUGETLB | MFD_HUGE_2MB);
-		if (memfd >= 0 && sys_fallocate(memfd, 0, 0, map_len) == 0) {
-			dst = (uint8_t *)sys_mmap(NULL, map_len, PROT_READ | PROT_WRITE, MAP_SHARED, memfd, 0);
-			if ((long)dst >= 0)
-				a->used_hugetlb = 1;
-		}
-	}
-
-	if ((long)dst < 0) {
-		a->stage = 7;
-		if (memfd >= 0) {
-			sys_close(memfd);
-			memfd = -1;
-		}
-		memfd = sys_memfd_create("criu_dsa_copy", MFD_CLOEXEC);
-		if (memfd < 0) {
-			a->op_ret = memfd;
-			a->detail = memfd;
-			goto out;
-		}
-		if (sys_fallocate(memfd, 0, 0, map_len) < 0) {
-			a->op_ret = (int)sys_fallocate(memfd, 0, 0, map_len);
-			a->detail = a->op_ret;
-			goto out;
-		}
-		dst = (uint8_t *)sys_mmap(NULL, map_len, PROT_READ | PROT_WRITE, MAP_SHARED, memfd, 0);
-		if ((long)dst < 0) {
-			a->op_ret = (int)(long)dst;
-			a->detail = (int)(long)dst;
-			goto out;
-		}
-		sys_madvise((unsigned long)dst, map_len, MADV_HUGEPAGE);
-	}
-
-	a->stage = 8;
-	src = (uint8_t *)(unsigned long)a->src_addr;
-	dsa_prefault_range(src, a->copy_len);
-	a->checksum_before = dsa_checksum32(src, a->copy_len);
-	dsa_memzero(dst, a->copy_len);
-
-	dsa_memzero(&desc, sizeof(desc));
-	dsa_memzero((void *)&comp, sizeof(comp));
-
-	desc.opcode = DSA_OPCODE_MEMMOVE;
-	desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
-	desc.src_addr = (uint64_t)(unsigned long)src;
-	desc.dst_addr = (uint64_t)(unsigned long)dst;
-	desc.xfer_size = a->copy_len;
-	desc.completion_addr = (uint64_t)(unsigned long)&comp;
-
-	a->stage = 9;
-	if (use_portal) {
-		for (i = 0; i < DSA_MAX_ENQ_RETRY; ++i) {
-			unsigned long off = ((unsigned long)portal_offset++ << 6) & 0xfffUL;
-			void *slot = (void *)(portal_mask | off);
-
-			if (dsa_enqcmd_local(slot, &desc) == 0)
+		/* Receive FDs from parent via RPC socket */
+		tsock = parasite_get_rpc_sock();
+		for (i = 0; i < a->wq_count; i++) {
+			wq_fds[i] = recv_fd(tsock);
+			if (wq_fds[i] < 0) {
+				/* Some WQs not available, continue with fewer */
+				if (i == 0) {
+					a->op_ret = -EIO;
+					goto out_cleanup;
+				}
+				a->wq_count = i;
 				break;
-			dsa_cpu_relax();
-		}
-	} else {
-		for (i = 0; i < DSA_MAX_ENQ_RETRY; ++i) {
-			long wr = sys_write(wq_fd, &desc, sizeof(desc));
-
-			if (wr == (long)sizeof(desc))
-				break;
-			dsa_cpu_relax();
-		}
-	}
-
-	if (i == DSA_MAX_ENQ_RETRY) {
-		a->stage = 10;
-		a->op_ret = -EAGAIN;
-		a->detail = a->op_ret;
-		goto out;
-	}
-
-	a->stage = 11;
-	for (i = 0; i < DSA_MAX_ENQ_RETRY; ++i) {
-		uint8_t st = comp.status;
-		uint8_t code = (uint8_t)DSA_COMP_STATUS(st);
-
-		if (st != 0 && code != DSA_COMP_NONE) {
-			a->stage = 12;
-			a->dsa_status = code;
-			a->bytes_completed = comp.bytes_completed;
-			a->fault_addr = comp.fault_addr;
-			a->comp_result = comp.result;
-			if (code == DSA_COMP_SUCCESS || code == DSA_COMP_SUCCESS_PRED) {
-				a->checksum_after = dsa_checksum32(dst, a->copy_len);
-				a->op_ret = (a->checksum_before == a->checksum_after) ? 0 : -EBADMSG;
-				a->detail = a->op_ret;
-			} else {
-				a->op_ret = -(int)code;
-				a->detail = a->op_ret;
 			}
-			goto out;
 		}
-		dsa_cpu_relax();
+	} else {
+		/* Open WQ paths directly */
+		for (i = 0; i < a->wq_count; i++) {
+			if (a->wq_paths[i][0]) {
+				wq_fds[i] = sys_open(a->wq_paths[i], O_RDWR, 0);
+				if (wq_fds[i] < 0) {
+					if (i == 0) {
+						a->op_ret = -EIO;
+						goto out_cleanup;
+					}
+					a->wq_count = i;
+					break;
+				}
+			}
+		}
 	}
 
-	a->stage = 13;
-	a->op_ret = -ETIMEDOUT;
-	a->detail = a->op_ret;
+	if (a->wq_count == 0) {
+		a->op_ret = -EIO;
+		goto out_cleanup;
+	}
 
-out:
-	if ((long)dst >= 0)
-		sys_munmap(dst, map_len);
-	if ((long)portal >= 0)
-		sys_munmap(portal, DSA_PORTAL_MAP_SIZE);
-	if (memfd >= 0)
-		sys_close(memfd);
-	if (wq_fd >= 0)
-		sys_close(wq_fd);
+	for (i = 0; i < a->wq_count; i++) {
+		if (wq_fds[i] >= 0)
+			active_wq_idx[active_wq_count++] = i;
+	}
+
+	for (i = 0; i < active_wq_count; i++)
+		active_wq_load[i] = 0;
+
+	if (!active_wq_count) {
+		a->op_ret = -EIO;
+		goto out_cleanup;
+	}
+
+	/* Map portals for all workqueues */
+	for (i = 0; i < a->wq_count; i++) {
+		if (wq_fds[i] < 0)
+			continue;
+
+		portal_va = (void *)sys_mmap(NULL, DSA_PORTAL_MAP_SIZE,
+					   PROT_WRITE, MAP_SHARED | MAP_POPULATE, wq_fds[i], 0);
+		if ((long)portal_va < 0) {
+			/* Retry without MAP_POPULATE */
+			portal_va = (void *)sys_mmap(NULL, DSA_PORTAL_MAP_SIZE,
+					    PROT_WRITE, MAP_SHARED, wq_fds[i], 0);
+		}
+
+		if ((long)portal_va >= 0) {
+			use_portal[i] = 1;
+			portals[i] = portal_va;
+			portal_mask[i] = ((unsigned long)portal_va) & ~0xfffUL;
+			portal_offset[i] = ((unsigned long)portal_va) & 0xfffUL;
+		}
+	}
+
+	/* Initialize descriptors - prepare all DSA move operations */
+	for (i = 0; i < a->nr_descriptors; i++) {
+		uint8_t *src = (uint8_t *)(unsigned long)descriptors[i].src_addr;
+		uint32_t copy_len = descriptors[i].copy_len;
+		uint8_t *dst = shared_buf + buf_write_offset;
+
+		/* Verify buffer space */
+		if (buf_write_offset + copy_len > a->shared_buf_size) {
+			a->op_ret = -ENOSPC;
+			goto out_cleanup;
+		}
+
+		/* Prefault source */
+		dsa_prefault_range(src, copy_len);
+
+		/* Prepare DSA descriptor */
+		dsa_memzero(&dsa_descs[i], sizeof(struct dsa_hw_desc));
+		dsa_descs[i].opcode = DSA_OPCODE_MEMMOVE;
+		dsa_descs[i].flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
+		dsa_descs[i].src_addr = (uint64_t)(unsigned long)src;
+		dsa_descs[i].dst_addr = (uint64_t)(unsigned long)dst;
+		dsa_descs[i].xfer_size = copy_len;
+		dsa_descs[i].completion_addr = (uint64_t)(unsigned long)&dsa_comps[i];
+
+		/* Zero destination */
+		dsa_memzero(dst, copy_len);
+		dsa_memzero((void *)&dsa_comps[i], sizeof(struct dsa_completion_record));
+
+		buf_write_offset += copy_len;
+		total_size += copy_len;
+	}
+
+	/* Submit all descriptors - load balance across available WQs */
+	submitted = 0;
+	order_cnt = a->nr_descriptors;
+	for (i = 0; i < order_cnt; i++)
+		lpt_order[i] = i;
+
+	if (a->wq_policy != DSA_WQ_POLICY_RR) {
+		for (i = 0; i < order_cnt; i++) {
+			uint32_t best = i;
+
+			for (j = i + 1; j < order_cnt; j++) {
+				if (descriptors[lpt_order[j]].copy_len > descriptors[lpt_order[best]].copy_len)
+					best = j;
+			}
+
+			if (best != i) {
+				uint32_t tmp = lpt_order[i];
+
+				lpt_order[i] = lpt_order[best];
+				lpt_order[best] = tmp;
+			}
+		}
+	}
+
+	for (k = 0; k < order_cnt; k++) {
+		uint32_t wq_idx;
+		uint32_t retry_count = 0;
+
+		desc_idx = lpt_order[k];
+
+		if (a->wq_policy == DSA_WQ_POLICY_RR) {
+			wq_sel = k % active_wq_count;
+		} else {
+			wq_sel = 0;
+			for (j = 1; j < active_wq_count; j++) {
+				if (active_wq_load[j] < active_wq_load[wq_sel])
+					wq_sel = j;
+			}
+		}
+
+		wq_idx = active_wq_idx[wq_sel];
+
+		if (!use_portal[wq_idx]) {
+			/* Use write() submission */
+			for (retry_count = 0; retry_count < DSA_MAX_ENQ_RETRY; retry_count++) {
+				long wr = sys_write(wq_fds[wq_idx], &dsa_descs[desc_idx], sizeof(struct dsa_hw_desc));
+				if (wr == (long)sizeof(struct dsa_hw_desc)) {
+					submitted_idx[submitted++] = desc_idx;
+					active_wq_load[wq_sel] += descriptors[desc_idx].copy_len;
+					break;
+				}
+				if (wr == -EAGAIN || wr == -EBUSY) {
+					dsa_cpu_relax();
+					continue;
+				}
+				if (wr < 0) {
+					a->failed_idx = desc_idx;
+					a->op_ret = (int)wr;
+					goto poll_completed;
+				}
+
+				a->failed_idx = desc_idx;
+				a->op_ret = -EIO;
+				goto poll_completed;
+			}
+
+			if (retry_count == DSA_MAX_ENQ_RETRY) {
+				a->failed_idx = desc_idx;
+				a->op_ret = -EAGAIN;
+				goto poll_completed;
+			}
+		} else {
+			/* Use portal enqcmd submission */
+			for (retry_count = 0; retry_count < DSA_MAX_ENQ_RETRY; retry_count++) {
+				unsigned long off = ((unsigned long)portal_offset[wq_idx]++ << 6) & 0xfffUL;
+				void *slot = (void *)(portal_mask[wq_idx] | off);
+
+				if (dsa_enqcmd_local(slot, &dsa_descs[desc_idx]) == 0) {
+					submitted_idx[submitted++] = desc_idx;
+					active_wq_load[wq_sel] += descriptors[desc_idx].copy_len;
+					break;
+				}
+				dsa_cpu_relax();
+			}
+			if (retry_count == DSA_MAX_ENQ_RETRY) {
+				a->failed_idx = desc_idx;
+				a->op_ret = -EAGAIN;
+				goto poll_completed;
+			}
+		}
+	}
+
+	/* Poll for completion of all submitted descriptors */
+poll_completed:
+	if (!submitted)
+		goto out_cleanup;
+
+	completed = 0;
+	timeout_count = 0;
+
+	for (k = 0; k < submitted; k++) {
+		desc_idx = submitted_idx[k];
+		timeout_count = 0;
+		while (1) {
+			comp_status = dsa_comps[desc_idx].status;
+			comp_code = (uint8_t)DSA_COMP_STATUS(comp_status);
+
+			if (comp_status != 0 && comp_code != DSA_COMP_NONE) {
+				/* Completion received */
+				a->completed_count++;
+
+				if (comp_code == DSA_COMP_SUCCESS || comp_code == DSA_COMP_SUCCESS_PRED) {
+					/* Success - verify destination */
+					completed++;
+				} else {
+					/* Hardware failure */
+					a->failed_idx = desc_idx;
+					a->failed_status = comp_code;
+					a->op_ret = -(int)comp_code;
+					goto out_cleanup;
+				}
+				break;
+			}
+
+			if (timeout_count++ >= max_timeout_retries) {
+				a->failed_idx = desc_idx;
+				a->op_ret = -ETIMEDOUT;
+				goto out_cleanup;
+			}
+			dsa_cpu_relax();
+		}
+	}
+
+	/* All successfully completed */
+	if (completed == submitted) {
+		a->op_ret = 0;
+		a->total_copied = total_size;
+		a->new_buf_offset = buf_write_offset;
+	}
+
+out_cleanup:
+	/* Clean up resources */
+	for (i = 0; i < a->wq_count; i++) {
+		if ((long)portals[i] >= 0)
+			sys_munmap(portals[i], DSA_PORTAL_MAP_SIZE);
+		if (wq_fds[i] >= 0)
+			sys_close(wq_fds[i]);
+	}
+
+	if ((long)shared_map >= 0)
+		sys_munmap(shared_map, a->shared_buf_size);
+	if (shared_buf_fd >= 0)
+		sys_close(shared_buf_fd);
 
 	return 0;
 }
@@ -1192,8 +1353,8 @@ int parasite_daemon_cmd(int cmd, void *args)
 	case PARASITE_CMD_DUMP_CGROUP:
 		ret = parasite_dump_cgroup(args);
 		break;
-	case PARASITE_CMD_DSA_COPY:
-		ret = parasite_dsa_copy(args);
+	case PARASITE_CMD_DSA_DUMP_PAGES:
+		ret = parasite_dsa_dump_pages(args);
 		break;
 	default:
 		pr_err("Unknown command in parasite daemon thread leader: %d\n", cmd);

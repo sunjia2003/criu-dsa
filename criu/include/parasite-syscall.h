@@ -16,9 +16,7 @@ struct cr_imgset;
 struct fd_opts;
 struct pid;
 struct parasite_dump_cgroup_args;
-struct parasite_dsa_copy_args;
-struct rt_sigframe;
-
+struct parasite_dsa_dump_pages_args;
 struct parasite_ctl;
 struct parasite_thread_ctl;
 
@@ -39,7 +37,8 @@ extern void parasite_ensure_args_size(unsigned long sz);
 extern unsigned long get_exec_start(struct vm_area_list *);
 
 extern int parasite_dump_cgroup(struct parasite_ctl *ctl, struct parasite_dump_cgroup_args *cgroup);
-extern int parasite_dsa_copy_seized(struct parasite_ctl *ctl, struct parasite_dsa_copy_args *args, int wq_fd);
+extern int parasite_dsa_dump_pages_seized(struct parasite_ctl *ctl, struct parasite_dsa_dump_pages_args *args,
+					   int shared_buf_fd, int *wq_fds, int wq_count);
 
 extern struct parasite_tty_args *parasite_dump_tty(struct parasite_ctl *ctl, int fd, int type);
 

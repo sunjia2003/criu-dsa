@@ -326,39 +326,99 @@ int parasite_dump_cgroup(struct parasite_ctl *ctl, struct parasite_dump_cgroup_a
 	return 0;
 }
 
-int parasite_dsa_copy_seized(struct parasite_ctl *ctl, struct parasite_dsa_copy_args *args, int wq_fd)
+int parasite_dsa_dump_pages_seized(struct parasite_ctl *ctl, struct parasite_dsa_dump_pages_args *args,
+				   int shared_buf_fd, int *wq_fds, int wq_count)
 {
 	int ret;
+	int sync_ret;
 	int sk;
-	struct parasite_dsa_copy_args *pa;
+	struct parasite_dsa_dump_pages_args *pa;
+	struct dsa_dump_descriptor *src_descs;
+	struct dsa_dump_descriptor *dst_descs;
+	unsigned long needed_size;
+	int have_path = 0;
+	int i;
 
-	if (!args)
+	if (!args || wq_count <= 0 || wq_count > DSA_DUMP_MAX_WQ)
 		return -EINVAL;
 
-	pa = compel_parasite_args(ctl, struct parasite_dsa_copy_args);
+	if (!wq_fds) {
+		for (i = 0; i < DSA_DUMP_MAX_WQ; i++) {
+			if (args->wq_paths[i][0]) {
+				have_path = 1;
+				break;
+			}
+		}
+
+		if (!have_path)
+			return -EINVAL;
+	}
+
+	if (!args->nr_descriptors || args->nr_descriptors > DSA_DUMP_BATCH_SIZE)
+		return -EINVAL;
+
+	/* Ensure sufficient space in parasite args area */
+	needed_size = sizeof(struct parasite_dsa_dump_pages_args) +
+		      args->nr_descriptors * sizeof(struct dsa_dump_descriptor);
+	parasite_ensure_args_size(needed_size);
+
+	/* Copy args to parasite shared area */
+	pa = compel_parasite_args_s(ctl, needed_size);
 	*pa = *args;
 
-	if (pa->use_wq_fd) {
-		if (wq_fd < 0)
-			return -EINVAL;
+	/* Copy descriptor array */
+	src_descs = pdpa_descriptors(args);
+	dst_descs = pdpa_descriptors(pa);
+	for (i = 0; i < args->nr_descriptors; i++)
+		dst_descs[i] = src_descs[i];
 
-		ret = compel_rpc_call(PARASITE_CMD_DSA_COPY, ctl);
+	pa->wq_count = wq_count;
+	pa->use_wq_fd = (wq_fds != NULL) ? 1 : 0;
+	pa->use_shared_buf_fd = (pa->use_wq_fd && shared_buf_fd >= 0) ? 1 : 0;
+
+	/* Send FDs for all available workqueues */
+	if (pa->use_wq_fd) {
+		sk = compel_rpc_sock(ctl);
+		
+		/* Start the RPC call first */
+		ret = compel_rpc_call(PARASITE_CMD_DSA_DUMP_PAGES, ctl);
 		if (ret) {
-			pr_err("Parasite failed to start DSA copy call\n");
+			pr_err("Parasite failed to start DSA dump pages call\n");
 			return ret;
 		}
 
-		sk = compel_rpc_sock(ctl);
-		if (send_fd(sk, NULL, 0, wq_fd) < 0) {
-			pr_err("Can't send DSA workqueue fd to parasite\n");
-			return -1;
+		if (pa->use_shared_buf_fd) {
+			if (send_fd(sk, NULL, 0, shared_buf_fd) < 0) {
+				pr_err("Can't send DSA shared buffer fd to parasite\n");
+				sync_ret = compel_rpc_sync(PARASITE_CMD_DSA_DUMP_PAGES, ctl);
+				if (sync_ret)
+					pr_err("Failed to sync DSA RPC after shared fd send error\n");
+				return -1;
+			}
 		}
 
-		ret = compel_rpc_sync(PARASITE_CMD_DSA_COPY, ctl);
+		/* Send all WQ FDs */
+		for (i = 0; i < wq_count; i++) {
+			if (wq_fds[i] >= 0) {
+				if (send_fd(sk, NULL, 0, wq_fds[i]) < 0) {
+					pr_err("Can't send DSA workqueue fd %d to parasite\n", i);
+					/* Keep RPC channel consistent before returning. */
+					sync_ret = compel_rpc_sync(PARASITE_CMD_DSA_DUMP_PAGES, ctl);
+					if (sync_ret)
+						pr_err("Failed to sync DSA RPC after send_fd error\n");
+					return -1;
+				}
+			}
+		}
+
+		/* Now sync to wait for completion */
+		ret = compel_rpc_sync(PARASITE_CMD_DSA_DUMP_PAGES, ctl);
 	} else {
-		ret = compel_rpc_call_sync(PARASITE_CMD_DSA_COPY, ctl);
+		/* Use paths, no need to send FDs */
+		ret = compel_rpc_call_sync(PARASITE_CMD_DSA_DUMP_PAGES, ctl);
 	}
 
+	/* Copy back the results */
 	*args = *pa;
 	if (ret)
 		return ret;
