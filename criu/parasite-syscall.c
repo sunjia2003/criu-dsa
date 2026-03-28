@@ -38,6 +38,7 @@
 
 #include "dump.h"
 #include "restorer.h"
+#include "common/scm.h"
 
 #include "infect.h"
 #include "infect-rpc.h"
@@ -323,6 +324,46 @@ int parasite_dump_cgroup(struct parasite_ctl *ctl, struct parasite_dump_cgroup_a
 
 	*cgroup = *ca;
 	return 0;
+}
+
+int parasite_dsa_copy_seized(struct parasite_ctl *ctl, struct parasite_dsa_copy_args *args, int wq_fd)
+{
+	int ret;
+	int sk;
+	struct parasite_dsa_copy_args *pa;
+
+	if (!args)
+		return -EINVAL;
+
+	pa = compel_parasite_args(ctl, struct parasite_dsa_copy_args);
+	*pa = *args;
+
+	if (pa->use_wq_fd) {
+		if (wq_fd < 0)
+			return -EINVAL;
+
+		ret = compel_rpc_call(PARASITE_CMD_DSA_COPY, ctl);
+		if (ret) {
+			pr_err("Parasite failed to start DSA copy call\n");
+			return ret;
+		}
+
+		sk = compel_rpc_sock(ctl);
+		if (send_fd(sk, NULL, 0, wq_fd) < 0) {
+			pr_err("Can't send DSA workqueue fd to parasite\n");
+			return -1;
+		}
+
+		ret = compel_rpc_sync(PARASITE_CMD_DSA_COPY, ctl);
+	} else {
+		ret = compel_rpc_call_sync(PARASITE_CMD_DSA_COPY, ctl);
+	}
+
+	*args = *pa;
+	if (ret)
+		return ret;
+
+	return args->op_ret;
 }
 
 static unsigned long parasite_args_size = PARASITE_ARG_SIZE_MIN;

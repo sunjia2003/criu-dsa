@@ -37,6 +37,7 @@ enum {
 	PARASITE_CMD_CHECK_VDSO_MARK,
 	PARASITE_CMD_CHECK_AIOS,
 	PARASITE_CMD_DUMP_CGROUP,
+	PARASITE_CMD_DSA_COPY,
 
 	PARASITE_CMD_MAX,
 };
@@ -253,6 +254,25 @@ struct parasite_dump_cgroup_args {
 	 * "self/task/<tid>/cgroup"
 	 */
 	char thread_cgrp[32];
+};
+
+struct parasite_dsa_copy_args {
+	u64 src_addr;
+	u32 copy_len;
+	u32 use_wq_fd;
+	u32 prefer_hugetlb;
+	char wq_path[64];
+
+	s32 op_ret;
+	s32 stage;
+	s32 detail;
+	u32 dsa_status;
+	u32 bytes_completed;
+	u32 used_hugetlb;
+	u32 checksum_before;
+	u32 checksum_after;
+	u64 fault_addr;
+	u32 comp_result;
 };
 
 #endif /* !__ASSEMBLY__ */
