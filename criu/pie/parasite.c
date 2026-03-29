@@ -154,8 +154,8 @@ static int parasite_dsa_dump_pages(struct parasite_dsa_dump_pages_args *a)
 	uint8_t *shared_buf;
 	uint32_t buf_write_offset;
 	struct dsa_dump_descriptor *descriptors;
-	struct dsa_hw_desc dsa_descs[DSA_DUMP_BATCH_SIZE];
-	volatile struct dsa_completion_record dsa_comps[DSA_DUMP_BATCH_SIZE];
+	struct dsa_hw_desc dsa_descs[DSA_DUMP_BATCH_SIZE] __attribute__((aligned(64)));
+	volatile struct dsa_completion_record dsa_comps[DSA_DUMP_BATCH_SIZE] __attribute__((aligned(32)));
 	uint32_t submitted = 0;
 	uint32_t completed = 0;
 	uint32_t timeout_count = 0;

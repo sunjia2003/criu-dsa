@@ -9,6 +9,7 @@
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <linux/memfd.h>
 
 #include "types.h"
@@ -332,6 +333,127 @@ prep_dump_pages_args(struct parasite_ctl *ctl, struct vm_area_list *vma_area_lis
 }
 
 #define DSA_SHARED_BUF_SIZE	(2U * 1024U * 1024U)
+#define DSA_BATCH_TARGET_US_DEFAULT	2000U
+#define DSA_BATCH_TARGET_US_MIN	200U
+#define DSA_BATCH_TARGET_US_MAX	500000U
+#define DSA_BATCH_LIMIT_MIN_DEFAULT	8U
+
+#ifndef MADV_POPULATE_READ
+#define MADV_POPULATE_READ	22
+#endif
+
+static unsigned int dsa_parse_env_u32(const char *name, unsigned int def,
+				      unsigned int min, unsigned int max)
+{
+	const char *env;
+	int v;
+
+	env = getenv(name);
+	if (!env)
+		return def;
+
+	v = atoi(env);
+	if (v < (int)min)
+		return min;
+	if (v > (int)max)
+		return max;
+
+	return (unsigned int)v;
+}
+
+static unsigned int dsa_batch_target_us(void)
+{
+	return dsa_parse_env_u32("CRIU_DSA_BATCH_TARGET_US",
+				 DSA_BATCH_TARGET_US_DEFAULT,
+				 DSA_BATCH_TARGET_US_MIN,
+				 DSA_BATCH_TARGET_US_MAX);
+}
+
+static unsigned int dsa_batch_limit_min(void)
+{
+	return dsa_parse_env_u32("CRIU_DSA_BATCH_MIN_DESC",
+				 DSA_BATCH_LIMIT_MIN_DEFAULT,
+				 1,
+				 DSA_DUMP_BATCH_SIZE);
+}
+
+static unsigned long dsa_timespec_delta_us(const struct timespec *start,
+					   const struct timespec *end)
+{
+	long sec;
+	long nsec;
+
+	sec = end->tv_sec - start->tv_sec;
+	nsec = end->tv_nsec - start->tv_nsec;
+	if (nsec < 0) {
+		nsec += 1000000000L;
+		sec--;
+	}
+
+	if (sec < 0)
+		return 0;
+
+	return (unsigned long)sec * 1000000UL + (unsigned long)nsec / 1000UL;
+}
+
+static bool dsa_populate_read_enabled(void)
+{
+	const char *env;
+
+	env = getenv("CRIU_DSA_POPULATE_READ");
+	if (!env)
+		return false;
+
+	return atoi(env) > 0;
+}
+
+static int dsa_open_pidfd(pid_t pid)
+{
+#ifdef SYS_pidfd_open
+	return syscall(SYS_pidfd_open, pid, 0);
+#else
+	errno = ENOSYS;
+	return -1;
+#endif
+}
+
+static void dsa_try_populate_read_batch(int pidfd, u64 *src_addrs,
+					u32 *copy_lens, unsigned int nr)
+{
+#ifdef SYS_process_madvise
+	struct iovec iovs[DSA_DUMP_BATCH_SIZE];
+	unsigned int i;
+	ssize_t advised;
+	size_t total = 0;
+
+	if (pidfd < 0 || !nr)
+		return;
+
+	if (nr > DSA_DUMP_BATCH_SIZE)
+		nr = DSA_DUMP_BATCH_SIZE;
+
+	for (i = 0; i < nr; i++) {
+		iovs[i].iov_base = (void *)(unsigned long)src_addrs[i];
+		iovs[i].iov_len = copy_lens[i];
+		total += copy_lens[i];
+	}
+
+	advised = syscall(SYS_process_madvise, pidfd, iovs, nr,
+			 MADV_POPULATE_READ, 0);
+	if (advised < 0) {
+		pr_debug("DSA populate_read skipped: %d\n", errno);
+		return;
+	}
+
+	if ((size_t)advised < total)
+		pr_debug("DSA populate_read partial: %zd/%zu\n", advised, total);
+#else
+	(void)pidfd;
+	(void)src_addrs;
+	(void)copy_lens;
+	(void)nr;
+#endif
+}
 
 static bool dsa_dump_enabled(void)
 {
@@ -344,13 +466,23 @@ static bool dsa_dump_enabled(void)
 	return atoi(env) > 0;
 }
 
-static int dsa_open_workqueues(int *wq_fds, int max_wq)
+static int dsa_collect_workqueues(char wq_paths[DSA_DUMP_MAX_WQ][64], int max_wq)
 {
 	DIR *dir;
 	struct dirent *de;
 	int nr = 0;
 	char path[128];
-	int fd;
+	char type_path[160];
+	char state_path[160];
+	char type_buf[32];
+	char state_buf[32];
+	int type_fd;
+	int state_fd;
+	ssize_t read_len;
+	int i;
+
+	for (i = 0; i < DSA_DUMP_MAX_WQ; i++)
+		wq_paths[i][0] = '\0';
 
 	dir = opendir("/dev/dsa");
 	if (!dir)
@@ -362,16 +494,51 @@ static int dsa_open_workqueues(int *wq_fds, int max_wq)
 		if (strncmp(de->d_name, "wq", 2))
 			continue;
 
+		n = snprintf(type_path, sizeof(type_path),
+			     "/sys/bus/dsa/devices/%s/type", de->d_name);
+		if (n < 0 || n >= sizeof(type_path))
+			continue;
+
+		n = snprintf(state_path, sizeof(state_path),
+			     "/sys/bus/dsa/devices/%s/state", de->d_name);
+		if (n < 0 || n >= sizeof(state_path))
+			continue;
+
+		type_fd = open(type_path, O_RDONLY | O_CLOEXEC);
+		if (type_fd < 0)
+			continue;
+
+		read_len = read(type_fd, type_buf, sizeof(type_buf) - 1);
+		close(type_fd);
+		if (read_len <= 0)
+			continue;
+		type_buf[read_len] = '\0';
+		if (strncmp(type_buf, "user", 4))
+			continue;
+
+		state_fd = open(state_path, O_RDONLY | O_CLOEXEC);
+		if (state_fd < 0)
+			continue;
+
+		read_len = read(state_fd, state_buf, sizeof(state_buf) - 1);
+		close(state_fd);
+		if (read_len <= 0)
+			continue;
+		state_buf[read_len] = '\0';
+		if (strncmp(state_buf, "enabled", 7))
+			continue;
+
 		n = snprintf(path, sizeof(path), "/dev/dsa/%.*s",
 			     (int)(sizeof(path) - sizeof("/dev/dsa/")), de->d_name);
 		if (n < 0 || n >= sizeof(path))
 			continue;
 
-		fd = open(path, O_RDWR | O_CLOEXEC);
-		if (fd < 0)
+		n = snprintf(wq_paths[nr], sizeof(wq_paths[nr]), "/dev/dsa/%s", de->d_name);
+		if (n < 0 || n >= sizeof(wq_paths[nr]))
 			continue;
 
-		wq_fds[nr++] = fd;
+		pr_debug("Use DSA wq %s\n", de->d_name);
+		nr++;
 	}
 
 	closedir(dir);
@@ -410,22 +577,30 @@ static int dsa_write_to_pipe(int pipe_fd, const void *buf, size_t len)
  * <0  - DSA path selected but failed.
  */
 static int drain_pages_dsa(struct page_pipe *pp, struct parasite_ctl *ctl,
-			   struct parasite_dump_pages_args *args)
+			   struct parasite_dump_pages_args *args, pid_t target_pid)
 {
 	struct page_pipe_buf *ppb;
 	int ret = 0;
 	bool wrote_data = false;
-	int wq_fds[DSA_DUMP_MAX_WQ];
+	bool do_populate_read;
+	char wq_paths[DSA_DUMP_MAX_WQ][64];
 	int wq_count;
-	int i;
+	int pidfd = -1;
 	int shared_fd = -1;
 	void *shared_buf = MAP_FAILED;
 	unsigned int seg_off;
 	unsigned int seg_pos;
+	unsigned int args_off_cur;
+	unsigned int ppb_off;
+	unsigned int ppb_nr_segs;
+	unsigned long ppb_nr_pages;
 	unsigned int batch_nr;
 	unsigned int j;
 	unsigned int fill_off;
 	unsigned int fill_pos;
+	unsigned int batch_limit;
+	unsigned int batch_limit_min;
+	unsigned int batch_target_us;
 	u64 batch_src_addr[DSA_DUMP_BATCH_SIZE];
 	u32 batch_copy_len[DSA_DUMP_BATCH_SIZE];
 	size_t batch_bytes;
@@ -433,18 +608,55 @@ static int drain_pages_dsa(struct page_pipe *pp, struct parasite_ctl *ctl,
 	size_t max_chunk;
 	size_t len;
 	unsigned long args_sz;
+	size_t args_tail_sz;
 	struct parasite_dsa_dump_pages_args *dargs;
 	struct dsa_dump_descriptor *ddesc;
 	struct iovec *src_iov;
+	void *args_tail_saved = NULL;
+	unsigned int args_nr_vmas_saved;
+	unsigned int args_add_prot_saved;
+	unsigned int args_off_saved;
 	int htlb_flags;
-
-	for (i = 0; i < DSA_DUMP_MAX_WQ; i++)
-		wq_fds[i] = -1;
+	struct timespec t_start;
+	struct timespec t_end;
+	unsigned long rpc_us;
+	int have_time;
 
 	if (!dsa_dump_enabled())
 		return 1;
 
-	wq_count = dsa_open_workqueues(wq_fds, DSA_DUMP_MAX_WQ);
+	args_nr_vmas_saved = args->nr_vmas;
+	args_add_prot_saved = args->add_prot;
+	args_off_saved = args->off;
+	args_off_cur = args_off_saved;
+
+	do_populate_read = dsa_populate_read_enabled();
+	if (do_populate_read) {
+		pidfd = dsa_open_pidfd(target_pid);
+		if (pidfd < 0)
+			pr_debug("DSA populate_read disabled: can't open pidfd for %d\n",
+				 target_pid);
+	}
+
+	batch_limit = DSA_DUMP_BATCH_SIZE;
+	batch_limit_min = dsa_batch_limit_min();
+	batch_target_us = dsa_batch_target_us();
+
+	/*
+	 * DSA RPC reuses parasite args area and overwrites its beginning.
+	 * Preserve dump vma/iov payload so legacy fallback and next batches
+	 * can safely use PARASITE_CMD_DUMPPAGES arguments.
+	 */
+	args_tail_sz = args->nr_vmas * sizeof(struct parasite_vma_entry) +
+		      pp->nr_iovs * sizeof(struct iovec);
+	if (args_tail_sz) {
+		args_tail_saved = xmalloc(args_tail_sz);
+		if (!args_tail_saved)
+			return -1;
+		memcpy(args_tail_saved, pargs_vmas(args), args_tail_sz);
+	}
+
+	wq_count = dsa_collect_workqueues(wq_paths, DSA_DUMP_MAX_WQ);
 	if (wq_count <= 0) {
 		pr_info("DSA dump requested, but no /dev/dsa workqueue is available\n");
 		return 1;
@@ -476,9 +688,17 @@ static int drain_pages_dsa(struct page_pipe *pp, struct parasite_ctl *ctl,
 	debug_show_page_pipe(pp);
 
 	list_for_each_entry(ppb, &pp->bufs, l) {
-		args->nr_segs = ppb->nr_segs;
-		args->nr_pages = ppb->pages_in;
-		src_iov = pargs_iovs(args) + args->off;
+		ppb_nr_segs = ppb->nr_segs;
+		ppb_nr_pages = ppb->pages_in;
+		ppb_off = args_off_cur;
+
+		args->nr_vmas = args_nr_vmas_saved;
+		args->add_prot = args_add_prot_saved;
+		args->nr_segs = ppb_nr_segs;
+		args->nr_pages = ppb_nr_pages;
+		args->off = ppb_off;
+
+		src_iov = pargs_iovs(args) + ppb_off;
 		seg_off = 0;
 		seg_pos = 0;
 
@@ -491,7 +711,7 @@ static int drain_pages_dsa(struct page_pipe *pp, struct parasite_ctl *ctl,
 			fill_off = seg_off;
 			fill_pos = seg_pos;
 
-			while (batch_nr < DSA_DUMP_BATCH_SIZE && fill_off < args->nr_segs) {
+			while (batch_nr < batch_limit && fill_off < args->nr_segs) {
 				while (fill_off < args->nr_segs && fill_pos >= src_iov[fill_off].iov_len) {
 					fill_off++;
 					fill_pos = 0;
@@ -545,8 +765,15 @@ static int drain_pages_dsa(struct page_pipe *pp, struct parasite_ctl *ctl,
 			dargs->is_last_batch = (fill_off >= args->nr_segs);
 			dargs->wq_count = wq_count;
 			dargs->use_shared_buf_fd = 1;
-			dargs->use_wq_fd = 1;
+			dargs->use_wq_fd = 0;
 			dargs->wq_policy = DSA_WQ_POLICY_LPT;
+			for (j = 0; j < (unsigned int)wq_count; j++) {
+				size_t path_len;
+
+				path_len = strnlen(wq_paths[j], sizeof(dargs->wq_paths[j]) - 1);
+				memcpy(dargs->wq_paths[j], wq_paths[j], path_len);
+				dargs->wq_paths[j][path_len] = '\0';
+			}
 
 			ddesc = pdpa_descriptors(dargs);
 			for (j = 0; j < batch_nr; j++) {
@@ -554,9 +781,26 @@ static int drain_pages_dsa(struct page_pipe *pp, struct parasite_ctl *ctl,
 				ddesc[j].copy_len = batch_copy_len[j];
 			}
 
-			ret = parasite_dsa_dump_pages_seized(ctl, dargs, shared_fd, wq_fds, wq_count);
+			if (do_populate_read)
+				dsa_try_populate_read_batch(pidfd, batch_src_addr,
+							 batch_copy_len, batch_nr);
+
+			have_time = (clock_gettime(CLOCK_MONOTONIC, &t_start) == 0);
+			ret = parasite_dsa_dump_pages_seized(ctl, dargs, shared_fd, NULL, wq_count);
+			args->nr_vmas = args_nr_vmas_saved;
+			args->add_prot = args_add_prot_saved;
+			args->off = ppb_off;
+			args->nr_segs = ppb_nr_segs;
+			args->nr_pages = ppb_nr_pages;
+			if (args_tail_saved)
+				memcpy(pargs_vmas(args), args_tail_saved, args_tail_sz);
+			if (have_time && clock_gettime(CLOCK_MONOTONIC, &t_end))
+				have_time = 0;
 			if (ret) {
-				pr_err("DSA page dump RPC failed\n");
+				pr_err("DSA page dump RPC failed: ret=%d op_ret=%d failed_idx=%d status=%u completed=%u copied=%u\n",
+				       ret, dargs->op_ret, dargs->failed_idx,
+				       dargs->failed_status, dargs->completed_count,
+				       dargs->total_copied);
 				xfree(dargs);
 				goto out;
 			}
@@ -576,12 +820,30 @@ static int drain_pages_dsa(struct page_pipe *pp, struct parasite_ctl *ctl,
 			}
 			wrote_data = true;
 
+			if (have_time) {
+				rpc_us = dsa_timespec_delta_us(&t_start, &t_end);
+				if (rpc_us > batch_target_us && batch_limit > batch_limit_min) {
+					batch_limit /= 2;
+					if (batch_limit < batch_limit_min)
+						batch_limit = batch_limit_min;
+				} else if (rpc_us < (batch_target_us / 2) &&
+					   batch_limit < DSA_DUMP_BATCH_SIZE) {
+					batch_limit *= 2;
+					if (batch_limit > DSA_DUMP_BATCH_SIZE)
+						batch_limit = DSA_DUMP_BATCH_SIZE;
+				}
+
+				pr_debug("DSA batch adaptive: rpc_us=%lu target_us=%u desc_limit=%u\n",
+					 rpc_us, batch_target_us, batch_limit);
+			}
+
 			xfree(dargs);
 			seg_off = fill_off;
 			seg_pos = fill_pos;
 		}
 
-		args->off += args->nr_segs;
+		args_off_cur = ppb_off + ppb_nr_segs;
+		args->off = args_off_cur;
 	}
 
 	ret = 0;
@@ -590,29 +852,46 @@ out:
 		munmap(shared_buf, DSA_SHARED_BUF_SIZE);
 	if (shared_fd >= 0)
 		close(shared_fd);
+	xfree(args_tail_saved);
+	if (pidfd >= 0)
+		close(pidfd);
 
-	for (i = 0; i < DSA_DUMP_MAX_WQ; i++) {
-		if (wq_fds[i] >= 0)
-			close(wq_fds[i]);
+	args->nr_vmas = args_nr_vmas_saved;
+	args->add_prot = args_add_prot_saved;
+
+	if (ret < 0 && !wrote_data) {
+		args->off = args_off_saved;
+		return 1;
 	}
 
-	if (ret < 0 && !wrote_data)
-		return 1;
+	if (ret < 0)
+		args->off = args_off_cur;
 
 	return ret;
 }
 
-static int drain_pages(struct page_pipe *pp, struct parasite_ctl *ctl, struct parasite_dump_pages_args *args)
+static int drain_pages(struct page_pipe *pp, struct parasite_ctl *ctl,
+		       struct parasite_dump_pages_args *args, pid_t target_pid)
 {
 	struct page_pipe_buf *ppb;
+	unsigned int args_off;
 	int ret = 0;
 	int dsa_ret;
 
-	dsa_ret = drain_pages_dsa(pp, ctl, args);
+	args_off = args->off;
+
+	dsa_ret = drain_pages_dsa(pp, ctl, args, target_pid);
 	if (dsa_ret == 0)
 		return 0;
 	if (dsa_ret < 0)
 		return dsa_ret;
+
+	/*
+	 * DSA RPC uses the same parasite args area and may leave header fields
+	 * clobbered on failure paths; restore the caller-visible offset before
+	 * falling back to legacy DUMPPAGES.
+	 */
+	args->off = args_off;
 
 	debug_show_page_pipe(pp);
 
@@ -620,6 +899,7 @@ static int drain_pages(struct page_pipe *pp, struct parasite_ctl *ctl, struct pa
 	list_for_each_entry(ppb, &pp->bufs, l) {
 		args->nr_segs = ppb->nr_segs;
 		args->nr_pages = ppb->pages_in;
+		args->off = args_off;
 		pr_debug("PPB: %ld pages %d segs %u pipe %d off\n", args->nr_pages, args->nr_segs, ppb->pipe_size,
 			 args->off);
 
@@ -634,8 +914,10 @@ static int drain_pages(struct page_pipe *pp, struct parasite_ctl *ctl, struct pa
 		if (ret < 0)
 			return -1;
 
-		args->off += args->nr_segs;
+		args_off += args->nr_segs;
 	}
+
+	args->off = args_off;
 
 	return 0;
 }
@@ -794,7 +1076,7 @@ again:
 	if (ret == -EAGAIN) {
 		BUG_ON(!(pp->flags & PP_CHUNK_MODE));
 
-		ret = drain_pages(pp, ctl, args);
+		ret = drain_pages(pp, ctl, args, item->pid->real);
 		if (!ret)
 			ret = xfer_pages(pp, xfer);
 		if (!ret) {
@@ -904,7 +1186,7 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	if (mdc->pre_dump && opts.pre_dump_mode == PRE_DUMP_READ)
 		ret = 0;
 	else
-		ret = drain_pages(pp, ctl, args);
+		ret = drain_pages(pp, ctl, args, item->pid->real);
 
 	if (!ret && !mdc->pre_dump)
 		ret = xfer_pages(pp, &xfer);

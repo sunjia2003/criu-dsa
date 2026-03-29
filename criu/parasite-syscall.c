@@ -374,12 +374,12 @@ int parasite_dsa_dump_pages_seized(struct parasite_ctl *ctl, struct parasite_dsa
 
 	pa->wq_count = wq_count;
 	pa->use_wq_fd = (wq_fds != NULL) ? 1 : 0;
-	pa->use_shared_buf_fd = (pa->use_wq_fd && shared_buf_fd >= 0) ? 1 : 0;
+	pa->use_shared_buf_fd = (shared_buf_fd >= 0) ? 1 : 0;
 
-	/* Send FDs for all available workqueues */
-	if (pa->use_wq_fd) {
+	/* If any FD has to be passed, use call + send_fd + sync flow. */
+	if (pa->use_wq_fd || pa->use_shared_buf_fd) {
 		sk = compel_rpc_sock(ctl);
-		
+
 		/* Start the RPC call first */
 		ret = compel_rpc_call(PARASITE_CMD_DSA_DUMP_PAGES, ctl);
 		if (ret) {
@@ -397,16 +397,18 @@ int parasite_dsa_dump_pages_seized(struct parasite_ctl *ctl, struct parasite_dsa
 			}
 		}
 
-		/* Send all WQ FDs */
-		for (i = 0; i < wq_count; i++) {
-			if (wq_fds[i] >= 0) {
-				if (send_fd(sk, NULL, 0, wq_fds[i]) < 0) {
-					pr_err("Can't send DSA workqueue fd %d to parasite\n", i);
-					/* Keep RPC channel consistent before returning. */
-					sync_ret = compel_rpc_sync(PARASITE_CMD_DSA_DUMP_PAGES, ctl);
-					if (sync_ret)
-						pr_err("Failed to sync DSA RPC after send_fd error\n");
-					return -1;
+		/* Send all WQ FDs if fd mode is requested */
+		if (pa->use_wq_fd) {
+			for (i = 0; i < wq_count; i++) {
+				if (wq_fds[i] >= 0) {
+					if (send_fd(sk, NULL, 0, wq_fds[i]) < 0) {
+						pr_err("Can't send DSA workqueue fd %d to parasite\n", i);
+						/* Keep RPC channel consistent before returning. */
+						sync_ret = compel_rpc_sync(PARASITE_CMD_DSA_DUMP_PAGES, ctl);
+						if (sync_ret)
+							pr_err("Failed to sync DSA RPC after send_fd error\n");
+						return -1;
+					}
 				}
 			}
 		}
