@@ -1566,6 +1566,7 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	struct parasite_drain_fd *dfds = NULL;
 	struct proc_posix_timers_stat proc_args;
 	struct mem_dump_ctl mdc;
+	int work_scope = WORK_SCOPE_PREPARE;
 
 	vm_area_list_init(&vmas);
 
@@ -1578,6 +1579,8 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		 * zombies are dumped separately in dump_zombies()
 		 */
 		return 0;
+
+	workload_bind_scope(WORK_SCOPE_PREPARE);
 
 	pr_info("Obtaining task stat ... \n");
 	ret = parse_pid_stat(pid, &pps_buf);
@@ -1695,6 +1698,20 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		goto err_cure;
 	}
 
+	mdc.pre_dump = false;
+	mdc.lazy = opts.lazy_pages;
+	mdc.stat = &pps_buf;
+	mdc.parent_ie = parent_ie;
+
+	workload_switch_scope(WORK_SCOPE_MEM_DUMP_MISC);
+	work_scope = WORK_SCOPE_MEM_DUMP_MISC;
+	ret = parasite_dump_pages_seized(item, &vmas, &mdc, parasite_ctl);
+	if (ret)
+		goto err_cure;
+
+	workload_switch_scope(WORK_SCOPE_OTHER_RES_DUMP);
+	work_scope = WORK_SCOPE_OTHER_RES_DUMP;
+
 	if (dfds) {
 		ret = dump_task_files_seized(parasite_ctl, item, dfds);
 		if (ret) {
@@ -1707,15 +1724,6 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 			goto err_cure;
 		}
 	}
-
-	mdc.pre_dump = false;
-	mdc.lazy = opts.lazy_pages;
-	mdc.stat = &pps_buf;
-	mdc.parent_ie = parent_ie;
-
-	ret = parasite_dump_pages_seized(item, &vmas, &mdc, parasite_ctl);
-	if (ret)
-		goto err_cure;
 
 	ret = parasite_dump_sigacts_seized(parasite_ctl, item);
 	if (ret) {
@@ -1745,6 +1753,19 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	if (ret) {
 		pr_err("Dump cgroup of threads in process (pid: %d) failed with %d\n", pid, ret);
 		goto err_cure;
+	}
+
+	if (dmpi(item)->mem_async) {
+		workload_switch_scope(WORK_SCOPE_MEM_WRITE_WAIT);
+		work_scope = WORK_SCOPE_MEM_WRITE_WAIT;
+		ret = parasite_dump_pages_seized_wait(item);
+		if (ret) {
+			pr_err("Wait for async memory write (pid: %d) failed with %d\n",
+			       pid, ret);
+			goto err_cure;
+		}
+		workload_switch_scope(WORK_SCOPE_OTHER_RES_DUMP);
+		work_scope = WORK_SCOPE_OTHER_RES_DUMP;
 	}
 
 	ret = compel_stop_daemon(parasite_ctl);
@@ -1786,6 +1807,15 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 
 	exit_code = 0;
 err:
+	if (dmpi(item)->mem_async) {
+		workload_switch_scope(WORK_SCOPE_MEM_WRITE_WAIT);
+		if (parasite_dump_pages_seized_wait(item))
+			pr_err("Async memory write cleanup failed (pid: %d)\n", pid);
+		workload_switch_scope(work_scope);
+	}
+
+	workload_unbind_scope();
+
 	close_cr_imgset(&cr_imgset);
 	close_pid_proc();
 	free_mappings(&vmas);
@@ -1793,6 +1823,13 @@ err:
 	return exit_code;
 
 err_cure:
+	if (dmpi(item)->mem_async) {
+		workload_switch_scope(WORK_SCOPE_MEM_WRITE_WAIT);
+		if (parasite_dump_pages_seized_wait(item))
+			pr_err("Async memory write cleanup failed (pid: %d)\n", pid);
+		workload_switch_scope(work_scope);
+	}
+
 	ret = compel_cure(parasite_ctl);
 	if (ret)
 		pr_err("Can't cure (pid: %d) from parasite\n", pid);
@@ -1832,6 +1869,41 @@ static int setup_alarm_handler(void)
 	}
 
 	return 0;
+}
+
+static void print_dump_timing_summary(const char *tag)
+{
+	u64 frozen_us;
+	u64 memdump_us;
+	u64 memwrite_us;
+	u64 dsa_rpc_us;
+	u64 async_wait_us;
+
+	frozen_us = timing_total_usecs(TIME_FROZEN);
+	memdump_us = timing_total_usecs(TIME_MEMDUMP);
+	memwrite_us = timing_total_usecs(TIME_MEMWRITE);
+	dsa_rpc_us = timing_total_usecs(TIME_DSA_RPC);
+	async_wait_us = timing_total_usecs(TIME_ASYNC_WAIT);
+
+	pr_info("%s timing: frozen=%llu us (%llu.%03llu ms) memdump=%llu us (%llu.%03llu ms) memwrite=%llu us (%llu.%03llu ms) dsa_rpc=%llu us (%llu.%03llu ms) async_wait=%llu us (%llu.%03llu ms)\n",
+		tag,
+		(unsigned long long)frozen_us,
+		(unsigned long long)(frozen_us / 1000),
+		(unsigned long long)(frozen_us % 1000),
+		(unsigned long long)memdump_us,
+		(unsigned long long)(memdump_us / 1000),
+		(unsigned long long)(memdump_us % 1000),
+		(unsigned long long)memwrite_us,
+		(unsigned long long)(memwrite_us / 1000),
+		(unsigned long long)(memwrite_us % 1000),
+		(unsigned long long)dsa_rpc_us,
+		(unsigned long long)(dsa_rpc_us / 1000),
+		(unsigned long long)(dsa_rpc_us % 1000),
+		(unsigned long long)async_wait_us,
+		(unsigned long long)(async_wait_us / 1000),
+		(unsigned long long)(async_wait_us % 1000));
+
+	workload_dump_log(tag);
 }
 
 static int cr_pre_dump_finish(int status)
@@ -1924,6 +1996,7 @@ err:
 	if (ret)
 		pr_err("Pre-dumping FAILED.\n");
 	else {
+		print_dump_timing_summary("Pre-dump");
 		write_stats(DUMP_STATS);
 		pr_info("Pre-dumping finished successfully\n");
 	}
@@ -2127,8 +2200,10 @@ static int cr_dump_finish(int ret)
 			pr_info("fault: CRIU dump crashed!\n");
 			abort();
 		}
+		print_dump_timing_summary("Dump");
 		pr_err("Dumping FAILED.\n");
 	} else {
+		print_dump_timing_summary("Dump");
 		write_stats(DUMP_STATS);
 		pr_info("Dumping finished successfully\n");
 	}

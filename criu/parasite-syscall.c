@@ -327,14 +327,13 @@ int parasite_dump_cgroup(struct parasite_ctl *ctl, struct parasite_dump_cgroup_a
 }
 
 int parasite_dsa_dump_pages_seized(struct parasite_ctl *ctl, struct parasite_dsa_dump_pages_args *args,
-				   int shared_buf_fd, int *wq_fds, int wq_count)
+				   int shared_buf_fd,
+				   int *wq_fds, int wq_count)
 {
 	int ret;
 	int sync_ret;
 	int sk;
 	struct parasite_dsa_dump_pages_args *pa;
-	struct dsa_dump_descriptor *src_descs;
-	struct dsa_dump_descriptor *dst_descs;
 	unsigned long needed_size;
 	int have_path = 0;
 	int i;
@@ -354,23 +353,15 @@ int parasite_dsa_dump_pages_seized(struct parasite_ctl *ctl, struct parasite_dsa
 			return -EINVAL;
 	}
 
-	if (!args->nr_descriptors || args->nr_descriptors > DSA_DUMP_BATCH_SIZE)
+	if (args->hdr_off >= args->shared_buf_size)
 		return -EINVAL;
 
-	/* Ensure sufficient space in parasite args area */
-	needed_size = sizeof(struct parasite_dsa_dump_pages_args) +
-		      args->nr_descriptors * sizeof(struct dsa_dump_descriptor);
+	needed_size = sizeof(struct parasite_dsa_dump_pages_args);
 	parasite_ensure_args_size(needed_size);
 
 	/* Copy args to parasite shared area */
 	pa = compel_parasite_args_s(ctl, needed_size);
 	*pa = *args;
-
-	/* Copy descriptor array */
-	src_descs = pdpa_descriptors(args);
-	dst_descs = pdpa_descriptors(pa);
-	for (i = 0; i < args->nr_descriptors; i++)
-		dst_descs[i] = src_descs[i];
 
 	pa->wq_count = wq_count;
 	pa->use_wq_fd = (wq_fds != NULL) ? 1 : 0;

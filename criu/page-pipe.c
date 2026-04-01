@@ -1,4 +1,5 @@
 #include <unistd.h>
+#include <errno.h>
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "page-pipe: "
@@ -71,9 +72,17 @@ static inline int ppb_resize_pipe(struct page_pipe_buf *ppb)
 static struct page_pipe_buf *pp_prev_ppb(struct page_pipe *pp, unsigned int ppb_flags)
 {
 	int type = 0;
+	struct page_pipe_buf *last;
 
-	/* don't allow to reuse a pipe in the PP_CHUNK_MODE mode */
-	if (pp->flags & PP_CHUNK_MODE)
+	if (pp->flags & PP_DSA_SINGLE_PIPE) {
+		if (list_empty(&pp->bufs))
+			return NULL;
+		last = list_entry(pp->bufs.prev, struct page_pipe_buf, l);
+		return last;
+	}
+
+	/* don't allow to reuse a pipe in PP_CHUNK_MODE unless DSA single-pipe */
+	if ((pp->flags & PP_CHUNK_MODE) && !(pp->flags & PP_DSA_SINGLE_PIPE))
 		return NULL;
 
 	if (list_empty(&pp->bufs))
@@ -112,6 +121,10 @@ static struct page_pipe_buf *ppb_alloc(struct page_pipe *pp, unsigned int ppb_fl
 		ppb->p[1] = prev->p[1];
 		ppb->pipe_off = prev->pages_in + prev->pipe_off;
 		ppb->pipe_size = prev->pipe_size;
+	} else if (prev && (pp->flags & PP_DSA_SINGLE_PIPE)) {
+		xfree(ppb);
+		errno = EAGAIN;
+		return NULL;
 	} else {
 		if (pipe(ppb->p)) {
 			xfree(ppb);
@@ -174,8 +187,11 @@ static int page_pipe_grow(struct page_pipe *pp, unsigned int flags)
 		return -EAGAIN;
 
 	ppb = ppb_alloc(pp, flags);
-	if (!ppb)
+	if (!ppb) {
+		if ((pp->flags & PP_DSA_SINGLE_PIPE) && errno == EAGAIN)
+			return -EAGAIN;
 		return -1;
+	}
 
 out:
 	free_iov = &pp->iovs[pp->free_iov];
@@ -279,6 +295,107 @@ static inline int try_add_page(struct page_pipe *pp, unsigned long addr, unsigne
 	return try_add_page_to(pp, list_entry(pp->bufs.prev, struct page_pipe_buf, l), addr, flags);
 }
 
+static inline int try_add_page_to_unbounded(struct page_pipe *pp,
+					   struct page_pipe_buf *ppb,
+					   unsigned long addr,
+					   unsigned int flags)
+{
+	if (ppb->flags != flags)
+		return 1;
+
+	if (ppb->nr_segs && iov_grow_page(&ppb->iov[ppb->nr_segs - 1], addr))
+		goto out;
+
+	pr_debug("Add iov to page pipe (unbounded, %u iovs, %u/%u total)\n",
+		 ppb->nr_segs, pp->free_iov, pp->nr_iovs);
+	iov_init(&ppb->iov[ppb->nr_segs++], addr);
+	pp->free_iov++;
+	BUG_ON(pp->free_iov > pp->nr_iovs);
+out:
+	ppb->pages_in++;
+	return 0;
+}
+
+static inline int try_add_page_unbounded(struct page_pipe *pp, unsigned long addr,
+					 unsigned int flags)
+{
+	BUG_ON(list_empty(&pp->bufs));
+	return try_add_page_to_unbounded(pp,
+					 list_entry(pp->bufs.prev,
+						    struct page_pipe_buf, l),
+					 addr, flags);
+}
+
+static struct page_pipe_buf *ppb_alloc_unbounded(struct page_pipe *pp,
+						 unsigned int ppb_flags)
+{
+	struct page_pipe_buf *prev = pp_prev_ppb(pp, ppb_flags);
+	struct page_pipe_buf *ppb;
+	int ppb_size;
+
+	ppb = xmalloc(sizeof(*ppb));
+	if (!ppb)
+		return NULL;
+	cnt_add(CNT_PAGE_PIPE_BUFS, 1);
+
+	if (prev) {
+		/*
+		 * DSA descriptor-scan mode tracks metadata only during scanning,
+		 * so keep sharing the same pipe without capacity checks.
+		 */
+		ppb->p[0] = prev->p[0];
+		ppb->p[1] = prev->p[1];
+		ppb->pipe_off = prev->pages_in + prev->pipe_off;
+		ppb->pipe_size = prev->pipe_size;
+	} else {
+		if (pipe(ppb->p)) {
+			xfree(ppb);
+			pr_perror("Can't make pipe for page-pipe");
+			return NULL;
+		}
+		cnt_add(CNT_PAGE_PIPES, 1);
+
+		ppb->pipe_off = 0;
+		ppb_size = fcntl(ppb->p[0], F_GETPIPE_SZ, 0);
+		if (ppb_size < 0) {
+			xfree(ppb);
+			pr_perror("Can't get pipe size");
+			return NULL;
+		}
+		ppb->pipe_size = ppb_size / PAGE_SIZE;
+		pp->nr_pipes++;
+	}
+
+	list_add_tail(&ppb->l, &pp->bufs);
+	pp_update_prev_ppb(pp, ppb, ppb_flags);
+
+	return ppb;
+}
+
+static int page_pipe_grow_unbounded(struct page_pipe *pp, unsigned int flags)
+{
+	struct page_pipe_buf *ppb;
+	struct iovec *free_iov;
+
+	pr_debug("Will grow page pipe (unbounded, iov off is %u)\n", pp->free_iov);
+
+	if (!list_empty(&pp->free_bufs)) {
+		ppb = list_first_entry(&pp->free_bufs, struct page_pipe_buf, l);
+		list_move_tail(&ppb->l, &pp->bufs);
+		goto out;
+	}
+
+	ppb = ppb_alloc_unbounded(pp, flags);
+	if (!ppb)
+		return -1;
+
+out:
+	free_iov = &pp->iovs[pp->free_iov];
+	ppb_init(ppb, 0, 0, flags, free_iov);
+
+	return 0;
+}
+
 int page_pipe_add_page(struct page_pipe *pp, unsigned long addr, unsigned int flags)
 {
 	int ret;
@@ -292,6 +409,24 @@ int page_pipe_add_page(struct page_pipe *pp, unsigned long addr, unsigned int fl
 		return ret;
 
 	ret = try_add_page(pp, addr, flags);
+	BUG_ON(ret > 0);
+	return ret;
+}
+
+int page_pipe_add_page_unbounded(struct page_pipe *pp, unsigned long addr,
+					 unsigned int flags)
+{
+	int ret;
+
+	ret = try_add_page_unbounded(pp, addr, flags);
+	if (ret <= 0)
+		return ret;
+
+	ret = page_pipe_grow_unbounded(pp, flags);
+	if (ret < 0)
+		return ret;
+
+	ret = try_add_page_unbounded(pp, addr, flags);
 	BUG_ON(ret > 0);
 	return ret;
 }

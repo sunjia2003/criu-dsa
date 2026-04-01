@@ -57,9 +57,11 @@ struct thread_lsm {
 };
 
 struct ns_id;
+struct mem_dump_async;
 struct dmp_info {
 	struct ns_id *netns;
 	struct page_pipe *mem_pp;
+	struct mem_dump_async *mem_async;
 	struct parasite_ctl *parasite_ctl;
 	struct parasite_thread_ctl **thread_ctls;
 	uint64_t *thread_sp;

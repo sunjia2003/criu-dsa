@@ -259,6 +259,9 @@ struct parasite_dump_cgroup_args {
 /* DSA dump pages batch structure */
 #define DSA_DUMP_BATCH_SIZE    128
 #define DSA_DUMP_MAX_WQ        16
+#define DSA_SHARED_DATA_ALIGN  4096U
+#define PARASITE_DSA_SHM_HDR_MAGIC   0x4453414dU
+#define PARASITE_DSA_SHM_HDR_VERSION 1U
 
 enum dsa_wq_policy {
 	DSA_WQ_POLICY_LPT = 0,
@@ -271,16 +274,28 @@ struct dsa_dump_descriptor {
 	u32 reserved0;
 };
 
+struct parasite_dsa_shm_hdr {
+	u32 magic;
+	u32 version;
+	u32 flags;
+	u32 desc_bytes;
+	u32 desc_count;
+	u32 data_off;
+	u32 data_bytes;
+	u32 reserved;
+};
+
 struct parasite_dsa_dump_pages_args {
 	/* Input from CRIU */
 	u64 shared_buf_addr;	/* Shared buffer address in parasite */
 	u32 shared_buf_size;	/* Total shared buffer size */
-	u32 nr_descriptors;	/* Number of descriptors in this batch */
+	u32 hdr_off;		/* Header offset inside shared buffer */
 	u32 buf_write_offset;	/* Current buffer write position */
 	u32 is_last_batch;	/* Is this the last batch */
 	u32 wq_count;		/* Number of available DSA workqueues */
 	u32 use_shared_buf_fd;  /* Shared buffer is passed as FD and mmap-ed in parasite */
 	u32 use_wq_fd;		/* Use FD instead of path */
+	u32 batch_id;		/* Monotonic batch id from host */
 	u32 wq_policy;		/* enum dsa_wq_policy, default LPT */
 	char wq_paths[DSA_DUMP_MAX_WQ][64];  /* WQ paths or empty if using FD */
 
@@ -291,16 +306,10 @@ struct parasite_dsa_dump_pages_args {
 	s32 failed_idx;		/* Failed descriptor index (-1 = all success) */
 	u32 failed_status;	/* Failed descriptor DSA status */
 	u32 new_buf_offset;	/* New buffer write offset after this batch */
-
-	/* Descriptor array follows after this structure */
-	/* struct dsa_dump_descriptor descriptors[nr_descriptors]; */
+	u32 submit_enqcmd;	/* Number of descriptors submitted via enqcmd */
+	u32 submit_write;	/* Number of descriptors submitted via write() */
+	u32 map_populate_fallbacks;	/* MAP_POPULATE -> MAP_SHARED fallbacks */
 };
-
-static inline struct dsa_dump_descriptor *
-pdpa_descriptors(struct parasite_dsa_dump_pages_args *a)
-{
-	return (struct dsa_dump_descriptor *)(a + 1);
-}
 
 #endif /* !__ASSEMBLY__ */
 

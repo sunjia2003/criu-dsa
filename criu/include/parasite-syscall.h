@@ -38,7 +38,8 @@ extern unsigned long get_exec_start(struct vm_area_list *);
 
 extern int parasite_dump_cgroup(struct parasite_ctl *ctl, struct parasite_dump_cgroup_args *cgroup);
 extern int parasite_dsa_dump_pages_seized(struct parasite_ctl *ctl, struct parasite_dsa_dump_pages_args *args,
-					   int shared_buf_fd, int *wq_fds, int wq_count);
+					   int shared_buf_fd,
+					   int *wq_fds, int wq_count);
 
 extern struct parasite_tty_args *parasite_dump_tty(struct parasite_ctl *ctl, int fd, int type);
 

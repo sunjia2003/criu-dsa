@@ -130,12 +130,15 @@ struct page_pipe {
 	unsigned int flags; /* PP_FOO flags below */
 };
 
-#define PP_CHUNK_MODE 0x1 /* Restrict the maximum buffer size of pipes and dump memory for a few iterations */
-#define PP_OWN_IOVS   0x4 /* create_page_pipe allocated IOVs memory */
+#define PP_CHUNK_MODE       0x1 /* Restrict the maximum buffer size of pipes and dump memory for a few iterations */
+#define PP_DSA_SINGLE_PIPE  0x2 /* DSA-only: enforce single pipe, no new pipes */
+#define PP_OWN_IOVS         0x4 /* create_page_pipe allocated IOVs memory */
 
 struct page_pipe *create_page_pipe(unsigned int nr_segs, struct iovec *iovs, unsigned flags);
 extern void destroy_page_pipe(struct page_pipe *p);
 extern int page_pipe_add_page(struct page_pipe *p, unsigned long addr, unsigned int flags);
+extern int page_pipe_add_page_unbounded(struct page_pipe *p, unsigned long addr,
+					 unsigned int flags);
 extern int page_pipe_add_hole(struct page_pipe *pp, unsigned long addr, unsigned int flags);
 
 extern void debug_show_page_pipe(struct page_pipe *pp);
