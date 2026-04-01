@@ -32,6 +32,7 @@ extern unsigned long dump_pages_args_size(struct vm_area_list *vmas);
 extern int parasite_dump_pages_seized(struct pstree_item *item, struct vm_area_list *vma_area_list,
 				      struct mem_dump_ctl *mdc, struct parasite_ctl *ctl);
 extern int parasite_dump_pages_seized_wait(struct pstree_item *item);
+extern bool parasite_mem_async_deferred(const struct pstree_item *item);
 extern int collect_madv_guards(pid_t pid, struct vm_area_list *vma_area_list);
 
 #define PME_PRESENT	  (1ULL << 63)

@@ -342,12 +342,16 @@ prep_dump_pages_args(struct parasite_ctl *ctl, struct vm_area_list *vma_area_lis
 #define DSA_BATCH_TARGET_US_MIN	200U
 #define MEM_DUMP_ASYNC_MIN_PAGES_DEFAULT	4096U
 
+struct dsa_dump_ctx;
+
 struct mem_dump_async {
 	pthread_t tid;
 	struct page_pipe *pp;
 	struct page_xfer xfer;
 	int xfer_ret;
 	int pid;
+	bool dsa_live_defer;
+	struct dsa_dump_ctx *dsa_ctx_deferred;
 };
 #define DSA_BATCH_TARGET_US_MAX	500000U
 #define DSA_BATCH_LIMIT_MIN_DEFAULT	128U
@@ -698,13 +702,17 @@ static int dsa_dump_ctx_init(struct dsa_dump_ctx *ctx, pid_t target_pid)
 	return 0;
 }
 
-static void dsa_dump_ctx_fini(struct dsa_dump_ctx *ctx)
+static int dsa_dump_ctx_fini(struct dsa_dump_ctx *ctx)
 {
-	if (!ctx)
-		return;
+	int ret = 0;
 
-	if (dsa_replay_wait_idle(ctx))
+	if (!ctx)
+		return 0;
+
+	if (dsa_replay_wait_idle(ctx)) {
 		pr_err("DSA replay wait failed during ctx fini\n");
+		ret = -1;
+	}
 	dsa_replay_stop(ctx);
 
 	if (ctx->shared_buf != MAP_FAILED)
@@ -717,6 +725,8 @@ static void dsa_dump_ctx_fini(struct dsa_dump_ctx *ctx)
 	ctx->shared_fd = -1;
 	ctx->shared_buf = MAP_FAILED;
 	ctx->pidfd = -1;
+
+	return ret;
 }
 
 struct dsa_replay_task {
@@ -1790,6 +1800,8 @@ static int start_mem_dump_async_xfer(struct pstree_item *item, struct page_pipe 
 	async->xfer = *xfer;
 	async->xfer_ret = 0;
 	async->pid = item->pid->real;
+	async->dsa_live_defer = false;
+	async->dsa_ctx_deferred = NULL;
 
 	if (pthread_create(&async->tid, NULL, mem_dump_async_xfer_thread, async)) {
 		pr_err("Can't create async memwrite thread for pid %d\n",
@@ -1802,10 +1814,37 @@ static int start_mem_dump_async_xfer(struct pstree_item *item, struct page_pipe 
 	return 0;
 }
 
+bool parasite_mem_async_deferred(const struct pstree_item *item)
+{
+	struct mem_dump_async *async;
+
+	if (!item)
+		return false;
+
+	async = dmpi(item)->mem_async;
+	return async && async->dsa_live_defer;
+}
+
+static int dsa_deferred_ctx_finalize(struct mem_dump_async *async)
+{
+	int ret;
+
+	if (!async || !async->dsa_ctx_deferred)
+		return 0;
+
+	ret = dsa_dump_ctx_fini(async->dsa_ctx_deferred);
+	xfree(async->dsa_ctx_deferred);
+	async->dsa_ctx_deferred = NULL;
+	async->dsa_live_defer = false;
+
+	return ret;
+}
+
 int parasite_dump_pages_seized_wait(struct pstree_item *item)
 {
 	struct mem_dump_async *async;
 	int ret = 0;
+	int dsa_ret;
 
 	async = dmpi(item)->mem_async;
 	if (!async)
@@ -1823,16 +1862,20 @@ int parasite_dump_pages_seized_wait(struct pstree_item *item)
 		workload_switch_scope(WORK_SCOPE_MEM_DUMP_MISC);
 		return -1;
 	}
-	timing_stop(TIME_ASYNC_WAIT);
-	workload_switch_scope(WORK_SCOPE_MEM_DUMP_MISC);
 
 	if (!ret && async->xfer_ret)
 		ret = async->xfer_ret;
+
+	dsa_ret = dsa_deferred_ctx_finalize(async);
+	if (!ret && dsa_ret)
+		ret = dsa_ret;
 
 	async->xfer.close(&async->xfer);
 	destroy_page_pipe(async->pp);
 	dmpi(item)->mem_async = NULL;
 	xfree(async);
+	timing_stop(TIME_ASYNC_WAIT);
+	workload_switch_scope(WORK_SCOPE_MEM_DUMP_MISC);
 
 	if (ret)
 		pr_err("Async memwrite failed for pid %d ret=%d\n", item->pid->real,
@@ -2137,13 +2180,11 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	bool dsa_strict = dsa_dump_enabled();
 	bool dsa_desc_scan = dsa_strict && dsa_desc_scan_enabled();
 	bool dsa_desc_scan_active = false;
+	bool dsa_live_mode = false;
 	bool allow_dsa = dsa_strict;
 	bool dsa_desc_scan_ready = false;
-	struct dsa_dump_ctx dsa_ctx = {
-		.shared_fd = -1,
-		.shared_buf = MAP_FAILED,
-		.pidfd = -1,
-	};
+	bool dsa_ctx_deferred = false;
+	struct dsa_dump_ctx *dsa_ctx;
 	struct dsa_desc_scan_ctx dsa_sc = {
 		.dsa_pipe_fd = -1,
 	};
@@ -2165,14 +2206,23 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	if (pmc_init(&pmc, item->pid->real, &vma_area_list->h, pmc_size * PAGE_SIZE))
 		return -1;
 
+	dsa_ctx = xzalloc(sizeof(*dsa_ctx));
+	if (!dsa_ctx)
+		goto out;
+
+	dsa_ctx->shared_fd = -1;
+	dsa_ctx->shared_buf = MAP_FAILED;
+	dsa_ctx->pidfd = -1;
+
 	dsa_populate_read = dsa_strict && dsa_populate_read_enabled();
 	async_regular = dsa_strict && !mdc->pre_dump && !mdc->lazy &&
 			vma_area_list->nr_priv_pages >= mem_dump_async_min_pages();
 	dsa_desc_scan_active = dsa_desc_scan && !mdc->pre_dump && !mdc->lazy;
+	dsa_live_mode = dsa_desc_scan_active && async_regular;
 
 	if (dsa_desc_scan_active) {
 		workload_switch_scope(WORK_SCOPE_MEM_DSA_CTX_INIT);
-		ret = dsa_dump_ctx_init(&dsa_ctx, item->pid->real);
+		ret = dsa_dump_ctx_init(dsa_ctx, item->pid->real);
 		if (ret) {
 			workload_switch_scope(WORK_SCOPE_MEM_DUMP_MISC);
 			goto out;
@@ -2181,10 +2231,10 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 
 		dsa_sc.ctl = ctl;
 		dsa_sc.args = args;
-		dsa_sc.dsa_ctx = &dsa_ctx;
-		dsa_sc.do_populate_read = dsa_ctx.do_populate_read;
-		dsa_sc.pidfd = dsa_ctx.pidfd;
-		dsa_sc.send_shared_fds = !dsa_ctx.shared_fds_sent;
+		dsa_sc.dsa_ctx = dsa_ctx;
+		dsa_sc.do_populate_read = dsa_ctx->do_populate_read;
+		dsa_sc.pidfd = dsa_ctx->pidfd;
+		dsa_sc.send_shared_fds = !dsa_ctx->shared_fds_sent;
 		dsa_sc.args_nr_vmas_saved = args->nr_vmas;
 		dsa_sc.args_add_prot_saved = args->add_prot;
 		dsa_sc.args_off_cur = 0;
@@ -2300,7 +2350,7 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 			ret = generate_vma_iovs(item, vma_area, pp, &xfer, args, ctl,
 						&pmc, has_parent, mdc->pre_dump,
 						parent_predump_mode, allow_dsa,
-						&dsa_ctx);
+						dsa_ctx);
 		if (ret < 0)
 			goto out_xfer;
 	}
@@ -2316,7 +2366,7 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 			(unsigned long long)dsa_sc.desc_seq_total,
 			(unsigned long long)dsa_sc.desc_seq_out_of_order,
 			(unsigned long long)dsa_sc.desc_seq_discont);
-		dsa_batch_stats_log(&dsa_sc.stats, &dsa_ctx);
+		dsa_batch_stats_log(&dsa_sc.stats, dsa_ctx);
 	}
 
 	if (mdc->lazy)
@@ -2339,8 +2389,14 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 				goto out_xfer;
 			}
 			ret = start_mem_dump_async_xfer(item, pp, &xfer);
-			if (!ret)
+			if (!ret) {
 				async_started = true;
+				if (dsa_live_mode && dmpi(item)->mem_async) {
+					dmpi(item)->mem_async->dsa_live_defer = true;
+					dmpi(item)->mem_async->dsa_ctx_deferred = dsa_ctx;
+					dsa_ctx_deferred = true;
+				}
+			}
 		} else {
 			ret = xfer_pages(pp, &xfer);
 		}
@@ -2350,7 +2406,7 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 		 * This keeps pipe content stable while preserving post-drain overlap.
 		 */
 		ret = drain_pages(pp, ctl, args, item->pid->real, allow_dsa,
-				  &dsa_ctx);
+				  dsa_ctx);
 		if (!ret) {
 			if (dsa_strict)
 				dsa_sanitize_page_pipe(pp);
@@ -2367,7 +2423,7 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 		 * For pre-dump or lazy dump, use legacy sequential drain_pages + xfer_pages.
 		 */
 		ret = drain_pages(pp, ctl, args, item->pid->real, allow_dsa,
-				  &dsa_ctx);
+				  dsa_ctx);
 		if (!ret)
 			ret = xfer_pages(pp, &xfer);
 	}
@@ -2416,7 +2472,14 @@ out:
 		xfree(dsa_sc.batch_copy_len);
 		xfree(dsa_sc.args_tail_saved);
 	}
-	dsa_dump_ctx_fini(&dsa_ctx);
+	if (dsa_ctx && !dsa_ctx_deferred) {
+		int fini_ret;
+
+		fini_ret = dsa_dump_ctx_fini(dsa_ctx);
+		if (!exit_code && fini_ret)
+			exit_code = fini_ret;
+		xfree(dsa_ctx);
+	}
 	pmc_fini(&pmc);
 	pr_info("----------------------------------------\n");
 	return exit_code;

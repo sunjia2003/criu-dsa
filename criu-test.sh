@@ -13,7 +13,6 @@ TARGET_MB=${TARGET_MB:-64}
 PYTHON_BIN=${PYTHON_BIN:-$(command -v python3 || true)}
 RESTORE_DETACHED=${RESTORE_DETACHED:-1}
 BENCH_ROUNDS=${BENCH_ROUNDS:-1}
-RUN_POPULATE_CASE=${RUN_POPULATE_CASE:-1}
 
 if [ "$(id -u)" -eq 0 ]; then
     SUDO=
@@ -22,6 +21,8 @@ fi
 TOTAL=0
 PASS=0
 FAIL=0
+
+declare -a ACTIVE_MARKERS=()
 
 declare -A CASE_FROZEN_US
 declare -A CASE_MEMDUMP_US
@@ -167,20 +168,20 @@ record_case_vma_stats() {
 print_vma_metric_compare() {
     local label="$1"
     local base_kb="$2"
-    local dsa_kb="$3"
+    local dsa_live_kb="$3"
 
-    if [ -z "$base_kb" ] || [ -z "$dsa_kb" ]; then
+    if [ -z "$base_kb" ] || [ -z "$dsa_live_kb" ]; then
         echo "  $label: n/a (missing VMA data)"
         return
     fi
 
-    awk -v label="$label" -v base="$base_kb" -v dsa="$dsa_kb" 'BEGIN {
-        diff = base - dsa;
+    awk -v label="$label" -v base="$base_kb" -v dsa_live="$dsa_live_kb" 'BEGIN {
+        diff = base - dsa_live;
         if (base > 0)
             pct = (diff * 100.0) / base;
         else
             pct = 0.0;
-        printf("  %s: base=%d KiB dsa=%d KiB delta=%+d KiB (%+.2f%%)\n", label, base, dsa, diff, pct);
+        printf("  %s: base=%d KiB dsa_live=%d KiB delta=%+d KiB (%+.2f%%)\n", label, base, dsa_live, diff, pct);
     }'
 }
 
@@ -188,14 +189,11 @@ normalize_case_group() {
     local name="$1"
 
     case "$name" in
-        dsa_populate|dsa_populate_*)
-            echo "dsa_populate"
+        dsa_live|dsa_live_*)
+            echo "dsa_live"
             ;;
         base|base_*)
             echo "base"
-            ;;
-        dsa|dsa_*)
-            echo "dsa"
             ;;
         *)
             echo "$name"
@@ -391,23 +389,53 @@ avg_us() {
     avg_kb "$1" "$2"
 }
 
+sum_us() {
+    local a="$1"
+    local b="$2"
+
+    if [ -z "$a" ] || [ -z "$b" ]; then
+        echo ""
+        return
+    fi
+
+    echo $(( a + b ))
+}
+
+sub_us_nonneg() {
+    local a="$1"
+    local b="$2"
+    local diff
+
+    if [ -z "$a" ] || [ -z "$b" ]; then
+        echo ""
+        return
+    fi
+
+    diff=$(( a - b ))
+    if [ "$diff" -lt 0 ]; then
+        diff=0
+    fi
+
+    echo "$diff"
+}
+
 print_metric_compare() {
     local label="$1"
     local base="$2"
-    local dsa="$3"
+    local dsa_live="$3"
 
-    if [ -z "$base" ] || [ -z "$dsa" ]; then
+    if [ -z "$base" ] || [ -z "$dsa_live" ]; then
         echo "  $label: n/a (missing timing data)"
         return
     fi
 
-    awk -v label="$label" -v base="$base" -v dsa="$dsa" 'BEGIN {
-        diff = base - dsa;
+    awk -v label="$label" -v base="$base" -v dsa_live="$dsa_live" 'BEGIN {
+        diff = base - dsa_live;
         if (base > 0)
             pct = (diff * 100.0) / base;
         else
             pct = 0.0;
-        printf("  %s: base=%d us dsa=%d us delta=%+d us (%+.2f%%)\n", label, base, dsa, diff, pct);
+        printf("  %s: base=%d us dsa_live=%d us delta=%+d us (%+.2f%%)\n", label, base, dsa_live, diff, pct);
     }'
 }
 
@@ -424,6 +452,34 @@ cleanup_marker() {
             $SUDO kill -9 $pids 2>/dev/null || true
         fi
     fi
+}
+
+cleanup_all_markers() {
+    local marker
+
+    for marker in "${ACTIVE_MARKERS[@]}"; do
+        cleanup_marker "$marker"
+    done
+}
+
+register_marker() {
+    local marker="$1"
+
+    ACTIVE_MARKERS+=("$marker")
+}
+
+unregister_marker() {
+    local marker="$1"
+    local keep=()
+    local m
+
+    for m in "${ACTIVE_MARKERS[@]}"; do
+        if [ "$m" != "$marker" ]; then
+            keep+=("$m")
+        fi
+    done
+
+    ACTIVE_MARKERS=("${keep[@]}")
 }
 
 start_target() {
@@ -485,6 +541,7 @@ run_with_timeout() {
 run_case() {
     local name="$1"
     local envs="$2"
+    local mode="${3:-restore}"
     local marker="criu-test-${name}-$$"
     local case_dir="$BASE_DIR/$name"
     local img_dir="$case_dir/img"
@@ -503,6 +560,7 @@ run_case() {
     echo ""
     echo "=== CASE: $name ==="
 
+    register_marker "$marker"
     cleanup_marker "$marker"
     rm -rf "$case_dir"
     mkdir -p "$img_dir"
@@ -525,6 +583,7 @@ run_case() {
         echo "  target stderr: $case_dir/target.err"
         tail -n 40 "$case_dir/target.err" 2>/dev/null || true
         FAIL=$((FAIL + 1))
+        unregister_marker "$marker"
         return
     fi
 
@@ -546,36 +605,84 @@ run_case() {
     fi
 
     if [ "$rc" -eq 0 ]; then
-        echo "  restore start (timeout=${RESTORE_TIMEOUT_SEC}s)"
-        if [ "$RESTORE_DETACHED" -eq 1 ]; then
-            if ! run_with_timeout "$RESTORE_TIMEOUT_SEC" \
-                $SUDO "$CRIU_BIN" restore -D "$img_dir" -o "$log_restore" -v4 --shell-job --restore-detached; then
+        if [ "$mode" = "dump-only" ]; then
+            echo "  dump-only mode: skip restore"
+        elif [ "$mode" = "live-restore-check" ]; then
+            echo "  live mode: verify target keeps running"
+            if ! kill -0 "$pid" 2>/dev/null; then
+                echo "  live mode target exited unexpectedly"
                 rc=1
+            fi
+
+            if [ "$rc" -eq 0 ]; then
+                echo "  live mode: stop original target before restore check"
+                cleanup_marker "$marker"
+
+                echo "  restore check start (timeout=${RESTORE_TIMEOUT_SEC}s)"
+                if [ "$RESTORE_DETACHED" -eq 1 ]; then
+                    if ! run_with_timeout "$RESTORE_TIMEOUT_SEC" \
+                        $SUDO "$CRIU_BIN" restore -D "$img_dir" -o "$log_restore" -v4 --shell-job --restore-detached; then
+                        rc=1
+                    fi
+                else
+                    if ! run_with_timeout "$RESTORE_TIMEOUT_SEC" \
+                        $SUDO "$CRIU_BIN" restore -D "$img_dir" -o "$log_restore" -v4 --shell-job; then
+                        rc=1
+                    fi
+                fi
+
+                if [ "$rc" -eq 0 ] && grep -q "Restore finished successfully" "$log_restore" 2>/dev/null; then
+                    restore_ok=1
+                fi
+
+                if [ "$rc" -eq 0 ] && [ "$restore_ok" -ne 1 ]; then
+                    echo "  restore log does not contain success marker"
+                    rc=1
+                fi
             fi
         else
-            if ! run_with_timeout "$RESTORE_TIMEOUT_SEC" \
-                $SUDO "$CRIU_BIN" restore -D "$img_dir" -o "$log_restore" -v4 --shell-job; then
+            echo "  restore start (timeout=${RESTORE_TIMEOUT_SEC}s)"
+            if [ "$RESTORE_DETACHED" -eq 1 ]; then
+                if ! run_with_timeout "$RESTORE_TIMEOUT_SEC" \
+                    $SUDO "$CRIU_BIN" restore -D "$img_dir" -o "$log_restore" -v4 --shell-job --restore-detached; then
+                    rc=1
+                fi
+            else
+                if ! run_with_timeout "$RESTORE_TIMEOUT_SEC" \
+                    $SUDO "$CRIU_BIN" restore -D "$img_dir" -o "$log_restore" -v4 --shell-job; then
+                    rc=1
+                fi
+            fi
+
+            if [ "$rc" -eq 0 ] && grep -q "Restore finished successfully" "$log_restore" 2>/dev/null; then
+                restore_ok=1
+            fi
+
+            if [ "$rc" -eq 0 ] && [ "$restore_ok" -ne 1 ]; then
+                echo "  restore log does not contain success marker"
                 rc=1
             fi
-        fi
-
-        if [ "$rc" -eq 0 ] && grep -q "Restore finished successfully" "$log_restore" 2>/dev/null; then
-            restore_ok=1
-        fi
-
-        if [ "$rc" -eq 0 ] && [ "$restore_ok" -ne 1 ]; then
-            echo "  restore log does not contain success marker"
-            rc=1
         fi
     fi
     t1=$(date +%s)
 
     if [ "$rc" -eq 0 ]; then
-        if pgrep -f "$marker" >/dev/null 2>&1; then
+        if [ "$mode" = "dump-only" ]; then
+            echo "[PASS] $name: dump-only success, elapsed=$((t1 - t0))s"
+        elif [ "$mode" = "live-restore-check" ]; then
+            if pgrep -f "$marker" >/dev/null 2>&1; then
+                echo "[PASS] $name: live dump + restore check success, elapsed=$((t1 - t0))s"
+            else
+                echo "[PASS] $name: live dump + restore check success (restored marker not found), elapsed=$((t1 - t0))s"
+            fi
+        elif pgrep -f "$marker" >/dev/null 2>&1; then
             echo "[PASS] $name: dump+restore success, elapsed=$((t1 - t0))s"
         else
             echo "[PASS] $name: dump+restore success (restored marker not found), elapsed=$((t1 - t0))s"
         fi
+    fi
+
+    if [ "$rc" -eq 0 ]; then
         PASS=$((PASS + 1))
     else
         echo "[FAIL] $name: dump/restore failed or restored process missing"
@@ -602,6 +709,7 @@ run_case() {
     fi
 
     cleanup_marker "$marker"
+    unregister_marker "$marker"
 }
 
 if [ ! -x "$CRIU_BIN" ]; then
@@ -624,21 +732,19 @@ if [ -n "$SUDO" ]; then
 fi
 
 mkdir -p "$BASE_DIR"
+trap cleanup_all_markers EXIT INT TERM
+
 echo "test workspace: $BASE_DIR"
 echo "benchmark rounds: $BENCH_ROUNDS"
 
 if [ "$BENCH_ROUNDS" -le 1 ]; then
-    run_case "base" "CRIU_DSA_DUMP=0 CRIU_DSA_POPULATE_READ=0"
-    run_case "dsa" "CRIU_DSA_DUMP=1"
+    run_case "base" "CRIU_DSA_DUMP=0 CRIU_DSA_POPULATE_READ=0" "dump-only"
+    run_case "dsa_live" "CRIU_DSA_DUMP=1 CRIU_DSA_DESC_SCAN=1" "live-restore-check"
 else
     for i in $(seq 1 "$BENCH_ROUNDS"); do
-        run_case "base_$i" "CRIU_DSA_DUMP=0 CRIU_DSA_POPULATE_READ=0"
-        run_case "dsa_$i" "CRIU_DSA_DUMP=1"
+        run_case "base_$i" "CRIU_DSA_DUMP=0 CRIU_DSA_POPULATE_READ=0" "dump-only"
+        run_case "dsa_live_$i" "CRIU_DSA_DUMP=1 CRIU_DSA_DESC_SCAN=1" "live-restore-check"
     done
-fi
-
-if [ "$RUN_POPULATE_CASE" -eq 1 ]; then
-    run_case "dsa_populate" "CRIU_DSA_DUMP=1 CRIU_DSA_POPULATE_READ=1"
 fi
 
 echo ""
@@ -646,40 +752,44 @@ echo "=== SUMMARY ==="
 echo "TOTAL=$TOTAL PASS=$PASS FAIL=$FAIL"
 
 echo ""
-echo "=== TIMING COMPARE (base vs dsa) ==="
-echo "  samples: base=${CNT_TIMING[base]:-0} dsa=${CNT_TIMING[dsa]:-0}"
+echo "=== TIMING COMPARE (base vs dsa_live) ==="
+echo "  samples: base=${CNT_TIMING[base]:-0} dsa_live=${CNT_TIMING[dsa_live]:-0}"
 
 BASE_FROZEN_AVG=$(avg_us "${SUM_FROZEN_US[base]:-}" "${CNT_TIMING[base]:-0}")
-DSA_FROZEN_AVG=$(avg_us "${SUM_FROZEN_US[dsa]:-}" "${CNT_TIMING[dsa]:-0}")
+DSA_FROZEN_AVG=$(avg_us "${SUM_FROZEN_US[dsa_live]:-}" "${CNT_TIMING[dsa_live]:-0}")
 BASE_MEMDUMP_AVG=$(avg_us "${SUM_MEMDUMP_US[base]:-}" "${CNT_TIMING[base]:-0}")
-DSA_MEMDUMP_AVG=$(avg_us "${SUM_MEMDUMP_US[dsa]:-}" "${CNT_TIMING[dsa]:-0}")
+DSA_MEMDUMP_AVG=$(avg_us "${SUM_MEMDUMP_US[dsa_live]:-}" "${CNT_TIMING[dsa_live]:-0}")
 BASE_MEMWRITE_AVG=$(avg_us "${SUM_MEMWRITE_US[base]:-}" "${CNT_TIMING[base]:-0}")
-DSA_MEMWRITE_AVG=$(avg_us "${SUM_MEMWRITE_US[dsa]:-}" "${CNT_TIMING[dsa]:-0}")
+DSA_MEMWRITE_AVG=$(avg_us "${SUM_MEMWRITE_US[dsa_live]:-}" "${CNT_TIMING[dsa_live]:-0}")
 BASE_DSA_RPC_AVG=$(avg_us "${SUM_DSA_RPC_US[base]:-}" "${CNT_TIMING[base]:-0}")
-DSA_DSA_RPC_AVG=$(avg_us "${SUM_DSA_RPC_US[dsa]:-}" "${CNT_TIMING[dsa]:-0}")
+DSA_DSA_RPC_AVG=$(avg_us "${SUM_DSA_RPC_US[dsa_live]:-}" "${CNT_TIMING[dsa_live]:-0}")
 BASE_ASYNC_WAIT_AVG=$(avg_us "${SUM_ASYNC_WAIT_US[base]:-}" "${CNT_TIMING[base]:-0}")
-DSA_ASYNC_WAIT_AVG=$(avg_us "${SUM_ASYNC_WAIT_US[dsa]:-}" "${CNT_TIMING[dsa]:-0}")
+DSA_ASYNC_WAIT_AVG=$(avg_us "${SUM_ASYNC_WAIT_US[dsa_live]:-}" "${CNT_TIMING[dsa_live]:-0}")
+BASE_MEMWRITE_E2E_AVG=$(sum_us "$BASE_MEMWRITE_AVG" "$BASE_ASYNC_WAIT_AVG")
+DSA_MEMWRITE_E2E_AVG=$(sum_us "$DSA_MEMWRITE_AVG" "$DSA_ASYNC_WAIT_AVG")
 
 print_metric_compare "frozen(avg)" "$BASE_FROZEN_AVG" "$DSA_FROZEN_AVG"
 print_metric_compare "memdump(avg)" "$BASE_MEMDUMP_AVG" "$DSA_MEMDUMP_AVG"
 print_metric_compare "memwrite(avg)" "$BASE_MEMWRITE_AVG" "$DSA_MEMWRITE_AVG"
 print_metric_compare "dsa_rpc(avg)" "$BASE_DSA_RPC_AVG" "$DSA_DSA_RPC_AVG"
 print_metric_compare "async_wait(avg)" "$BASE_ASYNC_WAIT_AVG" "$DSA_ASYNC_WAIT_AVG"
+print_metric_compare "memwrite_e2e(avg=memwrite+async_wait)" "$BASE_MEMWRITE_E2E_AVG" "$DSA_MEMWRITE_E2E_AVG"
 
 echo ""
-echo "=== WORKLOAD COMPARE (base vs dsa) ==="
-echo "  samples: base=${CNT_WORK[base]:-0} dsa=${CNT_WORK[dsa]:-0}"
+echo "=== WORKLOAD COMPARE (base vs dsa_live) ==="
+echo "  samples: base=${CNT_WORK[base]:-0} dsa_live=${CNT_WORK[dsa_live]:-0}"
+echo "  note: workload_* is aggregated scope time across threads, not wall-clock timing."
 
 BASE_WL_TOTAL_AVG=$(avg_us "${SUM_WL_TOTAL_US[base]:-}" "${CNT_WORK[base]:-0}")
-DSA_WL_TOTAL_AVG=$(avg_us "${SUM_WL_TOTAL_US[dsa]:-}" "${CNT_WORK[dsa]:-0}")
+DSA_WL_TOTAL_AVG=$(avg_us "${SUM_WL_TOTAL_US[dsa_live]:-}" "${CNT_WORK[dsa_live]:-0}")
 BASE_WL_PREPARE_AVG=$(avg_us "${SUM_WL_PREPARE_US[base]:-}" "${CNT_WORK[base]:-0}")
-DSA_WL_PREPARE_AVG=$(avg_us "${SUM_WL_PREPARE_US[dsa]:-}" "${CNT_WORK[dsa]:-0}")
+DSA_WL_PREPARE_AVG=$(avg_us "${SUM_WL_PREPARE_US[dsa_live]:-}" "${CNT_WORK[dsa_live]:-0}")
 BASE_WL_MEMDUMP_AVG=$(avg_us "${SUM_WL_MEMDUMP_US[base]:-}" "${CNT_WORK[base]:-0}")
-DSA_WL_MEMDUMP_AVG=$(avg_us "${SUM_WL_MEMDUMP_US[dsa]:-}" "${CNT_WORK[dsa]:-0}")
+DSA_WL_MEMDUMP_AVG=$(avg_us "${SUM_WL_MEMDUMP_US[dsa_live]:-}" "${CNT_WORK[dsa_live]:-0}")
 BASE_WL_OTHER_AVG=$(avg_us "${SUM_WL_OTHER_RES_US[base]:-}" "${CNT_WORK[base]:-0}")
-DSA_WL_OTHER_AVG=$(avg_us "${SUM_WL_OTHER_RES_US[dsa]:-}" "${CNT_WORK[dsa]:-0}")
+DSA_WL_OTHER_AVG=$(avg_us "${SUM_WL_OTHER_RES_US[dsa_live]:-}" "${CNT_WORK[dsa_live]:-0}")
 BASE_WL_MEMWRITE_AVG=$(avg_us "${SUM_WL_MEMWRITE_US[base]:-}" "${CNT_WORK[base]:-0}")
-DSA_WL_MEMWRITE_AVG=$(avg_us "${SUM_WL_MEMWRITE_US[dsa]:-}" "${CNT_WORK[dsa]:-0}")
+DSA_WL_MEMWRITE_AVG=$(avg_us "${SUM_WL_MEMWRITE_US[dsa_live]:-}" "${CNT_WORK[dsa_live]:-0}")
 
 print_metric_compare "work_total(avg)" "$BASE_WL_TOTAL_AVG" "$DSA_WL_TOTAL_AVG"
 print_metric_compare "work_prepare(avg)" "$BASE_WL_PREPARE_AVG" "$DSA_WL_PREPARE_AVG"
@@ -688,19 +798,21 @@ print_metric_compare "work_other_res(avg)" "$BASE_WL_OTHER_AVG" "$DSA_WL_OTHER_A
 print_metric_compare "work_memwrite(avg)" "$BASE_WL_MEMWRITE_AVG" "$DSA_WL_MEMWRITE_AVG"
 
 BASE_WL_SCAN_AVG=$(avg_us "${SUM_WL_SCAN_IOV_US[base]:-}" "${CNT_WORK[base]:-0}")
-DSA_WL_SCAN_AVG=$(avg_us "${SUM_WL_SCAN_IOV_US[dsa]:-}" "${CNT_WORK[dsa]:-0}")
+DSA_WL_SCAN_AVG=$(avg_us "${SUM_WL_SCAN_IOV_US[dsa_live]:-}" "${CNT_WORK[dsa_live]:-0}")
 BASE_WL_BASE_RPC_AVG=$(avg_us "${SUM_WL_BASE_RPC_US[base]:-}" "${CNT_WORK[base]:-0}")
-DSA_WL_BASE_RPC_AVG=$(avg_us "${SUM_WL_BASE_RPC_US[dsa]:-}" "${CNT_WORK[dsa]:-0}")
+DSA_WL_BASE_RPC_AVG=$(avg_us "${SUM_WL_BASE_RPC_US[dsa_live]:-}" "${CNT_WORK[dsa_live]:-0}")
 BASE_WL_DSA_CTX_AVG=$(avg_us "${SUM_WL_DSA_CTX_US[base]:-}" "${CNT_WORK[base]:-0}")
-DSA_WL_DSA_CTX_AVG=$(avg_us "${SUM_WL_DSA_CTX_US[dsa]:-}" "${CNT_WORK[dsa]:-0}")
+DSA_WL_DSA_CTX_AVG=$(avg_us "${SUM_WL_DSA_CTX_US[dsa_live]:-}" "${CNT_WORK[dsa_live]:-0}")
 BASE_WL_DSA_BUILD_AVG=$(avg_us "${SUM_WL_DSA_BUILD_US[base]:-}" "${CNT_WORK[base]:-0}")
-DSA_WL_DSA_BUILD_AVG=$(avg_us "${SUM_WL_DSA_BUILD_US[dsa]:-}" "${CNT_WORK[dsa]:-0}")
+DSA_WL_DSA_BUILD_AVG=$(avg_us "${SUM_WL_DSA_BUILD_US[dsa_live]:-}" "${CNT_WORK[dsa_live]:-0}")
 BASE_WL_DSA_RPC_AVG=$(avg_us "${SUM_WL_DSA_RPC_US[base]:-}" "${CNT_WORK[base]:-0}")
-DSA_WL_DSA_RPC_AVG=$(avg_us "${SUM_WL_DSA_RPC_US[dsa]:-}" "${CNT_WORK[dsa]:-0}")
+DSA_WL_DSA_RPC_AVG=$(avg_us "${SUM_WL_DSA_RPC_US[dsa_live]:-}" "${CNT_WORK[dsa_live]:-0}")
 BASE_WL_DSA_REPLAY_AVG=$(avg_us "${SUM_WL_DSA_REPLAY_US[base]:-}" "${CNT_WORK[base]:-0}")
-DSA_WL_DSA_REPLAY_AVG=$(avg_us "${SUM_WL_DSA_REPLAY_US[dsa]:-}" "${CNT_WORK[dsa]:-0}")
+DSA_WL_DSA_REPLAY_AVG=$(avg_us "${SUM_WL_DSA_REPLAY_US[dsa_live]:-}" "${CNT_WORK[dsa_live]:-0}")
 BASE_WL_MISC_AVG=$(avg_us "${SUM_WL_MISC_US[base]:-}" "${CNT_WORK[base]:-0}")
-DSA_WL_MISC_AVG=$(avg_us "${SUM_WL_MISC_US[dsa]:-}" "${CNT_WORK[dsa]:-0}")
+DSA_WL_MISC_AVG=$(avg_us "${SUM_WL_MISC_US[dsa_live]:-}" "${CNT_WORK[dsa_live]:-0}")
+BASE_WL_MEMDUMP_CORE_AVG=$(sub_us_nonneg "$BASE_WL_MEMDUMP_AVG" "$BASE_WL_DSA_REPLAY_AVG")
+DSA_WL_MEMDUMP_CORE_AVG=$(sub_us_nonneg "$DSA_WL_MEMDUMP_AVG" "$DSA_WL_DSA_REPLAY_AVG")
 
 print_metric_compare "work_scan_iov(avg)" "$BASE_WL_SCAN_AVG" "$DSA_WL_SCAN_AVG"
 print_metric_compare "work_base_rpc(avg)" "$BASE_WL_BASE_RPC_AVG" "$DSA_WL_BASE_RPC_AVG"
@@ -708,42 +820,19 @@ print_metric_compare "work_dsa_ctx_init(avg)" "$BASE_WL_DSA_CTX_AVG" "$DSA_WL_DS
 print_metric_compare "work_dsa_batch_build(avg)" "$BASE_WL_DSA_BUILD_AVG" "$DSA_WL_DSA_BUILD_AVG"
 print_metric_compare "work_dsa_rpc(avg)" "$BASE_WL_DSA_RPC_AVG" "$DSA_WL_DSA_RPC_AVG"
 print_metric_compare "work_dsa_replay(avg)" "$BASE_WL_DSA_REPLAY_AVG" "$DSA_WL_DSA_REPLAY_AVG"
+print_metric_compare "work_memdump_core(avg=work_memdump-work_dsa_replay)" "$BASE_WL_MEMDUMP_CORE_AVG" "$DSA_WL_MEMDUMP_CORE_AVG"
 print_metric_compare "work_memdump_misc(avg)" "$BASE_WL_MISC_AVG" "$DSA_WL_MISC_AVG"
 
 echo ""
-echo "=== DSA MODE/DEGRADE COMPARE (base vs dsa) ==="
-echo "  samples: base=${CNT_DSA_MODE[base]:-0} dsa=${CNT_DSA_MODE[dsa]:-0}"
-
-BASE_DEGRADE_TOTAL_AVG=$(avg_us "${SUM_DSA_DEGRADE_TOTAL[base]:-}" "${CNT_DSA_MODE[base]:-0}")
-DSA_DEGRADE_TOTAL_AVG=$(avg_us "${SUM_DSA_DEGRADE_TOTAL[dsa]:-}" "${CNT_DSA_MODE[dsa]:-0}")
-BASE_DEGRADE_SHARED_AVG=$(avg_us "${SUM_DSA_DEGRADE_SHARED[base]:-}" "${CNT_DSA_MODE[base]:-0}")
-DSA_DEGRADE_SHARED_AVG=$(avg_us "${SUM_DSA_DEGRADE_SHARED[dsa]:-}" "${CNT_DSA_MODE[dsa]:-0}")
-BASE_DEGRADE_SUBMIT_AVG=$(avg_us "${SUM_DSA_DEGRADE_SUBMIT[base]:-}" "${CNT_DSA_MODE[base]:-0}")
-DSA_DEGRADE_SUBMIT_AVG=$(avg_us "${SUM_DSA_DEGRADE_SUBMIT[dsa]:-}" "${CNT_DSA_MODE[dsa]:-0}")
-BASE_SUBMIT_ENQCMD_AVG=$(avg_us "${SUM_DSA_SUBMIT_ENQCMD[base]:-}" "${CNT_DSA_MODE[base]:-0}")
-DSA_SUBMIT_ENQCMD_AVG=$(avg_us "${SUM_DSA_SUBMIT_ENQCMD[dsa]:-}" "${CNT_DSA_MODE[dsa]:-0}")
-BASE_SUBMIT_WRITE_AVG=$(avg_us "${SUM_DSA_SUBMIT_WRITE[base]:-}" "${CNT_DSA_MODE[base]:-0}")
-DSA_SUBMIT_WRITE_AVG=$(avg_us "${SUM_DSA_SUBMIT_WRITE[dsa]:-}" "${CNT_DSA_MODE[dsa]:-0}")
-BASE_MAP_POP_FB_AVG=$(avg_us "${SUM_DSA_MAP_POP_FALLBACK[base]:-}" "${CNT_DSA_MODE[base]:-0}")
-DSA_MAP_POP_FB_AVG=$(avg_us "${SUM_DSA_MAP_POP_FALLBACK[dsa]:-}" "${CNT_DSA_MODE[dsa]:-0}")
-
-print_metric_compare "degrade_total(avg)" "$BASE_DEGRADE_TOTAL_AVG" "$DSA_DEGRADE_TOTAL_AVG"
-print_metric_compare "degrade_shared_mem(avg)" "$BASE_DEGRADE_SHARED_AVG" "$DSA_DEGRADE_SHARED_AVG"
-print_metric_compare "degrade_submit(avg)" "$BASE_DEGRADE_SUBMIT_AVG" "$DSA_DEGRADE_SUBMIT_AVG"
-print_metric_compare "submit_enqcmd_desc(avg)" "$BASE_SUBMIT_ENQCMD_AVG" "$DSA_SUBMIT_ENQCMD_AVG"
-print_metric_compare "submit_write_desc(avg)" "$BASE_SUBMIT_WRITE_AVG" "$DSA_SUBMIT_WRITE_AVG"
-print_metric_compare "map_populate_fallback(avg)" "$BASE_MAP_POP_FB_AVG" "$DSA_MAP_POP_FB_AVG"
-
-echo ""
-echo "=== VMA SIZE COMPARE (base vs dsa) ==="
-echo "  samples: base=${CNT_VMA[base]:-0} dsa=${CNT_VMA[dsa]:-0}"
+echo "=== VMA SIZE COMPARE (base vs dsa_live) ==="
+echo "  samples: base=${CNT_VMA[base]:-0} dsa_live=${CNT_VMA[dsa_live]:-0}"
 
 BASE_VMA_AVG_KB=$(avg_kb "${SUM_VMA_AVG_KB[base]:-}" "${CNT_VMA[base]:-0}")
-DSA_VMA_AVG_KB=$(avg_kb "${SUM_VMA_AVG_KB[dsa]:-}" "${CNT_VMA[dsa]:-0}")
+DSA_VMA_AVG_KB=$(avg_kb "${SUM_VMA_AVG_KB[dsa_live]:-}" "${CNT_VMA[dsa_live]:-0}")
 BASE_VMA_P95_KB=$(avg_kb "${SUM_VMA_P95_KB[base]:-}" "${CNT_VMA[base]:-0}")
-DSA_VMA_P95_KB=$(avg_kb "${SUM_VMA_P95_KB[dsa]:-}" "${CNT_VMA[dsa]:-0}")
+DSA_VMA_P95_KB=$(avg_kb "${SUM_VMA_P95_KB[dsa_live]:-}" "${CNT_VMA[dsa_live]:-0}")
 BASE_VMA_P99_KB=$(avg_kb "${SUM_VMA_P99_KB[base]:-}" "${CNT_VMA[base]:-0}")
-DSA_VMA_P99_KB=$(avg_kb "${SUM_VMA_P99_KB[dsa]:-}" "${CNT_VMA[dsa]:-0}")
+DSA_VMA_P99_KB=$(avg_kb "${SUM_VMA_P99_KB[dsa_live]:-}" "${CNT_VMA[dsa_live]:-0}")
 
 print_vma_metric_compare "vma_avg" "$BASE_VMA_AVG_KB" "$DSA_VMA_AVG_KB"
 print_vma_metric_compare "vma_p95" "$BASE_VMA_P95_KB" "$DSA_VMA_P95_KB"

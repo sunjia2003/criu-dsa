@@ -1755,7 +1755,7 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		goto err_cure;
 	}
 
-	if (dmpi(item)->mem_async) {
+	if (dmpi(item)->mem_async && !parasite_mem_async_deferred(item)) {
 		workload_switch_scope(WORK_SCOPE_MEM_WRITE_WAIT);
 		work_scope = WORK_SCOPE_MEM_WRITE_WAIT;
 		ret = parasite_dump_pages_seized_wait(item);
@@ -1807,7 +1807,8 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 
 	exit_code = 0;
 err:
-	if (dmpi(item)->mem_async) {
+	if (dmpi(item)->mem_async &&
+	    (exit_code || !parasite_mem_async_deferred(item))) {
 		workload_switch_scope(WORK_SCOPE_MEM_WRITE_WAIT);
 		if (parasite_dump_pages_seized_wait(item))
 			pr_err("Async memory write cleanup failed (pid: %d)\n", pid);
@@ -2116,9 +2117,124 @@ static int cr_lazy_mem_dump(void)
 	return ret;
 }
 
+static bool dsa_keep_failed_images_enabled(void)
+{
+	const char *env;
+
+	env = getenv("CRIU_DSA_KEEP_FAILED_IMAGES");
+	if (!env)
+		return false;
+
+	return atoi(env) > 0;
+}
+
+static bool dsa_live_dump_active(void)
+{
+	struct pstree_item *item;
+
+	for_each_pstree_item(item) {
+		if (parasite_mem_async_deferred(item))
+			return true;
+	}
+
+	return false;
+}
+
+static int dsa_wait_deferred_async_writers(void)
+{
+	struct pstree_item *item;
+	int ret = 0;
+
+	for_each_pstree_item(item) {
+		if (!dmpi(item)->mem_async)
+			continue;
+
+		if (parasite_dump_pages_seized_wait(item)) {
+			pr_err("Deferred async memory write wait failed (pid: %d)\n",
+			       item->pid->real);
+			ret = -1;
+		}
+	}
+
+	return ret;
+}
+
 static int cr_dump_finish(int ret)
 {
 	int post_dump_ret = 0;
+	bool dsa_live_mode = dsa_live_dump_active();
+
+	if (dsa_live_mode) {
+		/*
+		 * DSA live mode keeps tasks running after checkpoint and finalizes
+		 * async memwrite outside the frozen window.
+		 */
+		unsuspend_lsm();
+		network_unlock();
+		delete_link_remaps();
+
+		if (!ret && opts.lazy_pages)
+			ret = cr_lazy_mem_dump();
+
+		if (arch_set_thread_regs(root_item, true) < 0)
+			return -1;
+
+		cr_plugin_fini(CR_PLUGIN_STAGE__DUMP, ret);
+
+		pstree_switch_state(root_item, TASK_ALIVE);
+		timing_stop(TIME_FROZEN);
+
+		if (dsa_wait_deferred_async_writers())
+			ret = -1;
+
+		if (disconnect_from_page_server())
+			ret = -1;
+
+		close_cr_imgset(&glob_imgset);
+
+		if (bfd_flush_images())
+			ret = -1;
+
+		cgp_fini();
+
+		if (!ret) {
+			post_dump_ret = run_scripts(ACT_POST_DUMP);
+			if (post_dump_ret) {
+				post_dump_ret = WEXITSTATUS(post_dump_ret);
+				pr_info("Post dump script passed with %d\n", post_dump_ret);
+			}
+		}
+
+		free_pstree(root_item);
+		seccomp_free_entries();
+		free_file_locks();
+		free_link_remaps();
+		free_aufs_branches();
+		free_userns_data();
+
+		close_service_fd(CR_PROC_FD_OFF);
+		close_image_dir();
+
+		if ((ret || post_dump_ret) && !dsa_keep_failed_images_enabled() &&
+		    opts.imgs_dir && rmrf(opts.imgs_dir))
+			pr_warn("Failed to cleanup image dir %s after live dump failure\n",
+				opts.imgs_dir);
+
+		if (ret || post_dump_ret) {
+			if (fault_injected(FI_DUMP_CRASH)) {
+				pr_info("fault: CRIU dump crashed!\n");
+				abort();
+			}
+			print_dump_timing_summary("Dump");
+			pr_err("Dumping FAILED.\n");
+		} else {
+			print_dump_timing_summary("Dump");
+			write_stats(DUMP_STATS);
+			pr_info("Dumping finished successfully\n");
+		}
+
+		return post_dump_ret ?: (ret != 0);
+	}
 
 	if (disconnect_from_page_server())
 		ret = -1;
