@@ -355,6 +355,7 @@ struct mem_dump_async {
 };
 #define DSA_BATCH_TARGET_US_MAX	500000U
 #define DSA_BATCH_LIMIT_MIN_DEFAULT	128U
+#define DSA_DESC_SCAN_MAX_COPY_LEN	(128U * 1024U)
 
 #ifndef MADV_POPULATE_READ
 #define MADV_POPULATE_READ	22
@@ -1112,14 +1113,32 @@ static int dsa_desc_scan_batch_append(struct dsa_desc_scan_ctx *sc,
 	u32 next_desc_count;
 	u32 desc_bytes;
 	u32 data_off;
+	u32 merge_idx = 0;
 	size_t copy_budget;
+	bool merge_prev;
 
 	shared_u8 = sc->dsa_ctx->shared_buf;
 	shm_desc = (struct dsa_dump_descriptor *)(shared_u8 +
 						  sizeof(struct parasite_dsa_shm_hdr));
 
 	retry_append:
+	merge_prev = false;
 	next_desc_count = sc->desc_count + 1;
+
+	if (sc->desc_count > 0) {
+		u64 prev_src = shm_desc[sc->desc_count - 1].src_addr;
+		u32 prev_len = shm_desc[sc->desc_count - 1].copy_len;
+		u64 expected = prev_src + prev_len;
+
+		/* Keep each desc bounded even when source pages are contiguous. */
+		if (src_addr == expected && prev_len <= UINT_MAX - copy_len &&
+		    prev_len + copy_len <= DSA_DESC_SCAN_MAX_COPY_LEN) {
+			merge_prev = true;
+			next_desc_count = sc->desc_count;
+			merge_idx = sc->desc_count - 1;
+		}
+	}
+
 	desc_bytes = next_desc_count * sizeof(struct dsa_dump_descriptor);
 	data_off = round_up(sizeof(struct parasite_dsa_shm_hdr) + desc_bytes,
 			    DSA_SHARED_DATA_ALIGN);
@@ -1134,13 +1153,6 @@ static int dsa_desc_scan_batch_append(struct dsa_desc_scan_ctx *sc,
 	if (copy_len > copy_budget)
 		goto need_flush;
 
-	if (dsa_desc_scan_ensure_cap(sc, sc->desc_count))
-		return -1;
-
-	shm_desc[sc->desc_count].src_addr = src_addr;
-	shm_desc[sc->desc_count].copy_len = copy_len;
-	shm_desc[sc->desc_count].reserved0 = 0;
-
 	if (sc->desc_count > 0) {
 		u64 prev_src = shm_desc[sc->desc_count - 1].src_addr;
 		u32 prev_len = shm_desc[sc->desc_count - 1].copy_len;
@@ -1153,10 +1165,22 @@ static int dsa_desc_scan_batch_append(struct dsa_desc_scan_ctx *sc,
 			sc->desc_seq_discont++;
 	}
 
-	sc->batch_src_addr[sc->desc_count] = src_addr;
-	sc->batch_copy_len[sc->desc_count] = copy_len;
+	if (merge_prev) {
+		shm_desc[merge_idx].copy_len += copy_len;
+		sc->batch_copy_len[merge_idx] += copy_len;
+	} else {
+		if (dsa_desc_scan_ensure_cap(sc, sc->desc_count))
+			return -1;
 
-	sc->desc_count = next_desc_count;
+		shm_desc[sc->desc_count].src_addr = src_addr;
+		shm_desc[sc->desc_count].copy_len = copy_len;
+		shm_desc[sc->desc_count].reserved0 = 0;
+
+		sc->batch_src_addr[sc->desc_count] = src_addr;
+		sc->batch_copy_len[sc->desc_count] = copy_len;
+
+		sc->desc_count = next_desc_count;
+	}
 	sc->batch_bytes += copy_len;
 
 	if (!is_last)

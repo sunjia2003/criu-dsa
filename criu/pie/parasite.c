@@ -74,7 +74,7 @@ static char dsa_cached_wq_paths[DSA_DUMP_MAX_WQ][64];
 #define DSA_PORTAL_MAP_SIZE 0x1000UL
 #define DSA_MAX_ENQ_RETRY   1000000U
 #define HUGEPAGE_2MB_SIZE   (2UL * 1024UL * 1024UL)
-#define DSA_DESC_PER_WQ     8U
+#define DSA_DESC_PER_WQ     128U
 
 static inline unsigned long dsa_align_up(unsigned long x, unsigned long align)
 {
