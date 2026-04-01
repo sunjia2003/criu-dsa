@@ -406,7 +406,7 @@ static __maybe_unused unsigned int dsa_batch_limit_min(void)
 				 DSA_DUMP_BATCH_SIZE);
 }
 
-static unsigned int dsa_round_up_u32(unsigned int val, unsigned int align)
+static __maybe_unused unsigned int dsa_round_up_u32(unsigned int val, unsigned int align)
 {
 	unsigned long long rounded;
 
@@ -420,7 +420,7 @@ static unsigned int dsa_round_up_u32(unsigned int val, unsigned int align)
 	return (unsigned int)rounded;
 }
 
-static bool dsa_read_ull_file(const char *path, unsigned long long *value)
+static __maybe_unused bool dsa_read_ull_file(const char *path, unsigned long long *value)
 {
 	FILE *fp;
 	char buf[64];
@@ -445,7 +445,7 @@ static bool dsa_read_ull_file(const char *path, unsigned long long *value)
 	return true;
 }
 
-static unsigned int dsa_shared_buf_size_manual(void)
+static __maybe_unused unsigned int dsa_shared_buf_size_manual(void)
 {
 	return dsa_round_up_u32(dsa_parse_env_u32("CRIU_DSA_SHARED_BUF_SIZE",
 						 DSA_SHARED_BUF_SIZE_DEFAULT,
@@ -454,7 +454,7 @@ static unsigned int dsa_shared_buf_size_manual(void)
 				 DSA_SHARED_DATA_ALIGN);
 }
 
-static unsigned int dsa_shared_buf_auto_max(void)
+static __maybe_unused unsigned int dsa_shared_buf_auto_max(void)
 {
 	unsigned long long free_pages;
 	unsigned long long free_bytes;
@@ -473,7 +473,7 @@ static unsigned int dsa_shared_buf_auto_max(void)
 	return (unsigned int)free_bytes;
 }
 
-static unsigned long long dsa_estimate_dirty_bytes(pid_t pid)
+static __maybe_unused unsigned long long dsa_estimate_dirty_bytes(pid_t pid)
 {
 	char path[64];
 	FILE *fp;
@@ -507,7 +507,7 @@ static unsigned long long dsa_estimate_dirty_bytes(pid_t pid)
 	return (private_dirty_kb + shared_dirty_kb) * 1024ULL;
 }
 
-static unsigned int dsa_shared_buf_size_auto(pid_t target_pid)
+static __maybe_unused unsigned int dsa_shared_buf_size_auto(pid_t target_pid)
 {
 	unsigned long long dirty_bytes;
 	unsigned long long target;
@@ -550,7 +550,7 @@ static unsigned int dsa_shared_buf_size_auto(pid_t target_pid)
 	return final_size;
 }
 
-static unsigned int dsa_shared_buf_size(pid_t target_pid)
+static __maybe_unused unsigned int dsa_shared_buf_size(pid_t target_pid)
 {
 	if (getenv("CRIU_DSA_SHARED_BUF_SIZE"))
 		return dsa_shared_buf_size_manual();
@@ -750,6 +750,7 @@ struct dsa_dump_ctx {
 	void *shared_buf;
 	int pidfd;
 	bool do_populate_read;
+	bool shared_from_before_freeze;
 	bool shared_fds_sent;
 	bool shared_hugetlb;
 	u32 shared_degrade_cnt;
@@ -775,20 +776,171 @@ static void dsa_replay_ctx_init(struct dsa_dump_ctx *ctx);
 static int dsa_replay_wait_idle(struct dsa_dump_ctx *ctx);
 static void dsa_replay_stop(struct dsa_dump_ctx *ctx);
 
-static int dsa_dump_ctx_init(struct dsa_dump_ctx *ctx, pid_t target_pid)
+struct dsa_shared_mem_before_freeze {
+	int fd;
+	void *buf;
+	size_t size;
+	bool ready;
+	u64 total_us;
+	u64 create_us;
+	u64 truncate_us;
+	u64 mmap_us;
+};
+
+static struct dsa_shared_mem_before_freeze dsa_shared_mem_bf = {
+	.fd = -1,
+	.buf = MAP_FAILED,
+	.size = 0,
+	.ready = false,
+	.total_us = 0,
+	.create_us = 0,
+	.truncate_us = 0,
+	.mmap_us = 0,
+};
+
+static void dsa_shared_mem_bf_reset(void)
+{
+	dsa_shared_mem_bf.fd = -1;
+	dsa_shared_mem_bf.buf = MAP_FAILED;
+	dsa_shared_mem_bf.size = 0;
+	dsa_shared_mem_bf.ready = false;
+	dsa_shared_mem_bf.total_us = 0;
+	dsa_shared_mem_bf.create_us = 0;
+	dsa_shared_mem_bf.truncate_us = 0;
+	dsa_shared_mem_bf.mmap_us = 0;
+}
+
+void dsa_shared_mem_cleanup_after_dump(void)
+{
+	if (dsa_shared_mem_bf.buf != MAP_FAILED)
+		munmap(dsa_shared_mem_bf.buf, dsa_shared_mem_bf.size);
+
+	if (dsa_shared_mem_bf.fd >= 0)
+		close(dsa_shared_mem_bf.fd);
+
+	dsa_shared_mem_bf_reset();
+}
+
+int dsa_shared_mem_prepare_before_freeze(void)
 {
 	int htlb_flags;
-	int saved_errno;
+	int fd = -1;
+	void *buf = MAP_FAILED;
+	size_t size = DSA_SHARED_BUF_SIZE_MAX -
+		(DSA_SHARED_BUF_SIZE_MAX % DSA_HUGEPAGE_2MB_SIZE);
+	struct timespec all_begin;
+	struct timespec all_end;
+	struct timespec t_begin;
+	struct timespec t_end;
+
+	if (!dsa_dump_enabled())
+		return 0;
+
+	if (dsa_shared_mem_bf.ready)
+		return 0;
+
+	if (dsa_shared_mem_bf.fd >= 0 || dsa_shared_mem_bf.buf != MAP_FAILED)
+		dsa_shared_mem_cleanup_after_dump();
+
+	htlb_flags = MFD_CLOEXEC | MFD_HUGETLB | MFD_HUGE_2MB;
+
+	clock_gettime(CLOCK_MONOTONIC, &all_begin);
+
+	clock_gettime(CLOCK_MONOTONIC, &t_begin);
+	fd = memfd_create("criu_dsa_dump", htlb_flags);
+	clock_gettime(CLOCK_MONOTONIC, &t_end);
+	dsa_shared_mem_bf.create_us = dsa_timespec_delta_us(&t_begin, &t_end);
+	if (fd < 0) {
+		pr_perror("DSA: before-freeze memfd_create failed");
+		return -1;
+	}
+
+	clock_gettime(CLOCK_MONOTONIC, &t_begin);
+	if (ftruncate(fd, size)) {
+		clock_gettime(CLOCK_MONOTONIC, &t_end);
+		dsa_shared_mem_bf.truncate_us = dsa_timespec_delta_us(&t_begin, &t_end);
+		pr_perror("DSA: before-freeze ftruncate failed");
+		goto err;
+	}
+	clock_gettime(CLOCK_MONOTONIC, &t_end);
+	dsa_shared_mem_bf.truncate_us = dsa_timespec_delta_us(&t_begin, &t_end);
+
+	clock_gettime(CLOCK_MONOTONIC, &t_begin);
+	buf = mmap(NULL, size, PROT_READ | PROT_WRITE,
+		   MAP_SHARED | MAP_POPULATE, fd, 0);
+	clock_gettime(CLOCK_MONOTONIC, &t_end);
+	dsa_shared_mem_bf.mmap_us = dsa_timespec_delta_us(&t_begin, &t_end);
+	if (buf == MAP_FAILED) {
+		pr_perror("DSA: before-freeze mmap MAP_POPULATE failed");
+		goto err;
+	}
+
+	if (((unsigned long)buf & (DSA_SHARED_DATA_ALIGN - 1)) != 0) {
+		pr_err("DSA before-freeze shared buffer alignment is invalid\n");
+		goto err;
+	}
+
+	clock_gettime(CLOCK_MONOTONIC, &all_end);
+	dsa_shared_mem_bf.total_us = dsa_timespec_delta_us(&all_begin, &all_end);
+	dsa_shared_mem_bf.fd = fd;
+	dsa_shared_mem_bf.buf = buf;
+	dsa_shared_mem_bf.size = size;
+	dsa_shared_mem_bf.ready = true;
+
+	pr_info("DSA_SHARED_MEM_PREPARE: size=%zu create_us=%llu truncate_us=%llu mmap_us=%llu total_us=%llu\n",
+		size,
+		(unsigned long long)dsa_shared_mem_bf.create_us,
+		(unsigned long long)dsa_shared_mem_bf.truncate_us,
+		(unsigned long long)dsa_shared_mem_bf.mmap_us,
+		(unsigned long long)dsa_shared_mem_bf.total_us);
+
+	return 0;
+
+err:
+	if (buf != MAP_FAILED)
+		munmap(buf, size);
+	if (fd >= 0)
+		close(fd);
+
+	dsa_shared_mem_bf_reset();
+	return -1;
+}
+
+static int dsa_take_shared_mem_before_freeze(struct dsa_dump_ctx *ctx, pid_t target_pid)
+{
+	if (!dsa_shared_mem_bf.ready || dsa_shared_mem_bf.fd < 0 ||
+	    dsa_shared_mem_bf.buf == MAP_FAILED || !dsa_shared_mem_bf.size) {
+		pr_err("DSA strict: before-freeze shared memory is not ready for pid %d\n",
+		       target_pid);
+		return -1;
+	}
+
+	ctx->shared_fd = dup(dsa_shared_mem_bf.fd);
+	if (ctx->shared_fd < 0) {
+		pr_perror("DSA: dup before-freeze shared fd failed");
+		return -1;
+	}
+
+	ctx->shared_buf = dsa_shared_mem_bf.buf;
+	ctx->shared_buf_size = dsa_shared_mem_bf.size;
+	ctx->shared_from_before_freeze = true;
+
+	return 0;
+}
+
+static int dsa_dump_ctx_init(struct dsa_dump_ctx *ctx, pid_t target_pid)
+{
+	int ret;
 
 	if (!ctx)
 		return -1;
 
 	if (ctx->shared_fd >= 0)
 		return 0;
+
+	ctx->shared_from_before_freeze = false;
 	ctx->shared_hugetlb = true;
 	ctx->shared_degrade_cnt = 0;
-
-	ctx->shared_buf_size = dsa_shared_buf_size(target_pid);
 
 	ctx->wq_count = dsa_collect_workqueues(ctx->wq_paths, DSA_DUMP_MAX_WQ);
 	if (ctx->wq_count <= 0) {
@@ -804,43 +956,9 @@ static int dsa_dump_ctx_init(struct dsa_dump_ctx *ctx, pid_t target_pid)
 				 target_pid);
 	}
 
-	htlb_flags = MFD_CLOEXEC | MFD_HUGETLB | MFD_HUGE_2MB;
-
-	if (ctx->shared_fd >= 0) {
-		close(ctx->shared_fd);
-		ctx->shared_fd = -1;
-	}
-
-	ctx->shared_fd = memfd_create("criu_dsa_dump", htlb_flags);
-
-	if (ctx->shared_fd < 0) {
-		saved_errno = errno;
-		ctx->shared_degrade_cnt++;
-		pr_info("DSA_DEGRADE: category=shared_mem stage=memfd_create from=hugetlb to=normal_memfd errno=%d pid=%d shared_buf_size=%zu strict=1 blocked=1\n",
-			saved_errno, target_pid, ctx->shared_buf_size);
-		pr_perror("Can't create DSA hugetlb shared memfd in strict mode");
-		return -1;
-	}
-
-	if (ftruncate(ctx->shared_fd, ctx->shared_buf_size)) {
-		saved_errno = errno;
-		ctx->shared_degrade_cnt++;
-		pr_info("DSA_DEGRADE: category=shared_mem stage=ftruncate from=hugetlb to=normal_memfd errno=%d pid=%d shared_buf_size=%zu strict=1 blocked=1\n",
-			saved_errno, target_pid, ctx->shared_buf_size);
-		pr_perror("Can't resize DSA hugetlb shared memfd in strict mode");
-		return -1;
-	}
-
-	ctx->shared_buf = mmap(NULL, ctx->shared_buf_size, PROT_READ | PROT_WRITE,
-				     MAP_SHARED, ctx->shared_fd, 0);
-	if (ctx->shared_buf == MAP_FAILED) {
-		saved_errno = errno;
-		ctx->shared_degrade_cnt++;
-		pr_info("DSA_DEGRADE: category=shared_mem stage=mmap from=hugetlb to=normal_memfd errno=%d pid=%d shared_buf_size=%zu strict=1 blocked=1\n",
-			saved_errno, target_pid, ctx->shared_buf_size);
-		pr_perror("Can't map DSA hugetlb shared memfd in strict mode");
-		return -1;
-	}
+	ret = dsa_take_shared_mem_before_freeze(ctx, target_pid);
+	if (ret)
+		return ret;
 
 	if (((unsigned long)ctx->shared_buf & (DSA_SHARED_DATA_ALIGN - 1)) != 0) {
 		pr_err("DSA shared buffer alignment is invalid\n");
@@ -869,7 +987,7 @@ static int dsa_dump_ctx_fini(struct dsa_dump_ctx *ctx)
 	}
 	dsa_replay_stop(ctx);
 
-	if (ctx->shared_buf != MAP_FAILED)
+	if (ctx->shared_buf != MAP_FAILED && !ctx->shared_from_before_freeze)
 		munmap(ctx->shared_buf, ctx->shared_buf_size);
 	if (ctx->shared_fd >= 0)
 		close(ctx->shared_fd);
@@ -879,6 +997,7 @@ static int dsa_dump_ctx_fini(struct dsa_dump_ctx *ctx)
 	ctx->shared_fd = -1;
 	ctx->shared_buf = MAP_FAILED;
 	ctx->pidfd = -1;
+	ctx->shared_from_before_freeze = false;
 
 	return ret;
 }
@@ -1117,6 +1236,27 @@ struct dsa_batch_stats {
 	u64 submit_enqcmd;
 	u64 submit_write;
 	u64 map_populate_fallbacks;
+	u64 prefault_us;
+	u64 submit_us;
+	u64 poll_us;
+	u64 max_prefault_us;
+	u64 min_prefault_us;
+	u64 max_submit_us;
+	u64 min_submit_us;
+	u64 max_poll_us;
+	u64 min_poll_us;
+	u64 setup_us;
+	u64 setup_shared_us;
+	u64 setup_wq_us;
+	u64 setup_shared_recv_fd_us;
+	u64 setup_shared_mmap_us;
+	u64 setup_wq_recv_fd_us;
+	u64 setup_wq_open_us;
+	u64 setup_wq_mmap_us;
+	u64 cleanup_munmap_us;
+	u64 cleanup_close_us;
+	u64 max_setup_us;
+	u64 min_setup_us;
 };
 
 struct dsa_desc_scan_ctx {
@@ -1152,6 +1292,10 @@ static void dsa_batch_stats_init(struct dsa_batch_stats *stats)
 	memset(stats, 0, sizeof(*stats));
 	stats->min_bytes = SIZE_MAX;
 	stats->min_desc = UINT_MAX;
+	stats->min_prefault_us = ULLONG_MAX;
+	stats->min_submit_us = ULLONG_MAX;
+	stats->min_poll_us = ULLONG_MAX;
+	stats->min_setup_us = ULLONG_MAX;
 }
 
 static void dsa_batch_stats_add(struct dsa_batch_stats *stats,
@@ -1183,6 +1327,35 @@ static void dsa_batch_stats_add(struct dsa_batch_stats *stats,
 	stats->submit_enqcmd += dargs->submit_enqcmd;
 	stats->submit_write += dargs->submit_write;
 	stats->map_populate_fallbacks += dargs->map_populate_fallbacks;
+	stats->prefault_us += dargs->prefault_us;
+	stats->submit_us += dargs->submit_us;
+	stats->poll_us += dargs->poll_us;
+	stats->setup_us += dargs->setup_us;
+	stats->setup_shared_us += dargs->setup_shared_us;
+	stats->setup_wq_us += dargs->setup_wq_us;
+	stats->setup_shared_recv_fd_us += dargs->setup_shared_recv_fd_us;
+	stats->setup_shared_mmap_us += dargs->setup_shared_mmap_us;
+	stats->setup_wq_recv_fd_us += dargs->setup_wq_recv_fd_us;
+	stats->setup_wq_open_us += dargs->setup_wq_open_us;
+	stats->setup_wq_mmap_us += dargs->setup_wq_mmap_us;
+	stats->cleanup_munmap_us += dargs->cleanup_munmap_us;
+	stats->cleanup_close_us += dargs->cleanup_close_us;
+	if (dargs->prefault_us > stats->max_prefault_us)
+		stats->max_prefault_us = dargs->prefault_us;
+	if (dargs->prefault_us < stats->min_prefault_us)
+		stats->min_prefault_us = dargs->prefault_us;
+	if (dargs->submit_us > stats->max_submit_us)
+		stats->max_submit_us = dargs->submit_us;
+	if (dargs->submit_us < stats->min_submit_us)
+		stats->min_submit_us = dargs->submit_us;
+	if (dargs->poll_us > stats->max_poll_us)
+		stats->max_poll_us = dargs->poll_us;
+	if (dargs->poll_us < stats->min_poll_us)
+		stats->min_poll_us = dargs->poll_us;
+	if (dargs->setup_us > stats->max_setup_us)
+		stats->max_setup_us = dargs->setup_us;
+	if (dargs->setup_us < stats->min_setup_us)
+		stats->min_setup_us = dargs->setup_us;
 	if (dargs->submit_write)
 		stats->submit_degrade_calls++;
 }
@@ -1190,8 +1363,54 @@ static void dsa_batch_stats_add(struct dsa_batch_stats *stats,
 static void dsa_batch_stats_log(const struct dsa_batch_stats *stats,
 				const struct dsa_dump_ctx *ctx)
 {
+	u64 avg_prefault_us;
+	u64 min_prefault_us;
+	u64 avg_submit_us;
+	u64 avg_poll_us;
+	u64 avg_submit_poll_us;
+	u64 min_submit_us;
+	u64 min_poll_us;
+	u64 avg_setup_us;
+	u64 avg_setup_shared_us;
+	u64 avg_setup_wq_us;
+	u64 avg_setup_shared_recv_fd_us;
+	u64 avg_setup_shared_mmap_us;
+	u64 avg_setup_wq_recv_fd_us;
+	u64 avg_setup_wq_open_us;
+	u64 avg_setup_wq_mmap_us;
+	u64 avg_cleanup_munmap_us;
+	u64 avg_cleanup_close_us;
+	u64 min_setup_us;
+
 	if (!stats->rpc_calls)
 		return;
+
+	avg_prefault_us = stats->prefault_us / stats->rpc_calls;
+	avg_submit_us = stats->submit_us / stats->rpc_calls;
+	avg_poll_us = stats->poll_us / stats->rpc_calls;
+	avg_submit_poll_us = (stats->submit_us + stats->poll_us) /
+		stats->rpc_calls;
+	avg_setup_us = stats->setup_us / stats->rpc_calls;
+	avg_setup_shared_us = stats->setup_shared_us / stats->rpc_calls;
+	avg_setup_wq_us = stats->setup_wq_us / stats->rpc_calls;
+	avg_setup_shared_recv_fd_us = stats->setup_shared_recv_fd_us /
+		stats->rpc_calls;
+	avg_setup_shared_mmap_us = stats->setup_shared_mmap_us /
+		stats->rpc_calls;
+	avg_setup_wq_recv_fd_us = stats->setup_wq_recv_fd_us /
+		stats->rpc_calls;
+	avg_setup_wq_open_us = stats->setup_wq_open_us / stats->rpc_calls;
+	avg_setup_wq_mmap_us = stats->setup_wq_mmap_us / stats->rpc_calls;
+	avg_cleanup_munmap_us = stats->cleanup_munmap_us / stats->rpc_calls;
+	avg_cleanup_close_us = stats->cleanup_close_us / stats->rpc_calls;
+	min_prefault_us = stats->min_prefault_us == ULLONG_MAX ? 0 :
+		stats->min_prefault_us;
+	min_submit_us = stats->min_submit_us == ULLONG_MAX ? 0 :
+		stats->min_submit_us;
+	min_poll_us = stats->min_poll_us == ULLONG_MAX ? 0 :
+		stats->min_poll_us;
+	min_setup_us = stats->min_setup_us == ULLONG_MAX ? 0 :
+		stats->min_setup_us;
 
 	pr_info("DSA batch stats: calls=%u avg_bytes=%llu avg_desc=%llu min_bytes=%zu max_bytes=%zu min_desc=%u max_desc=%u bins[<=1M:%u <=4M:%u <=16M:%u >16M:%u]\n",
 		stats->rpc_calls,
@@ -1208,6 +1427,50 @@ static void dsa_batch_stats_log(const struct dsa_batch_stats *stats,
 		(unsigned long long)stats->map_populate_fallbacks,
 		ctx->shared_hugetlb ? "hugetlb" : "normal_memfd",
 		ctx->shared_degrade_cnt);
+	pr_info("DSA prefault stats: calls=%u total_us=%llu avg_us=%llu min_us=%llu max_us=%llu\n",
+		stats->rpc_calls,
+		(unsigned long long)stats->prefault_us,
+		(unsigned long long)avg_prefault_us,
+		(unsigned long long)min_prefault_us,
+		(unsigned long long)stats->max_prefault_us);
+	pr_info("DSA submit/poll stats: calls=%u submit_total_us=%llu poll_total_us=%llu submit_poll_total_us=%llu avg_submit_us=%llu avg_poll_us=%llu avg_submit_poll_us=%llu min_submit_us=%llu max_submit_us=%llu min_poll_us=%llu max_poll_us=%llu\n",
+		stats->rpc_calls,
+		(unsigned long long)stats->submit_us,
+		(unsigned long long)stats->poll_us,
+		(unsigned long long)(stats->submit_us + stats->poll_us),
+		(unsigned long long)avg_submit_us,
+		(unsigned long long)avg_poll_us,
+		(unsigned long long)avg_submit_poll_us,
+		(unsigned long long)min_submit_us,
+		(unsigned long long)stats->max_submit_us,
+		(unsigned long long)min_poll_us,
+		(unsigned long long)stats->max_poll_us);
+	pr_info("DSA setup stats: calls=%u setup_total_us=%llu shared_total_us=%llu wq_total_us=%llu avg_setup_us=%llu avg_shared_us=%llu avg_wq_us=%llu min_setup_us=%llu max_setup_us=%llu\n",
+		stats->rpc_calls,
+		(unsigned long long)stats->setup_us,
+		(unsigned long long)stats->setup_shared_us,
+		(unsigned long long)stats->setup_wq_us,
+		(unsigned long long)avg_setup_us,
+		(unsigned long long)avg_setup_shared_us,
+		(unsigned long long)avg_setup_wq_us,
+		(unsigned long long)min_setup_us,
+		(unsigned long long)stats->max_setup_us);
+	pr_info("DSA setup breakdown: calls=%u shared_recv_fd_total_us=%llu shared_mmap_total_us=%llu wq_recv_fd_total_us=%llu wq_open_total_us=%llu wq_mmap_total_us=%llu cleanup_munmap_total_us=%llu cleanup_close_total_us=%llu avg_shared_recv_fd_us=%llu avg_shared_mmap_us=%llu avg_wq_recv_fd_us=%llu avg_wq_open_us=%llu avg_wq_mmap_us=%llu avg_cleanup_munmap_us=%llu avg_cleanup_close_us=%llu\n",
+		stats->rpc_calls,
+		(unsigned long long)stats->setup_shared_recv_fd_us,
+		(unsigned long long)stats->setup_shared_mmap_us,
+		(unsigned long long)stats->setup_wq_recv_fd_us,
+		(unsigned long long)stats->setup_wq_open_us,
+		(unsigned long long)stats->setup_wq_mmap_us,
+		(unsigned long long)stats->cleanup_munmap_us,
+		(unsigned long long)stats->cleanup_close_us,
+		(unsigned long long)avg_setup_shared_recv_fd_us,
+		(unsigned long long)avg_setup_shared_mmap_us,
+		(unsigned long long)avg_setup_wq_recv_fd_us,
+		(unsigned long long)avg_setup_wq_open_us,
+		(unsigned long long)avg_setup_wq_mmap_us,
+		(unsigned long long)avg_cleanup_munmap_us,
+		(unsigned long long)avg_cleanup_close_us);
 }
 
 static int dsa_flush_one_batch(struct parasite_ctl *ctl,
@@ -1490,9 +1753,23 @@ static int dsa_flush_one_batch(struct parasite_ctl *ctl,
 		goto out;
 	}
 
-	pr_info("DSA_BATCH_MODE: batch_id=%u submit_enqcmd=%u submit_write=%u map_populate_fallbacks=%u\n",
+	pr_info("DSA_BATCH_MODE: batch_id=%u submit_enqcmd=%u submit_write=%u map_populate_fallbacks=%u setup_us=%llu setup_shared_us=%llu setup_wq_us=%llu setup_shared_recv_fd_us=%llu setup_shared_mmap_us=%llu setup_wq_recv_fd_us=%llu setup_wq_open_us=%llu setup_wq_mmap_us=%llu cleanup_munmap_us=%llu cleanup_close_us=%llu prefault_us=%llu submit_us=%llu poll_us=%llu submit_poll_us=%llu\n",
 		dargs->batch_id, dargs->submit_enqcmd,
-		dargs->submit_write, dargs->map_populate_fallbacks);
+		dargs->submit_write, dargs->map_populate_fallbacks,
+		(unsigned long long)dargs->setup_us,
+		(unsigned long long)dargs->setup_shared_us,
+		(unsigned long long)dargs->setup_wq_us,
+		(unsigned long long)dargs->setup_shared_recv_fd_us,
+		(unsigned long long)dargs->setup_shared_mmap_us,
+		(unsigned long long)dargs->setup_wq_recv_fd_us,
+		(unsigned long long)dargs->setup_wq_open_us,
+		(unsigned long long)dargs->setup_wq_mmap_us,
+		(unsigned long long)dargs->cleanup_munmap_us,
+		(unsigned long long)dargs->cleanup_close_us,
+		(unsigned long long)dargs->prefault_us,
+		(unsigned long long)dargs->submit_us,
+		(unsigned long long)dargs->poll_us,
+		(unsigned long long)(dargs->submit_us + dargs->poll_us));
 	if (dargs->submit_write)
 		pr_info("DSA_DEGRADE: category=submit from=enqcmd to=write batch_id=%u submit_enqcmd=%u submit_write=%u\n",
 			dargs->batch_id, dargs->submit_enqcmd,

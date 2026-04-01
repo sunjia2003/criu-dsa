@@ -2176,8 +2176,10 @@ static int cr_dump_finish(int ret)
 		if (!ret && opts.lazy_pages)
 			ret = cr_lazy_mem_dump();
 
-		if (arch_set_thread_regs(root_item, true) < 0)
+		if (arch_set_thread_regs(root_item, true) < 0) {
+			dsa_shared_mem_cleanup_after_dump();
 			return -1;
+		}
 
 		cr_plugin_fini(CR_PLUGIN_STAGE__DUMP, ret);
 
@@ -2186,6 +2188,8 @@ static int cr_dump_finish(int ret)
 
 		if (dsa_wait_deferred_async_writers())
 			ret = -1;
+
+		dsa_shared_mem_cleanup_after_dump();
 
 		if (disconnect_from_page_server())
 			ret = -1;
@@ -2294,13 +2298,16 @@ static int cr_dump_finish(int ret)
 	if (!ret && opts.lazy_pages)
 		ret = cr_lazy_mem_dump();
 
-	if (arch_set_thread_regs(root_item, true) < 0)
+	if (arch_set_thread_regs(root_item, true) < 0) {
+		dsa_shared_mem_cleanup_after_dump();
 		return -1;
+	}
 
 	cr_plugin_fini(CR_PLUGIN_STAGE__DUMP, ret);
 
 	pstree_switch_state(root_item, (ret || post_dump_ret) ? TASK_ALIVE : opts.final_state);
 	timing_stop(TIME_FROZEN);
+	dsa_shared_mem_cleanup_after_dump();
 	free_pstree(root_item);
 	seccomp_free_entries();
 	free_file_locks();
@@ -2400,6 +2407,9 @@ int cr_dump_tasks(pid_t pid)
 	 * thus ensuring that they don't modify anything we collect
 	 * afterwards.
 	 */
+
+	if (dsa_shared_mem_prepare_before_freeze())
+		goto err;
 
 	if (collect_pstree())
 		goto err;

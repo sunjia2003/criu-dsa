@@ -6,6 +6,7 @@
 #include <stdarg.h>
 #include <sys/ioctl.h>
 #include <sys/uio.h>
+#include <sys/time.h>
 #include <linux/idxd.h>
 #include <linux/memfd.h>
 #include <linux/mman.h>
@@ -134,6 +135,16 @@ static inline void dsa_prefault_range(uint8_t *buf, uint32_t len)
 	(void)sink;
 }
 
+static inline u64 dsa_now_us(void)
+{
+	struct timeval tv;
+
+	if (sys_gettimeofday(&tv, NULL))
+		return 0;
+
+	return (u64)tv.tv_sec * 1000000ULL + (u64)tv.tv_usec;
+}
+
 static inline int dsa_path_eq(const char *a, const char *b, u32 max_len)
 {
 	u32 i;
@@ -245,6 +256,14 @@ static int parasite_dsa_dump_pages(struct parasite_dsa_dump_pages_args *a)
 	int tsock;
 	int shared_buf_fd = -1;
 	void *shared_map = (void *)-1;
+	u64 setup_begin_us = 0;
+	u64 setup_end_us = 0;
+	u64 shared_setup_begin_us = 0;
+	u64 shared_setup_end_us = 0;
+	u64 wq_setup_begin_us = 0;
+	u64 wq_setup_end_us = 0;
+	u64 t_begin_us;
+	u64 t_end_us;
 
 	/* Initialize output fields */
 	a->op_ret = -1;
@@ -256,6 +275,19 @@ static int parasite_dsa_dump_pages(struct parasite_dsa_dump_pages_args *a)
 	a->submit_enqcmd = 0;
 	a->submit_write = 0;
 	a->map_populate_fallbacks = 0;
+	a->prefault_us = 0;
+	a->submit_us = 0;
+	a->poll_us = 0;
+	a->setup_us = 0;
+	a->setup_shared_us = 0;
+	a->setup_wq_us = 0;
+	a->setup_shared_recv_fd_us = 0;
+	a->setup_shared_mmap_us = 0;
+	a->setup_wq_recv_fd_us = 0;
+	a->setup_wq_open_us = 0;
+	a->setup_wq_mmap_us = 0;
+	a->cleanup_munmap_us = 0;
+	a->cleanup_close_us = 0;
 
 	/* Validate input parameters */
 	if ((!a->use_shared_buf_fd && !a->shared_buf_addr &&
@@ -266,9 +298,16 @@ static int parasite_dsa_dump_pages(struct parasite_dsa_dump_pages_args *a)
 		return 0;
 	}
 
+	setup_begin_us = dsa_now_us();
+	shared_setup_begin_us = dsa_now_us();
+
 	if (a->use_shared_buf_fd) {
 		tsock = parasite_get_rpc_sock();
+		t_begin_us = dsa_now_us();
 		shared_buf_fd = recv_fd(tsock);
+		t_end_us = dsa_now_us();
+		if (t_end_us > t_begin_us)
+			a->setup_shared_recv_fd_us += t_end_us - t_begin_us;
 		if (shared_buf_fd < 0) {
 			pr_err("DSA: recv shared buffer fd failed\n");
 			a->op_ret = -EIO;
@@ -278,33 +317,42 @@ static int parasite_dsa_dump_pages(struct parasite_dsa_dump_pages_args *a)
 		if ((long)dsa_cached_shared_map >= 0 &&
 		    dsa_cached_shared_size == a->shared_buf_size) {
 			shared_buf = (uint8_t *)dsa_cached_shared_map;
+			t_begin_us = dsa_now_us();
 			sys_close(shared_buf_fd);
+			t_end_us = dsa_now_us();
+			if (t_end_us > t_begin_us)
+				a->cleanup_close_us += t_end_us - t_begin_us;
 			shared_buf_fd = -1;
 		} else {
+			t_begin_us = dsa_now_us();
 			shared_map = (void *)sys_mmap(NULL, a->shared_buf_size,
 						     PROT_READ | PROT_WRITE,
 						     MAP_SHARED | MAP_POPULATE,
 						     shared_buf_fd, 0);
+			t_end_us = dsa_now_us();
+			if (t_end_us > t_begin_us)
+				a->setup_shared_mmap_us += t_end_us - t_begin_us;
 			if ((long)shared_map < 0) {
-				shared_map = (void *)sys_mmap(NULL, a->shared_buf_size,
-							 PROT_READ | PROT_WRITE,
-							 MAP_SHARED,
-							 shared_buf_fd, 0);
-				if ((long)shared_map >= 0)
-					a->map_populate_fallbacks++;
-			}
-
-			if ((long)shared_map < 0) {
-				a->op_ret = -ENOMEM;
+				pr_err("DSA strict: shared mmap MAP_POPULATE failed\n");
+				a->op_ret = -EOPNOTSUPP;
 				goto out_cleanup;
 			}
 
-			if ((long)dsa_cached_shared_map >= 0)
+			if ((long)dsa_cached_shared_map >= 0) {
+				t_begin_us = dsa_now_us();
 				sys_munmap(dsa_cached_shared_map, dsa_cached_shared_size);
+				t_end_us = dsa_now_us();
+				if (t_end_us > t_begin_us)
+					a->cleanup_munmap_us += t_end_us - t_begin_us;
+			}
 			dsa_cached_shared_map = shared_map;
 			dsa_cached_shared_size = a->shared_buf_size;
 			shared_buf = (uint8_t *)dsa_cached_shared_map;
+			t_begin_us = dsa_now_us();
 			sys_close(shared_buf_fd);
+			t_end_us = dsa_now_us();
+			if (t_end_us > t_begin_us)
+				a->cleanup_close_us += t_end_us - t_begin_us;
 			shared_buf_fd = -1;
 		}
 	} else if (a->shared_buf_addr) {
@@ -316,6 +364,10 @@ static int parasite_dsa_dump_pages(struct parasite_dsa_dump_pages_args *a)
 		a->op_ret = -EINVAL;
 		goto out_cleanup;
 	}
+
+	shared_setup_end_us = dsa_now_us();
+	if (shared_setup_end_us > shared_setup_begin_us)
+		a->setup_shared_us = shared_setup_end_us - shared_setup_begin_us;
 
 	if (a->hdr_off > a->shared_buf_size - sizeof(*shm_hdr)) {
 		a->op_ret = -EINVAL;
@@ -367,12 +419,18 @@ static int parasite_dsa_dump_pages(struct parasite_dsa_dump_pages_args *a)
 		portals[i] = (void *)-1;
 	}
 
+	wq_setup_begin_us = dsa_now_us();
+
 	/* Acquire WQ file descriptors */
 	if (a->use_wq_fd) {
 		/* Receive FDs from parent via RPC socket */
 		tsock = parasite_get_rpc_sock();
 		for (i = 0; i < a->wq_count; i++) {
+			t_begin_us = dsa_now_us();
 			wq_fds[i] = recv_fd(tsock);
+			t_end_us = dsa_now_us();
+			if (t_end_us > t_begin_us)
+				a->setup_wq_recv_fd_us += t_end_us - t_begin_us;
 			if (wq_fds[i] < 0) {
 				/* Some WQs not available, continue with fewer */
 				if (i == 0) {
@@ -405,7 +463,11 @@ static int parasite_dsa_dump_pages(struct parasite_dsa_dump_pages_args *a)
 
 			dsa_wq_cache_drop_idx(i);
 
+			t_begin_us = dsa_now_us();
 			wq_fds[i] = sys_open(a->wq_paths[i], O_RDWR, 0);
+			t_end_us = dsa_now_us();
+			if (t_end_us > t_begin_us)
+				a->setup_wq_open_us += t_end_us - t_begin_us;
 			if (wq_fds[i] < 0) {
 				pr_err("DSA: open workqueue path failed %s ret=%d\n",
 				       a->wq_paths[i], wq_fds[i]);
@@ -421,18 +483,14 @@ static int parasite_dsa_dump_pages(struct parasite_dsa_dump_pages_args *a)
 			dsa_path_copy(dsa_cached_wq_paths[i], a->wq_paths[i],
 			      sizeof(dsa_cached_wq_paths[i]));
 
+			t_begin_us = dsa_now_us();
 			portal_va = (void *)sys_mmap(NULL, DSA_PORTAL_MAP_SIZE,
 					   PROT_WRITE,
 					   MAP_SHARED | MAP_POPULATE,
 					   wq_fds[i], 0);
-			if ((long)portal_va < 0) {
-				portal_va = (void *)sys_mmap(NULL, DSA_PORTAL_MAP_SIZE,
-						   PROT_WRITE,
-						   MAP_SHARED,
-						   wq_fds[i], 0);
-				if ((long)portal_va >= 0)
-					a->map_populate_fallbacks++;
-			}
+			t_end_us = dsa_now_us();
+			if (t_end_us > t_begin_us)
+				a->setup_wq_mmap_us += t_end_us - t_begin_us;
 			if ((long)portal_va < 0) {
 				pr_err("DSA strict: portal mmap failed for %s\n",
 				       a->wq_paths[i]);
@@ -477,18 +535,14 @@ static int parasite_dsa_dump_pages(struct parasite_dsa_dump_pages_args *a)
 			if (wq_fds[i] < 0)
 				continue;
 
+			t_begin_us = dsa_now_us();
 			portal_va = (void *)sys_mmap(NULL, DSA_PORTAL_MAP_SIZE,
 					   PROT_WRITE,
 					   MAP_SHARED | MAP_POPULATE,
 					   wq_fds[i], 0);
-			if ((long)portal_va < 0) {
-				portal_va = (void *)sys_mmap(NULL, DSA_PORTAL_MAP_SIZE,
-						   PROT_WRITE,
-						   MAP_SHARED,
-						   wq_fds[i], 0);
-				if ((long)portal_va >= 0)
-					a->map_populate_fallbacks++;
-			}
+			t_end_us = dsa_now_us();
+			if (t_end_us > t_begin_us)
+				a->setup_wq_mmap_us += t_end_us - t_begin_us;
 			if ((long)portal_va < 0) {
 				pr_err("DSA strict: portal mmap failed for wq_fd idx=%u\n", i);
 				a->op_ret = -EOPNOTSUPP;
@@ -501,6 +555,14 @@ static int parasite_dsa_dump_pages(struct parasite_dsa_dump_pages_args *a)
 			portal_offset[i] = ((unsigned long)portal_va) & 0xfffUL;
 		}
 	}
+
+	wq_setup_end_us = dsa_now_us();
+	if (wq_setup_end_us > wq_setup_begin_us)
+		a->setup_wq_us = wq_setup_end_us - wq_setup_begin_us;
+
+	setup_end_us = dsa_now_us();
+	if (setup_end_us > setup_begin_us)
+		a->setup_us = setup_end_us - setup_begin_us;
 
 	while (desc_base < nr_descriptors) {
 		remaining = nr_descriptors - desc_base;
@@ -516,6 +578,8 @@ static int parasite_dsa_dump_pages(struct parasite_dsa_dump_pages_args *a)
 			uint8_t *src = (uint8_t *)(unsigned long)desc->src_addr;
 			uint32_t copy_len = desc->copy_len;
 			uint8_t *dst = shared_buf + buf_write_offset;
+			u64 prefault_begin;
+			u64 prefault_end;
 
 			/* Verify buffer space */
 			if (buf_write_offset + copy_len > a->shared_buf_size ||
@@ -525,7 +589,11 @@ static int parasite_dsa_dump_pages(struct parasite_dsa_dump_pages_args *a)
 			}
 
 			/* Prefault source */
+			prefault_begin = dsa_now_us();
 			dsa_prefault_range(src, copy_len);
+			prefault_end = dsa_now_us();
+			if (prefault_end > prefault_begin)
+				a->prefault_us += prefault_end - prefault_begin;
 
 			/* Prepare DSA descriptor */
 			dsa_memzero(&dsa_descs[i], sizeof(struct dsa_hw_desc));
@@ -573,8 +641,11 @@ static int parasite_dsa_dump_pages(struct parasite_dsa_dump_pages_args *a)
 		for (k = 0; k < order_cnt; k++) {
 			uint32_t wq_idx;
 			uint32_t retry_count = 0;
+			u64 submit_begin;
+			u64 submit_end;
 
 			desc_idx = lpt_order[k];
+			submit_begin = dsa_now_us();
 
 			if (a->wq_policy == DSA_WQ_POLICY_RR) {
 				wq_sel = k % active_wq_count;
@@ -591,6 +662,9 @@ static int parasite_dsa_dump_pages(struct parasite_dsa_dump_pages_args *a)
 			if (!use_portal[wq_idx]) {
 				a->failed_idx = desc_base + desc_idx;
 				a->op_ret = -EOPNOTSUPP;
+				submit_end = dsa_now_us();
+				if (submit_end > submit_begin)
+					a->submit_us += submit_end - submit_begin;
 				goto poll_completed;
 			}
 
@@ -611,8 +685,15 @@ static int parasite_dsa_dump_pages(struct parasite_dsa_dump_pages_args *a)
 			if (retry_count == DSA_MAX_ENQ_RETRY) {
 				a->failed_idx = desc_base + desc_idx;
 				a->op_ret = -EAGAIN;
+				submit_end = dsa_now_us();
+				if (submit_end > submit_begin)
+					a->submit_us += submit_end - submit_begin;
 				goto poll_completed;
 			}
+
+			submit_end = dsa_now_us();
+			if (submit_end > submit_begin)
+				a->submit_us += submit_end - submit_begin;
 		}
 
 		/* Poll for completion of all submitted descriptors */
@@ -624,8 +705,14 @@ poll_completed:
 		timeout_count = 0;
 
 		for (k = 0; k < submitted; k++) {
+			u64 poll_begin;
+			u64 poll_end;
+			int poll_failed = 0;
+
 			desc_idx = submitted_idx[k];
 			timeout_count = 0;
+
+			poll_begin = dsa_now_us();
 			while (1) {
 				comp_status = dsa_comps[desc_idx].status;
 				comp_code = (uint8_t)DSA_COMP_STATUS(comp_status);
@@ -642,7 +729,8 @@ poll_completed:
 						a->failed_idx = desc_base + desc_idx;
 						a->failed_status = comp_code;
 						a->op_ret = -(int)comp_code;
-						goto out_cleanup;
+						poll_failed = 1;
+						break;
 					}
 					break;
 				}
@@ -650,10 +738,18 @@ poll_completed:
 				if (timeout_count++ >= max_timeout_retries) {
 					a->failed_idx = desc_base + desc_idx;
 					a->op_ret = -ETIMEDOUT;
-					goto out_cleanup;
+					poll_failed = 1;
+					break;
 				}
 				dsa_cpu_relax();
 			}
+
+			poll_end = dsa_now_us();
+			if (poll_end > poll_begin)
+				a->poll_us += poll_end - poll_begin;
+
+			if (poll_failed)
+				goto out_cleanup;
 		}
 
 		if (completed != submitted)
@@ -672,20 +768,53 @@ poll_completed:
 	}
 
 out_cleanup:
+	if (!a->setup_shared_us && shared_setup_begin_us) {
+		shared_setup_end_us = dsa_now_us();
+		if (shared_setup_end_us > shared_setup_begin_us)
+			a->setup_shared_us = shared_setup_end_us - shared_setup_begin_us;
+	}
+
+	if (!a->setup_wq_us && wq_setup_begin_us) {
+		wq_setup_end_us = dsa_now_us();
+		if (wq_setup_end_us > wq_setup_begin_us)
+			a->setup_wq_us = wq_setup_end_us - wq_setup_begin_us;
+	}
+
+	if (!a->setup_us && setup_begin_us) {
+		setup_end_us = dsa_now_us();
+		if (setup_end_us > setup_begin_us)
+			a->setup_us = setup_end_us - setup_begin_us;
+	}
+
 	/* Clean up resources */
 	for (i = 0; i < a->wq_count; i++) {
 		if (a->use_wq_fd) {
-			if ((long)portals[i] >= 0)
+			if ((long)portals[i] >= 0) {
+				t_begin_us = dsa_now_us();
 				sys_munmap(portals[i], DSA_PORTAL_MAP_SIZE);
-			if (wq_fds[i] >= 0)
+				t_end_us = dsa_now_us();
+				if (t_end_us > t_begin_us)
+					a->cleanup_munmap_us += t_end_us - t_begin_us;
+			}
+			if (wq_fds[i] >= 0) {
+				t_begin_us = dsa_now_us();
 				sys_close(wq_fds[i]);
+				t_end_us = dsa_now_us();
+				if (t_end_us > t_begin_us)
+					a->cleanup_close_us += t_end_us - t_begin_us;
+			}
 		} else if (use_portal[i]) {
 			dsa_cached_wq_portal_off[i] = portal_offset[i];
 		}
 	}
 
-	if (shared_buf_fd >= 0)
+	if (shared_buf_fd >= 0) {
+		t_begin_us = dsa_now_us();
 		sys_close(shared_buf_fd);
+		t_end_us = dsa_now_us();
+		if (t_end_us > t_begin_us)
+			a->cleanup_close_us += t_end_us - t_begin_us;
+	}
 
 	return 0;
 }

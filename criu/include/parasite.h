@@ -309,6 +309,19 @@ struct parasite_dsa_dump_pages_args {
 	u32 submit_enqcmd;	/* Number of descriptors submitted via enqcmd */
 	u32 submit_write;	/* Number of descriptors submitted via write() */
 	u32 map_populate_fallbacks;	/* MAP_POPULATE -> MAP_SHARED fallbacks */
+	u64 prefault_us;	/* Total time spent in source prefault for this batch */
+	u64 submit_us;	/* Total time spent in DSA submit for this batch */
+	u64 poll_us;	/* Total time spent in DSA completion poll for this batch */
+	u64 setup_us;	/* Total setup time before descriptor processing */
+	u64 setup_shared_us;	/* Shared buffer setup time */
+	u64 setup_wq_us;	/* Workqueue setup time */
+	u64 setup_shared_recv_fd_us;	/* Shared FD receive time */
+	u64 setup_shared_mmap_us;	/* Shared mmap time */
+	u64 setup_wq_recv_fd_us;	/* WQ FD receive time */
+	u64 setup_wq_open_us;	/* WQ path open time */
+	u64 setup_wq_mmap_us;	/* WQ portal mmap time */
+	u64 cleanup_munmap_us;	/* Cleanup munmap time */
+	u64 cleanup_close_us;	/* Cleanup close time */
 };
 
 #endif /* !__ASSEMBLY__ */

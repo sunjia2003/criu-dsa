@@ -34,6 +34,8 @@ extern int parasite_dump_pages_seized(struct pstree_item *item, struct vm_area_l
 extern int parasite_dump_pages_seized_wait(struct pstree_item *item);
 extern bool parasite_mem_async_deferred(const struct pstree_item *item);
 extern int collect_madv_guards(pid_t pid, struct vm_area_list *vma_area_list);
+extern int dsa_shared_mem_prepare_before_freeze(void);
+extern void dsa_shared_mem_cleanup_after_dump(void);
 
 #define PME_PRESENT	  (1ULL << 63)
 #define PME_SWAP	  (1ULL << 62)

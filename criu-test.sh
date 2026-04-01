@@ -101,12 +101,20 @@ declare -A CASE_DSA_DEGRADE_SUBMIT
 declare -A CASE_DSA_SUBMIT_ENQCMD
 declare -A CASE_DSA_SUBMIT_WRITE
 declare -A CASE_DSA_MAP_POP_FALLBACK
+declare -A CASE_DSA_PREFAULT_US
+declare -A CASE_DSA_SUBMIT_US
+declare -A CASE_DSA_POLL_US
+declare -A CASE_DSA_SUBMIT_POLL_US
 declare -A SUM_DSA_DEGRADE_TOTAL
 declare -A SUM_DSA_DEGRADE_SHARED
 declare -A SUM_DSA_DEGRADE_SUBMIT
 declare -A SUM_DSA_SUBMIT_ENQCMD
 declare -A SUM_DSA_SUBMIT_WRITE
 declare -A SUM_DSA_MAP_POP_FALLBACK
+declare -A SUM_DSA_PREFAULT_US
+declare -A SUM_DSA_SUBMIT_US
+declare -A SUM_DSA_POLL_US
+declare -A SUM_DSA_SUBMIT_POLL_US
 
 avg_kb() {
     local sum="$1"
@@ -269,6 +277,10 @@ record_case_timing() {
     local dsa_submit_enqcmd
     local dsa_submit_write
     local dsa_map_pop_fallback
+    local dsa_prefault_us
+    local dsa_submit_us
+    local dsa_poll_us
+    local dsa_submit_poll_us
     local dsa_mode_samples
 
     line=$($SUDO awk '/Dump timing:/{l=$0} END{print l}' "$log_dump" 2>/dev/null || true)
@@ -390,6 +402,10 @@ record_case_timing() {
     dsa_submit_enqcmd=$($SUDO awk '/DSA_BATCH_MODE:/{if (match($0, /submit_enqcmd=([0-9]+)/, a)) s += a[1]} END{print s+0}' "$log_dump" 2>/dev/null || echo 0)
     dsa_submit_write=$($SUDO awk '/DSA_BATCH_MODE:/{if (match($0, /submit_write=([0-9]+)/, a)) s += a[1]} END{print s+0}' "$log_dump" 2>/dev/null || echo 0)
     dsa_map_pop_fallback=$($SUDO awk '/DSA_BATCH_MODE:/{if (match($0, /map_populate_fallbacks=([0-9]+)/, a)) s += a[1]} END{print s+0}' "$log_dump" 2>/dev/null || echo 0)
+    dsa_prefault_us=$($SUDO awk '/DSA_BATCH_MODE:/{if (match($0, /prefault_us=([0-9]+)/, a)) s += a[1]} END{print s+0}' "$log_dump" 2>/dev/null || echo 0)
+    dsa_submit_us=$($SUDO awk '/DSA_BATCH_MODE:/{if (match($0, /submit_us=([0-9]+)/, a)) s += a[1]} END{print s+0}' "$log_dump" 2>/dev/null || echo 0)
+    dsa_poll_us=$($SUDO awk '/DSA_BATCH_MODE:/{if (match($0, /poll_us=([0-9]+)/, a)) s += a[1]} END{print s+0}' "$log_dump" 2>/dev/null || echo 0)
+    dsa_submit_poll_us=$(( dsa_submit_us + dsa_poll_us ))
     dsa_mode_samples=$($SUDO awk '/DSA_BATCH_MODE:/{c++} END{print c+0}' "$log_dump" 2>/dev/null || echo 0)
 
     CASE_DSA_DEGRADE_TOTAL["$name"]=$dsa_degrade_total
@@ -398,6 +414,10 @@ record_case_timing() {
     CASE_DSA_SUBMIT_ENQCMD["$name"]=$dsa_submit_enqcmd
     CASE_DSA_SUBMIT_WRITE["$name"]=$dsa_submit_write
     CASE_DSA_MAP_POP_FALLBACK["$name"]=$dsa_map_pop_fallback
+    CASE_DSA_PREFAULT_US["$name"]=$dsa_prefault_us
+    CASE_DSA_SUBMIT_US["$name"]=$dsa_submit_us
+    CASE_DSA_POLL_US["$name"]=$dsa_poll_us
+    CASE_DSA_SUBMIT_POLL_US["$name"]=$dsa_submit_poll_us
 
     SUM_DSA_DEGRADE_TOTAL["$group"]=$(( ${SUM_DSA_DEGRADE_TOTAL[$group]:-0} + dsa_degrade_total ))
     SUM_DSA_DEGRADE_SHARED["$group"]=$(( ${SUM_DSA_DEGRADE_SHARED[$group]:-0} + dsa_degrade_shared ))
@@ -405,6 +425,10 @@ record_case_timing() {
     SUM_DSA_SUBMIT_ENQCMD["$group"]=$(( ${SUM_DSA_SUBMIT_ENQCMD[$group]:-0} + dsa_submit_enqcmd ))
     SUM_DSA_SUBMIT_WRITE["$group"]=$(( ${SUM_DSA_SUBMIT_WRITE[$group]:-0} + dsa_submit_write ))
     SUM_DSA_MAP_POP_FALLBACK["$group"]=$(( ${SUM_DSA_MAP_POP_FALLBACK[$group]:-0} + dsa_map_pop_fallback ))
+    SUM_DSA_PREFAULT_US["$group"]=$(( ${SUM_DSA_PREFAULT_US[$group]:-0} + dsa_prefault_us ))
+    SUM_DSA_SUBMIT_US["$group"]=$(( ${SUM_DSA_SUBMIT_US[$group]:-0} + dsa_submit_us ))
+    SUM_DSA_POLL_US["$group"]=$(( ${SUM_DSA_POLL_US[$group]:-0} + dsa_poll_us ))
+    SUM_DSA_SUBMIT_POLL_US["$group"]=$(( ${SUM_DSA_SUBMIT_POLL_US[$group]:-0} + dsa_submit_poll_us ))
 
     CNT_DSA_MODE["$group"]=$(( ${CNT_DSA_MODE[$group]:-0} + 1 ))
 }
@@ -441,6 +465,18 @@ sub_us_nonneg() {
     fi
 
     echo "$diff"
+}
+
+pct_of() {
+    local part="$1"
+    local total="$2"
+
+    if [ -z "$part" ] || [ -z "$total" ] || [ "$total" -le 0 ]; then
+        echo ""
+        return
+    fi
+
+    awk -v p="$part" -v t="$total" 'BEGIN { printf("%.2f", (p * 100.0) / t) }'
 }
 
 print_metric_compare() {
@@ -813,6 +849,28 @@ print_metric_compare "memwrite(avg)" "$BASE_MEMWRITE_AVG" "$DSA_MEMWRITE_AVG"
 print_metric_compare "dsa_rpc(avg)" "$BASE_DSA_RPC_AVG" "$DSA_DSA_RPC_AVG"
 print_metric_compare "async_wait(avg)" "$BASE_ASYNC_WAIT_AVG" "$DSA_ASYNC_WAIT_AVG"
 print_metric_compare "memwrite_e2e(avg=memwrite+async_wait)" "$BASE_MEMWRITE_E2E_AVG" "$DSA_MEMWRITE_E2E_AVG"
+
+echo ""
+echo "=== DSA RPC BREAKDOWN (dsa_live) ==="
+echo "  scope: per-dump sum from DSA_BATCH_MODE"
+
+DSA_MODE_CNT=${CNT_DSA_MODE[dsa_live]:-0}
+DSA_PREFAULT_AVG=$(avg_us "${SUM_DSA_PREFAULT_US[dsa_live]:-}" "$DSA_MODE_CNT")
+DSA_SUBMIT_AVG=$(avg_us "${SUM_DSA_SUBMIT_US[dsa_live]:-}" "$DSA_MODE_CNT")
+DSA_POLL_AVG=$(avg_us "${SUM_DSA_POLL_US[dsa_live]:-}" "$DSA_MODE_CNT")
+DSA_SUBMIT_POLL_AVG=$(avg_us "${SUM_DSA_SUBMIT_POLL_US[dsa_live]:-}" "$DSA_MODE_CNT")
+
+PCT_PREFAULT_OF_RPC=$(pct_of "$DSA_PREFAULT_AVG" "$DSA_DSA_RPC_AVG")
+PCT_SUBMIT_POLL_OF_RPC=$(pct_of "$DSA_SUBMIT_POLL_AVG" "$DSA_DSA_RPC_AVG")
+PCT_PREFAULT_OF_MEMDUMP=$(pct_of "$DSA_PREFAULT_AVG" "$DSA_MEMDUMP_AVG")
+PCT_SUBMIT_POLL_OF_MEMDUMP=$(pct_of "$DSA_SUBMIT_POLL_AVG" "$DSA_MEMDUMP_AVG")
+
+echo "  dsa_live memdump(avg): ${DSA_MEMDUMP_AVG:-N/A} us"
+echo "  dsa_live dsa_rpc(avg): ${DSA_DSA_RPC_AVG:-N/A} us"
+echo "  dsa_live prefault(avg): ${DSA_PREFAULT_AVG:-N/A} us (${PCT_PREFAULT_OF_RPC:-N/A}% of dsa_rpc, ${PCT_PREFAULT_OF_MEMDUMP:-N/A}% of memdump)"
+echo "  dsa_live submit(avg): ${DSA_SUBMIT_AVG:-N/A} us"
+echo "  dsa_live poll(avg): ${DSA_POLL_AVG:-N/A} us"
+echo "  dsa_live submit+poll(avg): ${DSA_SUBMIT_POLL_AVG:-N/A} us (${PCT_SUBMIT_POLL_OF_RPC:-N/A}% of dsa_rpc, ${PCT_SUBMIT_POLL_OF_MEMDUMP:-N/A}% of memdump)"
 
 echo ""
 echo "=== WORKLOAD COMPARE (base vs dsa_live) ==="
