@@ -7,9 +7,33 @@ CRIU_BIN=${CRIU_BIN:-"$SCRIPT_DIR/criu/criu"}
 SUDO=${SUDO:-sudo}
 RUN_TAG=${RUN_TAG:-$(date +%Y%m%d-%H%M%S)-$$}
 BASE_DIR=${BASE_DIR:-/tmp/criu-test-${RUN_TAG}}
-DUMP_TIMEOUT_SEC=${DUMP_TIMEOUT_SEC:-10}
-RESTORE_TIMEOUT_SEC=${RESTORE_TIMEOUT_SEC:-10}
-TARGET_MB=${TARGET_MB:-64}
+TARGET_MB=${TARGET_MB:-2048}
+TARGET_STRICT_ALLOC=${TARGET_STRICT_ALLOC:-1}
+
+if [ -z "${TARGET_READY_TIMEOUT_SEC+x}" ]; then
+    if [ "$TARGET_MB" -ge 2048 ]; then
+        TARGET_READY_TIMEOUT_SEC=30
+    else
+        TARGET_READY_TIMEOUT_SEC=4
+    fi
+fi
+
+if [ -z "${DUMP_TIMEOUT_SEC+x}" ]; then
+    if [ "$TARGET_MB" -ge 2048 ]; then
+        DUMP_TIMEOUT_SEC=120
+    else
+        DUMP_TIMEOUT_SEC=10
+    fi
+fi
+
+if [ -z "${RESTORE_TIMEOUT_SEC+x}" ]; then
+    if [ "$TARGET_MB" -ge 2048 ]; then
+        RESTORE_TIMEOUT_SEC=120
+    else
+        RESTORE_TIMEOUT_SEC=10
+    fi
+fi
+
 PYTHON_BIN=${PYTHON_BIN:-$(command -v python3 || true)}
 RESTORE_DETACHED=${RESTORE_DETACHED:-1}
 BENCH_ROUNDS=${BENCH_ROUNDS:-1}
@@ -491,18 +515,23 @@ start_target() {
     local ready_file="$run_dir/target.ready"
 
     rm -f "$ready_file"
-    setsid "$PYTHON_BIN" - "$marker" "$TARGET_MB" "$ready_file" <<'PY' >"$out_log" 2>"$err_log" &
+    setsid "$PYTHON_BIN" - "$marker" "$TARGET_MB" "$ready_file" "$TARGET_STRICT_ALLOC" <<'PY' >"$out_log" 2>"$err_log" &
 import sys
 import time
 
 marker = sys.argv[1]
 mb = int(sys.argv[2])
 ready_file = sys.argv[3]
+strict_alloc = int(sys.argv[4]) != 0
 
 try:
     buf = bytearray(mb * 1024 * 1024)
 except MemoryError:
-    # Keep process alive with smaller footprint so test can still run.
+    if strict_alloc:
+        print(f"failed to allocate {mb} MiB dirty buffer", file=sys.stderr, flush=True)
+        sys.exit(42)
+
+    # Keep process alive with smaller footprint when strict mode is disabled.
     buf = bytearray(8 * 1024 * 1024)
 
 for i in range(0, len(buf), 4096):
@@ -511,7 +540,7 @@ for i in range(0, len(buf), 4096):
 with open(ready_file, "w", encoding="ascii") as f:
     f.write("ready\n")
 
-print("ready", marker, flush=True)
+print("ready", marker, len(buf), flush=True)
 while True:
     time.sleep(1)
 PY
@@ -553,6 +582,7 @@ run_case() {
     local t0
     local t1
     local i
+    local ready_loops
     local restore_ok=0
 
     TOTAL=$((TOTAL + 1))
@@ -567,7 +597,12 @@ run_case() {
 
     pid=$(start_target "$marker" "$case_dir")
 
-    for i in $(seq 1 20); do
+    ready_loops=$(( TARGET_READY_TIMEOUT_SEC * 5 ))
+    if [ "$ready_loops" -lt 1 ]; then
+        ready_loops=1
+    fi
+
+    for i in $(seq 1 "$ready_loops"); do
         if [ -f "$ready_file" ]; then
             break
         fi
@@ -591,6 +626,7 @@ run_case() {
 
     t0=$(date +%s)
     echo "  target pid: $pid"
+    echo "  target dirty footprint: ${TARGET_MB} MiB"
     echo "  dump start (timeout=${DUMP_TIMEOUT_SEC}s)"
     if [ -n "$envs" ]; then
         if ! run_with_timeout "$DUMP_TIMEOUT_SEC" \
@@ -736,6 +772,9 @@ trap cleanup_all_markers EXIT INT TERM
 
 echo "test workspace: $BASE_DIR"
 echo "benchmark rounds: $BENCH_ROUNDS"
+echo "target dirty footprint: ${TARGET_MB} MiB"
+echo "target alloc strict: ${TARGET_STRICT_ALLOC}"
+echo "target ready timeout: ${TARGET_READY_TIMEOUT_SEC}s"
 
 if [ "$BENCH_ROUNDS" -le 1 ]; then
     run_case "base" "CRIU_DSA_DUMP=0 CRIU_DSA_POPULATE_READ=0" "dump-only"

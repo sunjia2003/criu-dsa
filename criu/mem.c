@@ -337,7 +337,12 @@ prep_dump_pages_args(struct parasite_ctl *ctl, struct vm_area_list *vma_area_lis
 
 #define DSA_SHARED_BUF_SIZE_DEFAULT	(128U * 1024U * 1024U)
 #define DSA_SHARED_BUF_SIZE_MIN	(64U * 1024U)
-#define DSA_SHARED_BUF_SIZE_MAX	(512U * 1024U * 1024U)
+#define DSA_SHARED_BUF_SIZE_MAX \
+	((unsigned int)((4ULL * 1024ULL * 1024ULL * 1024ULL) - DSA_SHARED_DATA_ALIGN))
+#define DSA_HUGEPAGE_2MB_SIZE	(2U * 1024U * 1024U)
+#define DSA_SHARED_BUF_EST_MARGIN_PCT	25U
+#define DSA_SHARED_BUF_EST_RESERVE	(16U * 1024U * 1024U)
+#define DSA_HUGEPAGE_FREE_PATH	"/sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages"
 #define DSA_BATCH_TARGET_US_DEFAULT	2000U
 #define DSA_BATCH_TARGET_US_MIN	200U
 #define MEM_DUMP_ASYNC_MIN_PAGES_DEFAULT	4096U
@@ -365,16 +370,21 @@ static unsigned int dsa_parse_env_u32(const char *name, unsigned int def,
 				      unsigned int min, unsigned int max)
 {
 	const char *env;
-	int v;
+	unsigned long long v;
+	char *end;
 
 	env = getenv(name);
 	if (!env)
 		return def;
 
-	v = atoi(env);
-	if (v < (int)min)
+	errno = 0;
+	v = strtoull(env, &end, 10);
+	if (errno || end == env)
+		return def;
+
+	if (v < (unsigned long long)min)
 		return min;
-	if (v > (int)max)
+	if (v > (unsigned long long)max)
 		return max;
 
 	return (unsigned int)v;
@@ -396,13 +406,156 @@ static __maybe_unused unsigned int dsa_batch_limit_min(void)
 				 DSA_DUMP_BATCH_SIZE);
 }
 
-static unsigned int dsa_shared_buf_size(void)
+static unsigned int dsa_round_up_u32(unsigned int val, unsigned int align)
 {
-	return round_up(dsa_parse_env_u32("CRIU_DSA_SHARED_BUF_SIZE",
-					 DSA_SHARED_BUF_SIZE_DEFAULT,
-					 DSA_SHARED_BUF_SIZE_MIN,
-					 DSA_SHARED_BUF_SIZE_MAX),
-			DSA_SHARED_DATA_ALIGN);
+	unsigned long long rounded;
+
+	if (!align)
+		return val;
+
+	rounded = ((unsigned long long)val + align - 1ULL) & ~(unsigned long long)(align - 1ULL);
+	if (rounded > UINT_MAX)
+		return UINT_MAX;
+
+	return (unsigned int)rounded;
+}
+
+static bool dsa_read_ull_file(const char *path, unsigned long long *value)
+{
+	FILE *fp;
+	char buf[64];
+	char *end;
+
+	fp = fopen(path, "re");
+	if (!fp)
+		return false;
+
+	if (!fgets(buf, sizeof(buf), fp)) {
+		fclose(fp);
+		return false;
+	}
+
+	fclose(fp);
+
+	errno = 0;
+	*value = strtoull(buf, &end, 10);
+	if (errno || end == buf)
+		return false;
+
+	return true;
+}
+
+static unsigned int dsa_shared_buf_size_manual(void)
+{
+	return dsa_round_up_u32(dsa_parse_env_u32("CRIU_DSA_SHARED_BUF_SIZE",
+						 DSA_SHARED_BUF_SIZE_DEFAULT,
+						 DSA_SHARED_BUF_SIZE_MIN,
+						 DSA_SHARED_BUF_SIZE_MAX),
+				 DSA_SHARED_DATA_ALIGN);
+}
+
+static unsigned int dsa_shared_buf_auto_max(void)
+{
+	unsigned long long free_pages;
+	unsigned long long free_bytes;
+
+	if (!dsa_read_ull_file(DSA_HUGEPAGE_FREE_PATH, &free_pages) || !free_pages)
+		return DSA_SHARED_BUF_SIZE_MAX;
+
+	if (free_pages > ULLONG_MAX / DSA_HUGEPAGE_2MB_SIZE)
+		free_bytes = ULLONG_MAX;
+	else
+		free_bytes = free_pages * DSA_HUGEPAGE_2MB_SIZE;
+
+	if (free_bytes > DSA_SHARED_BUF_SIZE_MAX)
+		free_bytes = DSA_SHARED_BUF_SIZE_MAX;
+
+	return (unsigned int)free_bytes;
+}
+
+static unsigned long long dsa_estimate_dirty_bytes(pid_t pid)
+{
+	char path[64];
+	FILE *fp;
+	char line[256];
+	unsigned long long private_dirty_kb = 0;
+	unsigned long long shared_dirty_kb = 0;
+	unsigned long long kb;
+
+	if (snprintf(path, sizeof(path), "/proc/%d/smaps_rollup", pid) >= sizeof(path))
+		return 0;
+
+	fp = fopen(path, "re");
+	if (!fp)
+		return 0;
+
+	while (fgets(line, sizeof(line), fp)) {
+		if (sscanf(line, "Private_Dirty: %llu kB", &kb) == 1) {
+			private_dirty_kb = kb;
+			continue;
+		}
+
+		if (sscanf(line, "Shared_Dirty: %llu kB", &kb) == 1)
+			shared_dirty_kb = kb;
+	}
+
+	fclose(fp);
+
+	if (private_dirty_kb > (ULLONG_MAX - shared_dirty_kb))
+		return ULLONG_MAX;
+
+	return (private_dirty_kb + shared_dirty_kb) * 1024ULL;
+}
+
+static unsigned int dsa_shared_buf_size_auto(pid_t target_pid)
+{
+	unsigned long long dirty_bytes;
+	unsigned long long target;
+	unsigned int max_size;
+	unsigned int final_size;
+
+	dirty_bytes = dsa_estimate_dirty_bytes(target_pid);
+	if (!dirty_bytes)
+		return dsa_shared_buf_size_manual();
+
+	target = dirty_bytes;
+	target += (dirty_bytes * DSA_SHARED_BUF_EST_MARGIN_PCT) / 100ULL;
+	target += DSA_SHARED_BUF_EST_RESERVE;
+
+	max_size = dsa_shared_buf_auto_max();
+	if (max_size < DSA_SHARED_BUF_SIZE_MIN)
+		return dsa_shared_buf_size_manual();
+
+	if (target < DSA_SHARED_BUF_SIZE_MIN)
+		target = DSA_SHARED_BUF_SIZE_MIN;
+	if (target > max_size)
+		target = max_size;
+
+	final_size = dsa_round_up_u32((unsigned int)target, DSA_HUGEPAGE_2MB_SIZE);
+	if (final_size > max_size) {
+		if (max_size >= DSA_HUGEPAGE_2MB_SIZE)
+			final_size = max_size - (max_size % DSA_HUGEPAGE_2MB_SIZE);
+		else
+			final_size = max_size;
+	}
+
+	if (final_size < DSA_SHARED_BUF_SIZE_MIN)
+		final_size = DSA_SHARED_BUF_SIZE_MIN;
+
+	final_size = dsa_round_up_u32(final_size, DSA_SHARED_DATA_ALIGN);
+
+	pr_info("DSA_SHARED_MEM_AUTO: pid=%d dirty_bytes=%llu final_size=%u max_size=%u\n",
+		target_pid, dirty_bytes, final_size, max_size);
+
+	return final_size;
+}
+
+static unsigned int dsa_shared_buf_size(pid_t target_pid)
+{
+	if (getenv("CRIU_DSA_SHARED_BUF_SIZE"))
+		return dsa_shared_buf_size_manual();
+
+	return dsa_shared_buf_size_auto(target_pid);
 }
 
 static unsigned int mem_dump_async_min_pages(void)
@@ -635,7 +788,7 @@ static int dsa_dump_ctx_init(struct dsa_dump_ctx *ctx, pid_t target_pid)
 	ctx->shared_hugetlb = true;
 	ctx->shared_degrade_cnt = 0;
 
-	ctx->shared_buf_size = dsa_shared_buf_size();
+	ctx->shared_buf_size = dsa_shared_buf_size(target_pid);
 
 	ctx->wq_count = dsa_collect_workqueues(ctx->wq_paths, DSA_DUMP_MAX_WQ);
 	if (ctx->wq_count <= 0) {
