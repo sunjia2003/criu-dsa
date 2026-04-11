@@ -9,6 +9,13 @@ RUN_TAG=${RUN_TAG:-$(date +%Y%m%d-%H%M%S)-$$}
 BASE_DIR=${BASE_DIR:-/tmp/criu-test-${RUN_TAG}}
 TARGET_MB=${TARGET_MB:-2048}
 TARGET_STRICT_ALLOC=${TARGET_STRICT_ALLOC:-1}
+TARGET_WORKSPACE_WRAP=${TARGET_WORKSPACE_WRAP:-1}
+TARGET_WORKSPACE_WRAP_REQUIRE_NS=${TARGET_WORKSPACE_WRAP_REQUIRE_NS:-1}
+TARGET_WORKSPACE_WRAP_BIND_TMP=${TARGET_WORKSPACE_WRAP_BIND_TMP:-1}
+WORKSPACE_WRAP_BIN=${WORKSPACE_WRAP_BIN:-"$SCRIPT_DIR/test/zdtm/workspace-wrap.sh"}
+WORKSPACE_WRAP_ROOT=${WORKSPACE_WRAP_ROOT:-"$BASE_DIR/workspace"}
+EXTERNAL_TARGET_START_HOOK=${EXTERNAL_TARGET_START_HOOK:-}
+EXTERNAL_TARGET_STOP_HOOK=${EXTERNAL_TARGET_STOP_HOOK:-}
 
 if [ -z "${TARGET_READY_TIMEOUT_SEC+x}" ]; then
     if [ "$TARGET_MB" -ge 2048 ]; then
@@ -47,6 +54,8 @@ PASS=0
 FAIL=0
 
 declare -a ACTIVE_MARKERS=()
+declare -A MARKER_PID_HINT=()
+declare -A MARKER_RUN_DIR=()
 
 declare -A CASE_FROZEN_US
 declare -A CASE_MEMDUMP_US
@@ -501,7 +510,21 @@ print_metric_compare() {
 
 cleanup_marker() {
     local marker="$1"
+    local pid_hint="${MARKER_PID_HINT[$marker]:-}"
+    local run_dir="${MARKER_RUN_DIR[$marker]:-}"
     local pids
+
+    if [ -n "$pid_hint" ] && kill -0 "$pid_hint" 2>/dev/null; then
+        if [ -n "$EXTERNAL_TARGET_STOP_HOOK" ] && [ -x "$EXTERNAL_TARGET_STOP_HOOK" ]; then
+            "$EXTERNAL_TARGET_STOP_HOOK" "$marker" "$pid_hint" "$run_dir" || true
+        fi
+
+        $SUDO kill "$pid_hint" 2>/dev/null || true
+        sleep 1
+        if kill -0 "$pid_hint" 2>/dev/null; then
+            $SUDO kill -9 "$pid_hint" 2>/dev/null || true
+        fi
+    fi
 
     pids=$(pgrep -f "$marker" || true)
     if [ -n "$pids" ]; then
@@ -540,6 +563,8 @@ unregister_marker() {
     done
 
     ACTIVE_MARKERS=("${keep[@]}")
+    unset MARKER_PID_HINT["$marker"]
+    unset MARKER_RUN_DIR["$marker"]
 }
 
 start_target() {
@@ -549,9 +574,34 @@ start_target() {
     local out_log="$run_dir/target.out"
     local err_log="$run_dir/target.err"
     local ready_file="$run_dir/target.ready"
+    local wrap_run_id="target-${marker}"
+    local -a wrap_cmd
 
     rm -f "$ready_file"
-    setsid "$PYTHON_BIN" - "$marker" "$TARGET_MB" "$ready_file" "$TARGET_STRICT_ALLOC" <<'PY' >"$out_log" 2>"$err_log" &
+
+    if [ -n "$EXTERNAL_TARGET_START_HOOK" ]; then
+        if [ ! -x "$EXTERNAL_TARGET_START_HOOK" ]; then
+            echo "external start hook not executable: $EXTERNAL_TARGET_START_HOOK" >&2
+            return 1
+        fi
+
+        "$EXTERNAL_TARGET_START_HOOK" "$marker" "$run_dir" "$ready_file"
+        return $?
+    fi
+
+    wrap_cmd=()
+    if [ "$TARGET_WORKSPACE_WRAP" -eq 1 ]; then
+        wrap_cmd+=("$WORKSPACE_WRAP_BIN")
+        wrap_cmd+=(--workspace-root "$WORKSPACE_WRAP_ROOT")
+        wrap_cmd+=(--run-id "$wrap_run_id")
+        wrap_cmd+=(--require-namespace "$TARGET_WORKSPACE_WRAP_REQUIRE_NS")
+        if [ "$TARGET_WORKSPACE_WRAP_BIND_TMP" -ne 1 ]; then
+            wrap_cmd+=(--no-bind-tmp)
+        fi
+        wrap_cmd+=(--)
+    fi
+
+    setsid "${wrap_cmd[@]}" "$PYTHON_BIN" - "$marker" "$TARGET_MB" "$ready_file" "$TARGET_STRICT_ALLOC" <<'PY' >"$out_log" 2>"$err_log" &
 import sys
 import time
 
@@ -632,6 +682,14 @@ run_case() {
     mkdir -p "$img_dir"
 
     pid=$(start_target "$marker" "$case_dir")
+    if [ -z "$pid" ]; then
+        echo "[FAIL] $name: target start hook failed"
+        FAIL=$((FAIL + 1))
+        unregister_marker "$marker"
+        return
+    fi
+    MARKER_PID_HINT["$marker"]="$pid"
+    MARKER_RUN_DIR["$marker"]="$case_dir"
 
     ready_loops=$(( TARGET_READY_TIMEOUT_SEC * 5 ))
     if [ "$ready_loops" -lt 1 ]; then
@@ -794,6 +852,11 @@ if [ -z "$PYTHON_BIN" ] || [ ! -x "$PYTHON_BIN" ]; then
     exit 1
 fi
 
+if [ "$TARGET_WORKSPACE_WRAP" -eq 1 ] && [ ! -x "$WORKSPACE_WRAP_BIN" ]; then
+    echo "workspace wrapper not found or not executable: $WORKSPACE_WRAP_BIN"
+    exit 1
+fi
+
 if [ -n "$SUDO" ]; then
     echo "checking sudo credentials..."
     if ! $SUDO -v; then
@@ -804,6 +867,9 @@ if [ -n "$SUDO" ]; then
 fi
 
 mkdir -p "$BASE_DIR"
+if [ "$TARGET_WORKSPACE_WRAP" -eq 1 ]; then
+    mkdir -p "$WORKSPACE_WRAP_ROOT"
+fi
 trap cleanup_all_markers EXIT INT TERM
 
 echo "test workspace: $BASE_DIR"
@@ -811,6 +877,7 @@ echo "benchmark rounds: $BENCH_ROUNDS"
 echo "target dirty footprint: ${TARGET_MB} MiB"
 echo "target alloc strict: ${TARGET_STRICT_ALLOC}"
 echo "target ready timeout: ${TARGET_READY_TIMEOUT_SEC}s"
+echo "target workspace wrap: ${TARGET_WORKSPACE_WRAP} (root=${WORKSPACE_WRAP_ROOT})"
 
 if [ "$BENCH_ROUNDS" -le 1 ]; then
     run_case "base" "CRIU_DSA_DUMP=0 CRIU_DSA_POPULATE_READ=0" "dump-only"

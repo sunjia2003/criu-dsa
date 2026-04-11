@@ -3,6 +3,12 @@ LIB	:= $(LIBDIR)/libzdtmtst.a
 LDLIBS	+= $(LIB)
 CPPFLAGS += -I$(LIBDIR)
 
+ZDTM_WORKSPACE_WRAP ?= 0
+ZDTM_WORKSPACE_WRAP_ROOT ?=
+ZDTM_WORKSPACE_WRAP_REQUIRE_NS ?= 1
+ZDTM_WORKSPACE_WRAP_BIND_TMP ?= 1
+ZDTM_WORKSPACE_WRAP_BIN ?= ../workspace-wrap.sh
+
 TST_NOFILE	:=				\
 		busyloop00			\
 		sleeping00			\
@@ -524,10 +530,46 @@ install: all
 .PHONY: all install
 
 $(TST_NOFILE:%=%.pid):	%.pid:	%
-	$(TEST_ENV) $(<D)/$(<F) --pidfile=$@ --outfile=$<.out
+	@set -e; \
+	if [ "$(ZDTM_WORKSPACE_WRAP)" = "1" ]; then \
+		if [ "$(ZDTM_WORKSPACE_WRAP_BIND_TMP)" != "1" ]; then \
+			$(TEST_ENV) $(ZDTM_WORKSPACE_WRAP_BIN) \
+				--workspace-root "$(ZDTM_WORKSPACE_WRAP_ROOT)" \
+				--run-id "static-$(notdir $(@:.pid=))" \
+				--require-namespace "$(ZDTM_WORKSPACE_WRAP_REQUIRE_NS)" \
+				--no-bind-tmp -- \
+				$(<D)/$(<F) --pidfile=$@ --outfile=$<.out; \
+		else \
+			$(TEST_ENV) $(ZDTM_WORKSPACE_WRAP_BIN) \
+				--workspace-root "$(ZDTM_WORKSPACE_WRAP_ROOT)" \
+				--run-id "static-$(notdir $(@:.pid=))" \
+				--require-namespace "$(ZDTM_WORKSPACE_WRAP_REQUIRE_NS)" -- \
+				$(<D)/$(<F) --pidfile=$@ --outfile=$<.out; \
+		fi; \
+	else \
+		$(TEST_ENV) $(<D)/$(<F) --pidfile=$@ --outfile=$<.out; \
+	fi
 
 $(TST_FILE:%=%.pid):	%.pid:	%
-	$(TEST_ENV) $(<D)/$(<F) --pidfile=$@ --outfile=$<.out --filename=$<.test
+	@set -e; \
+	if [ "$(ZDTM_WORKSPACE_WRAP)" = "1" ]; then \
+		if [ "$(ZDTM_WORKSPACE_WRAP_BIND_TMP)" != "1" ]; then \
+			$(TEST_ENV) $(ZDTM_WORKSPACE_WRAP_BIN) \
+				--workspace-root "$(ZDTM_WORKSPACE_WRAP_ROOT)" \
+				--run-id "static-$(notdir $(@:.pid=))" \
+				--require-namespace "$(ZDTM_WORKSPACE_WRAP_REQUIRE_NS)" \
+				--no-bind-tmp -- \
+				$(<D)/$(<F) --pidfile=$@ --outfile=$<.out --filename=$<.test; \
+		else \
+			$(TEST_ENV) $(ZDTM_WORKSPACE_WRAP_BIN) \
+				--workspace-root "$(ZDTM_WORKSPACE_WRAP_ROOT)" \
+				--run-id "static-$(notdir $(@:.pid=))" \
+				--require-namespace "$(ZDTM_WORKSPACE_WRAP_REQUIRE_NS)" -- \
+				$(<D)/$(<F) --pidfile=$@ --outfile=$<.out --filename=$<.test; \
+		fi; \
+	else \
+		$(TEST_ENV) $(<D)/$(<F) --pidfile=$@ --outfile=$<.out --filename=$<.test; \
+	fi
 
 $(TST_DIR:%=%.pid):	%.pid:	%
 	$(TEST_ENV) $(<D)/$(<F) --pidfile=$@ --outfile=$<.out --dirname=$<.test

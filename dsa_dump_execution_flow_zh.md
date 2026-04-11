@@ -268,3 +268,75 @@ DSA 路径只是 `drain_pages` 的前置尝试分支，满足下列约束：
 ## 10. 一句话总结
 
 当前 DSA 集成在 CRIU dump 的 Step 2（drain_pages）中，以“同步批处理 + 共享 memfd + parasite 内部多 WQ 调度（默认 LPT）”完成页拷贝，并通过严格校验与受控回退机制保持与原有 dump 语义一致。
+
+## 11. workspace 快照并行路径（新增）
+
+本分支在 dump 主流程内新增了可选的 btrfs workspace 快照能力，核心目标是：
+
+- 不增加 frozen window 的阻塞等待
+- 快照失败时严格失败（不做静默降级）
+- 不使用 root overlay/pivot_root，避免影响 /dev 与 /sys 语义
+
+### 11.1 新增 CLI 选项
+
+- `--workspace-snapshot`
+- `--workspace-root <path>`
+- `--workspace-snapshot-parent <path>`
+- `--workspace-snapshot-dir <name>`（默认 `snaps`）
+- `--workspace-snapshot-meta-dir <name>`（默认 `meta`）
+- `--workspace-snapshot-strict`（默认开启，可用 `--no-workspace-snapshot-strict` 关闭）
+
+### 11.2 目录拓扑约束
+
+要求：
+
+1. `workspace-root` 与 `workspace-snapshot-parent` 必须都在 btrfs 上。
+2. 二者必须位于同一个 btrfs filesystem（fsid 一致）。
+3. `workspace-snapshot-parent` 必须在 `workspace-root` 外部（不能是其子目录或同路径）。
+
+推荐布局：
+
+- source: `/path/workspace`
+- snapshot parent: `/path/workspace_snap_parent`
+- snapshots: `/path/workspace_snap_parent/snaps`
+- metadata: `/path/workspace_snap_parent/meta`
+
+### 11.3 dump 生命周期接入点
+
+- 在 `collect_pstree()` 前初始化 snapshot worker 上下文。
+- 在 `collect_pstree()` 成功后发出 worker start 信号。
+- 在 unfreeze 前执行 non-blocking gate：
+  - `DONE_OK` 才允许继续
+  - `RUNNING/WAIT_START/DONE_ERR` 立即标记 dump 失败
+- 在 unfreeze 后执行 join 与资源清理。
+
+### 11.4 strict 检测语义
+
+worker 串行执行：
+
+1. pre-check：扫描 source tree 是否存在 nested subvolume
+2. create snapshot
+3. post-check：再次扫描 source tree
+
+若出现“create 成功但 post-check 失败”，会尝试删除刚创建的 snapshot，并让 dump 失败。
+
+### 11.5 启动包装（无 root 覆盖）
+
+新增统一启动脚本：`test/zdtm/workspace-wrap.sh`，策略为：
+
+- `unshare -m` 进入 mount namespace
+- `mount --make-rprivate /`
+- 可选 bind `/tmp`、`/var/tmp` 到 workspace 下临时目录
+- 重定向 `TMPDIR/HOME/XDG_RUNTIME_DIR` 与工作目录
+
+该策略不修改根文件系统视图，不覆盖 `/dev`、`/sys`，降低对 DSA 路径可见性的风险。
+
+### 11.6 常见报错与处理
+
+- `source workspace contains nested subvolumes`
+  - 原因：strict 模式下 source 内存在嵌套子卷。
+  - 处理：清理/迁移 nested subvolume，或显式关闭 strict。
+
+- `Snapshot parent ... must be outside source workspace ...`
+  - 原因：快照父目录在 source 内部。
+  - 处理：将 snapshot parent 移到 source 外部兄弟路径。

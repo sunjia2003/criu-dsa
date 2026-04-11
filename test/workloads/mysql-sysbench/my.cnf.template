@@ -1,0 +1,14 @@
+[mysqld]
+user=%MYSQL_USER%
+bind-address=127.0.0.1
+port=%MYSQL_PORT%
+socket=%MYSQL_SOCKET%
+pid-file=%MYSQL_PID_FILE%
+datadir=%MYSQL_DATADIR%
+log-error=%MYSQL_ERROR_LOG%
+skip-networking=0
+skip-name-resolve=1
+mysqlx=0
+innodb_buffer_pool_size=256M
+innodb_log_file_size=64M
+max_connections=64

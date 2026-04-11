@@ -191,6 +191,12 @@ struct cr_options {
 	int tcp_skip_in_flight;
 	bool lazy_pages;
 	char *work_dir;
+	int workspace_snapshot;
+	char *workspace_root;
+	char *workspace_snapshot_parent;
+	char *workspace_snapshot_dir;
+	char *workspace_snapshot_meta_dir;
+	int workspace_snapshot_strict;
 	int network_lock_method;
 	int skip_file_rwx_check;
 	int allow_uprobes;

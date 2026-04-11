@@ -63,6 +63,67 @@ One of the CRIU features is the ability to save and restore state of a TCP socke
 without breaking the connection. This functionality is considered to be useful by
 itself, and we have it available as the [libsoccr library](https://criu.org/Libsoccr).
 
+## Workspace Snapshot Integration (This Branch)
+
+This branch adds an optional dump-time btrfs workspace snapshot path.
+
+New dump options:
+- `--workspace-snapshot`
+- `--workspace-root <path>`
+- `--workspace-snapshot-parent <path>`
+- `--workspace-snapshot-dir <name>` (default: `snaps`)
+- `--workspace-snapshot-meta-dir <name>` (default: `meta`)
+- `--workspace-snapshot-strict` (enabled by default)
+
+Behavior summary:
+- Snapshot work runs in a dedicated worker thread during dump.
+- Dump fails if snapshot is unfinished or failed at the pre-unfreeze gate.
+- In strict mode, nested subvolumes under `--workspace-root` cause dump failure.
+
+Required directory topology:
+- `--workspace-snapshot-parent` must be outside `--workspace-root`.
+- Both paths must be on the same btrfs filesystem.
+
+Troubleshooting:
+- `source workspace contains nested subvolumes`: remove nested subvolumes from
+    source, or disable strict mode via `--no-workspace-snapshot-strict`.
+- `Snapshot parent ... must be outside source workspace ...`: move snapshot
+    parent to a sibling path outside source.
+
+Test launch wrapper (no root overlay):
+- `test/zdtm/workspace-wrap.sh` uses mount namespace + writable path
+    redirection only.
+- `criu-test.sh` enables wrapper launch by default for target workload.
+- `test/zdtm.py` can enable the same wrapper with:
+    `--workspace-wrap --workspace-wrap-root <path>`.
+
+## External Workload Harness (This Branch)
+
+This branch also includes an external workload harness under
+`test/workloads/` for compatibility verification with long-running services
+and simulators.
+
+Included adapters:
+- `redis-ycsb`
+- `mysql-sysbench`
+- `lammps-bd`
+- `verilator-linux`
+
+Entry point:
+- `test/workloads/run-matrix.sh`
+
+Useful commands:
+- `test/workloads/run-matrix.sh --list`
+- `sudo test/workloads/run-matrix.sh --workload all --mode all --profile small`
+
+MySQL safety constraints:
+- test instance never uses ports `3306`/`33060`
+- all runtime paths must stay under run root
+- stop/cleanup is instance-scoped (pidfile + cmdline fingerprint)
+- broad process kill patterns are forbidden
+
+See `test/workloads/README.md` for detailed usage and troubleshooting.
+
 ## Licence
 
 The project is licensed under GPLv2 (though files sitting in the lib/ directory are LGPLv2.1).

@@ -1,10 +1,12 @@
 #include <ctype.h>
 #include <getopt.h>
 #include <limits.h>
+#include <linux/magic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
+#include <sys/vfs.h>
 
 #include "log.h"
 #include "common/list.h"
@@ -27,6 +29,7 @@
 #include "sk-inet.h"
 #include "sockets.h"
 #include "tty.h"
+#include "util.h"
 #include "version.h"
 
 #include "common/xmalloc.h"
@@ -432,6 +435,95 @@ void init_opts(void)
 	opts.file_validation_method = FILE_VALIDATION_DEFAULT;
 	opts.network_lock_method = NETWORK_LOCK_DEFAULT;
 	opts.ghost_fiemap = FIEMAP_DEFAULT;
+	opts.workspace_snapshot_strict = true;
+}
+
+static bool workspace_snapshot_opts_set(void)
+{
+	return opts.workspace_snapshot || opts.workspace_root ||
+	       opts.workspace_snapshot_parent || opts.workspace_snapshot_dir ||
+	       opts.workspace_snapshot_meta_dir;
+}
+
+static int check_workspace_snapshot_opts(void)
+{
+	cleanup_free char *source_real = NULL;
+	cleanup_free char *parent_real = NULL;
+	struct statfs source_fs;
+	struct statfs parent_fs;
+	const char *snap_dir;
+	const char *meta_dir;
+
+	if (!workspace_snapshot_opts_set())
+		return 0;
+
+	if (opts.mode != CR_DUMP) {
+		pr_err("Workspace snapshot options are dump-only\n");
+		return 1;
+	}
+
+	if (!opts.workspace_snapshot) {
+		pr_err("Workspace snapshot paths require --workspace-snapshot\n");
+		return 1;
+	}
+
+	if (!opts.workspace_root || !opts.workspace_snapshot_parent) {
+		pr_err("--workspace-root and --workspace-snapshot-parent are required\n");
+		return 1;
+	}
+
+	snap_dir = opts.workspace_snapshot_dir ? opts.workspace_snapshot_dir : "snaps";
+	meta_dir = opts.workspace_snapshot_meta_dir ? opts.workspace_snapshot_meta_dir : "meta";
+
+	if (strchr(snap_dir, '/')) {
+		pr_err("--workspace-snapshot-dir must be a single path component\n");
+		return 1;
+	}
+
+	if (strchr(meta_dir, '/')) {
+		pr_err("--workspace-snapshot-meta-dir must be a single path component\n");
+		return 1;
+	}
+
+	source_real = realpath(opts.workspace_root, NULL);
+	if (!source_real) {
+		pr_perror("Can't resolve --workspace-root %s", opts.workspace_root);
+		return 1;
+	}
+
+	parent_real = realpath(opts.workspace_snapshot_parent, NULL);
+	if (!parent_real) {
+		pr_perror("Can't resolve --workspace-snapshot-parent %s",
+			  opts.workspace_snapshot_parent);
+		return 1;
+	}
+
+	if (is_path_prefix(parent_real, source_real)) {
+		pr_err("Snapshot parent %s must be outside source workspace %s\n",
+		       parent_real, source_real);
+		return 1;
+	}
+
+	if (statfs(source_real, &source_fs)) {
+		pr_perror("Can't statfs workspace root %s", source_real);
+		return 1;
+	}
+
+	if (statfs(parent_real, &parent_fs)) {
+		pr_perror("Can't statfs snapshot parent %s", parent_real);
+		return 1;
+	}
+
+	if (source_fs.f_type != BTRFS_SUPER_MAGIC ||
+	    parent_fs.f_type != BTRFS_SUPER_MAGIC) {
+		pr_err("Workspace snapshot requires both paths on btrfs\n");
+		return 1;
+	}
+
+	pr_info("Workspace snapshot enabled: source=%s parent=%s strict_nested=%d\n",
+		source_real, parent_real, opts.workspace_snapshot_strict ? 1 : 0);
+
+	return 0;
 }
 
 bool deprecated_ok(char *what)
@@ -701,6 +793,12 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		BOOL_OPT("skip-file-rwx-check", &opts.skip_file_rwx_check),
 		{ "lsm-mount-context", required_argument, 0, 1099 },
 		{ "network-lock", required_argument, 0, 1100 },
+		BOOL_OPT("workspace-snapshot", &opts.workspace_snapshot),
+		{ "workspace-root", required_argument, 0, 1101 },
+		{ "workspace-snapshot-parent", required_argument, 0, 1102 },
+		{ "workspace-snapshot-dir", required_argument, 0, 1103 },
+		{ "workspace-snapshot-meta-dir", required_argument, 0, 1104 },
+		BOOL_OPT("workspace-snapshot-strict", &opts.workspace_snapshot_strict),
 		BOOL_OPT("mntns-compat-mode", &opts.mntns_compat_mode),
 		BOOL_OPT("unprivileged", &opts.unprivileged),
 		BOOL_OPT("ghost-fiemap", &opts.ghost_fiemap),
@@ -1045,6 +1143,22 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 				return 1;
 			}
 			break;
+		case 1101:
+			SET_CHAR_OPTS(workspace_root, optarg);
+			opts.workspace_snapshot = true;
+			break;
+		case 1102:
+			SET_CHAR_OPTS(workspace_snapshot_parent, optarg);
+			opts.workspace_snapshot = true;
+			break;
+		case 1103:
+			SET_CHAR_OPTS(workspace_snapshot_dir, optarg);
+			opts.workspace_snapshot = true;
+			break;
+		case 1104:
+			SET_CHAR_OPTS(workspace_snapshot_meta_dir, optarg);
+			opts.workspace_snapshot = true;
+			break;
 		case 'V':
 			pr_msg("Version: %s\n", CRIU_VERSION);
 			if (strcmp(CRIU_GITID, "0"))
@@ -1135,6 +1249,9 @@ int check_options(void)
 		pr_err("Error: namespace flags conflict\n");
 		return 1;
 	}
+
+	if (check_workspace_snapshot_opts())
+		return 1;
 
 	return 0;
 }

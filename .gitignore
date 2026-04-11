@@ -36,3 +36,5 @@ build/**
 *.po
 *.code-workspace
 *.vscode
+workspace/*
+*.img

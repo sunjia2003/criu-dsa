@@ -15,6 +15,10 @@
 #include <pthread.h>
 #include <linux/memfd.h>
 
+#ifndef MFD_HUGE_1GB
+#define MFD_HUGE_1GB	(30 << MFD_HUGE_SHIFT)
+#endif
+
 #include "types.h"
 #include "cr_options.h"
 #include "servicefd.h"
@@ -340,6 +344,8 @@ prep_dump_pages_args(struct parasite_ctl *ctl, struct vm_area_list *vma_area_lis
 #define DSA_SHARED_BUF_SIZE_MAX \
 	((unsigned int)((4ULL * 1024ULL * 1024ULL * 1024ULL) - DSA_SHARED_DATA_ALIGN))
 #define DSA_HUGEPAGE_2MB_SIZE	(2U * 1024U * 1024U)
+#define DSA_HUGEPAGE_1GB_SIZE	(1ULL * 1024ULL * 1024ULL * 1024ULL)
+#define DSA_HUGEPAGE_1GB_PAGES	4U
 #define DSA_SHARED_BUF_EST_MARGIN_PCT	25U
 #define DSA_SHARED_BUF_EST_RESERVE	(16U * 1024U * 1024U)
 #define DSA_HUGEPAGE_FREE_PATH	"/sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages"
@@ -779,6 +785,7 @@ static void dsa_replay_stop(struct dsa_dump_ctx *ctx);
 struct dsa_shared_mem_before_freeze {
 	int fd;
 	void *buf;
+	size_t alloc_size;
 	size_t size;
 	bool ready;
 	u64 total_us;
@@ -790,6 +797,7 @@ struct dsa_shared_mem_before_freeze {
 static struct dsa_shared_mem_before_freeze dsa_shared_mem_bf = {
 	.fd = -1,
 	.buf = MAP_FAILED,
+	.alloc_size = 0,
 	.size = 0,
 	.ready = false,
 	.total_us = 0,
@@ -802,6 +810,7 @@ static void dsa_shared_mem_bf_reset(void)
 {
 	dsa_shared_mem_bf.fd = -1;
 	dsa_shared_mem_bf.buf = MAP_FAILED;
+	dsa_shared_mem_bf.alloc_size = 0;
 	dsa_shared_mem_bf.size = 0;
 	dsa_shared_mem_bf.ready = false;
 	dsa_shared_mem_bf.total_us = 0;
@@ -813,7 +822,7 @@ static void dsa_shared_mem_bf_reset(void)
 void dsa_shared_mem_cleanup_after_dump(void)
 {
 	if (dsa_shared_mem_bf.buf != MAP_FAILED)
-		munmap(dsa_shared_mem_bf.buf, dsa_shared_mem_bf.size);
+		munmap(dsa_shared_mem_bf.buf, dsa_shared_mem_bf.alloc_size);
 
 	if (dsa_shared_mem_bf.fd >= 0)
 		close(dsa_shared_mem_bf.fd);
@@ -826,8 +835,8 @@ int dsa_shared_mem_prepare_before_freeze(void)
 	int htlb_flags;
 	int fd = -1;
 	void *buf = MAP_FAILED;
-	size_t size = DSA_SHARED_BUF_SIZE_MAX -
-		(DSA_SHARED_BUF_SIZE_MAX % DSA_HUGEPAGE_2MB_SIZE);
+	size_t alloc_size = (size_t)DSA_HUGEPAGE_1GB_PAGES * (size_t)DSA_HUGEPAGE_1GB_SIZE;
+	size_t usable_size = DSA_SHARED_BUF_SIZE_MAX;
 	struct timespec all_begin;
 	struct timespec all_end;
 	struct timespec t_begin;
@@ -842,7 +851,7 @@ int dsa_shared_mem_prepare_before_freeze(void)
 	if (dsa_shared_mem_bf.fd >= 0 || dsa_shared_mem_bf.buf != MAP_FAILED)
 		dsa_shared_mem_cleanup_after_dump();
 
-	htlb_flags = MFD_CLOEXEC | MFD_HUGETLB | MFD_HUGE_2MB;
+	htlb_flags = MFD_CLOEXEC | MFD_HUGETLB | MFD_HUGE_1GB;
 
 	clock_gettime(CLOCK_MONOTONIC, &all_begin);
 
@@ -856,7 +865,7 @@ int dsa_shared_mem_prepare_before_freeze(void)
 	}
 
 	clock_gettime(CLOCK_MONOTONIC, &t_begin);
-	if (ftruncate(fd, size)) {
+	if (ftruncate(fd, alloc_size)) {
 		clock_gettime(CLOCK_MONOTONIC, &t_end);
 		dsa_shared_mem_bf.truncate_us = dsa_timespec_delta_us(&t_begin, &t_end);
 		pr_perror("DSA: before-freeze ftruncate failed");
@@ -866,7 +875,7 @@ int dsa_shared_mem_prepare_before_freeze(void)
 	dsa_shared_mem_bf.truncate_us = dsa_timespec_delta_us(&t_begin, &t_end);
 
 	clock_gettime(CLOCK_MONOTONIC, &t_begin);
-	buf = mmap(NULL, size, PROT_READ | PROT_WRITE,
+	buf = mmap(NULL, alloc_size, PROT_READ | PROT_WRITE,
 		   MAP_SHARED | MAP_POPULATE, fd, 0);
 	clock_gettime(CLOCK_MONOTONIC, &t_end);
 	dsa_shared_mem_bf.mmap_us = dsa_timespec_delta_us(&t_begin, &t_end);
@@ -884,11 +893,14 @@ int dsa_shared_mem_prepare_before_freeze(void)
 	dsa_shared_mem_bf.total_us = dsa_timespec_delta_us(&all_begin, &all_end);
 	dsa_shared_mem_bf.fd = fd;
 	dsa_shared_mem_bf.buf = buf;
-	dsa_shared_mem_bf.size = size;
+	dsa_shared_mem_bf.alloc_size = alloc_size;
+	dsa_shared_mem_bf.size = usable_size;
 	dsa_shared_mem_bf.ready = true;
 
-	pr_info("DSA_SHARED_MEM_PREPARE: size=%zu create_us=%llu truncate_us=%llu mmap_us=%llu total_us=%llu\n",
-		size,
+	pr_info("DSA_SHARED_MEM_PREPARE: mode=hugetlb_1gb pages=%u alloc_size=%zu usable_size=%zu create_us=%llu truncate_us=%llu mmap_us=%llu total_us=%llu\n",
+		DSA_HUGEPAGE_1GB_PAGES,
+		alloc_size,
+		usable_size,
 		(unsigned long long)dsa_shared_mem_bf.create_us,
 		(unsigned long long)dsa_shared_mem_bf.truncate_us,
 		(unsigned long long)dsa_shared_mem_bf.mmap_us,
@@ -898,7 +910,7 @@ int dsa_shared_mem_prepare_before_freeze(void)
 
 err:
 	if (buf != MAP_FAILED)
-		munmap(buf, size);
+		munmap(buf, alloc_size);
 	if (fd >= 0)
 		close(fd);
 

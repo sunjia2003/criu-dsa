@@ -88,6 +88,7 @@
 #include "asm/dump.h"
 #include "timer.h"
 #include "sigact.h"
+#include "ws-snapshot.h"
 
 /*
  * Architectures can overwrite this function to restore register sets that
@@ -232,6 +233,7 @@ static int check_thread_rseq(pid_t tid, const struct parasite_check_rseq *ti_rse
 }
 
 struct cr_imgset *glob_imgset;
+static struct workspace_snapshot_ctx dump_ws_snapshot;
 
 static int collect_fds(pid_t pid, struct parasite_drain_fd **dfds)
 {
@@ -2178,13 +2180,20 @@ static int cr_dump_finish(int ret)
 
 		if (arch_set_thread_regs(root_item, true) < 0) {
 			dsa_shared_mem_cleanup_after_dump();
+			ws_snapshot_ctx_destroy(&dump_ws_snapshot);
 			return -1;
 		}
 
 		cr_plugin_fini(CR_PLUGIN_STAGE__DUMP, ret);
 
+		if (!ret && ws_snapshot_gate_check_nonblocking(&dump_ws_snapshot))
+			ret = -1;
+
 		pstree_switch_state(root_item, TASK_ALIVE);
 		timing_stop(TIME_FROZEN);
+
+		if (ws_snapshot_join_and_finalize(&dump_ws_snapshot) && !ret)
+			ret = -1;
 
 		if (dsa_wait_deferred_async_writers())
 			ret = -1;
@@ -2236,6 +2245,8 @@ static int cr_dump_finish(int ret)
 			write_stats(DUMP_STATS);
 			pr_info("Dumping finished successfully\n");
 		}
+
+		ws_snapshot_ctx_destroy(&dump_ws_snapshot);
 
 		return post_dump_ret ?: (ret != 0);
 	}
@@ -2300,13 +2311,21 @@ static int cr_dump_finish(int ret)
 
 	if (arch_set_thread_regs(root_item, true) < 0) {
 		dsa_shared_mem_cleanup_after_dump();
+		ws_snapshot_ctx_destroy(&dump_ws_snapshot);
 		return -1;
 	}
 
 	cr_plugin_fini(CR_PLUGIN_STAGE__DUMP, ret);
 
+	if (!ret && ws_snapshot_gate_check_nonblocking(&dump_ws_snapshot))
+		ret = -1;
+
 	pstree_switch_state(root_item, (ret || post_dump_ret) ? TASK_ALIVE : opts.final_state);
 	timing_stop(TIME_FROZEN);
+
+	if (ws_snapshot_join_and_finalize(&dump_ws_snapshot) && !ret)
+		ret = -1;
+
 	dsa_shared_mem_cleanup_after_dump();
 	free_pstree(root_item);
 	seccomp_free_entries();
@@ -2330,6 +2349,9 @@ static int cr_dump_finish(int ret)
 		write_stats(DUMP_STATS);
 		pr_info("Dumping finished successfully\n");
 	}
+
+	ws_snapshot_ctx_destroy(&dump_ws_snapshot);
+
 	return post_dump_ret ?: (ret != 0);
 }
 
@@ -2342,6 +2364,8 @@ int cr_dump_tasks(pid_t pid)
 	int exit_code = -1;
 
 	kerndat_warn_about_madv_guards();
+
+	ws_snapshot_ctx_destroy(&dump_ws_snapshot);
 
 	pr_info("========================================\n");
 	pr_info("Dumping processes (pid: %d comm: %s)\n", pid, __task_comm_info(pid));
@@ -2411,8 +2435,26 @@ int cr_dump_tasks(pid_t pid)
 	if (dsa_shared_mem_prepare_before_freeze())
 		goto err;
 
+	if (opts.workspace_snapshot) {
+		if (ws_snapshot_ctx_init(&dump_ws_snapshot, pid,
+					 opts.workspace_root,
+					 opts.workspace_snapshot_parent,
+					 opts.workspace_snapshot_dir,
+					 opts.workspace_snapshot_meta_dir,
+					 opts.workspace_snapshot_strict)) {
+			pr_err("Failed to initialize workspace snapshot thread\n");
+			goto err;
+		}
+	}
+
 	if (collect_pstree())
 		goto err;
+
+	if (ws_snapshot_ctx_enabled(&dump_ws_snapshot) &&
+	    ws_snapshot_start(&dump_ws_snapshot)) {
+		pr_err("Failed to start workspace snapshot thread\n");
+		goto err;
+	}
 
 	if (checkpoint_devices())
 		goto err;

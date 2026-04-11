@@ -442,6 +442,26 @@ class zdtm_test:
         self.__freezer = freezer
         self._bins = [name]
         self._env = {'TMPDIR': os.environ.get('TMPDIR', '/tmp')}
+        if opts.get('workspace_wrap'):
+            wrap_root = opts.get('workspace_wrap_root')
+            if not wrap_root:
+                wrap_root = os.path.abspath(
+                    os.path.join(os.getcwd(), "workspace-wrap"))
+
+            wrap_bin = os.path.abspath(
+                os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)),
+                    "zdtm",
+                    "workspace-wrap.sh",
+                ))
+
+            self._env.update({
+                'ZDTM_WORKSPACE_WRAP': "1",
+                'ZDTM_WORKSPACE_WRAP_ROOT': os.path.abspath(wrap_root),
+                'ZDTM_WORKSPACE_WRAP_REQUIRE_NS': str(opts.get('workspace_wrap_require_ns', 1)),
+                'ZDTM_WORKSPACE_WRAP_BIND_TMP': str(opts.get('workspace_wrap_bind_tmp', 1)),
+                'ZDTM_WORKSPACE_WRAP_BIN': wrap_bin,
+            })
         self._deps = desc.get('deps', [])
         self._bind = desc.get('bind')
         self.auto_reap = True
@@ -2186,7 +2206,8 @@ class Launcher:
               'remote_lazy_pages', 'show_stats', 'lazy_migrate', 'stream',
               'tls', 'criu_bin', 'crit_bin', 'pre_dump_mode', 'mntns_compat_mode',
               'rootless', 'preload_libfault', 'mocked_cuda_checkpoint',
-              'pycriu_search_path')
+              'pycriu_search_path', 'workspace_wrap', 'workspace_wrap_root',
+              'workspace_wrap_require_ns', 'workspace_wrap_bind_tmp')
         arg = repr((name, desc, flavor, {d: self.__opts[d] for d in nd}))
 
         if self.__use_log:
@@ -2883,6 +2904,22 @@ def get_cli_args():
     rp.add_argument("--mntns-compat-mode",
                     help="Use old compat mounts restore engine",
                     action='store_true')
+    rp.add_argument("--workspace-wrap",
+                    help="Run tests in workspace wrapper mount namespace",
+                    action='store_true')
+    rp.add_argument("--workspace-wrap-root",
+                    help="Workspace root used by wrapper",
+                    default=None)
+    rp.add_argument("--workspace-wrap-require-ns",
+                    help="Require mount namespace setup in wrapper (1/0)",
+                    type=int,
+                    choices=[0, 1],
+                    default=1)
+    rp.add_argument("--workspace-wrap-bind-tmp",
+                    help="Bind /tmp and /var/tmp in wrapper (1/0)",
+                    type=int,
+                    choices=[0, 1],
+                    default=1)
     rp.add_argument("--test-shard-index", type=int, default=None,
                     help="Select tests for a shard <index> (0-based)")
     rp.add_argument("--test-shard-count", type=int, default=0,
