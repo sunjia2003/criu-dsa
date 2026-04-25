@@ -7,11 +7,14 @@ REDIS_CONF=
 REDIS_PID_FILE=
 REDIS_LOG=
 YCSB_LOG=
+YCSB_LOAD_LOG=
 REDIS_ADMIN_LOG=
 YCSB_PROBE_LOG=
 YCSB_PID=
 YCSB_BIN=
 REDIS_TCP_ESTABLISHED=
+YCSB_PROFILE_FILE=
+YCSB_LOADED=0
 
 redis_ping_ok() {
 	local out
@@ -34,6 +37,39 @@ redis_stop_ycsb() {
 	YCSB_PID=
 }
 
+ycsb_start_runner() {
+	if [ -z "${YCSB_BIN:-}" ] || [ -n "${YCSB_PID:-}" ]; then
+		return 0
+	fi
+
+	(
+		while true; do
+			"$YCSB_BIN" run redis -p "redis.host=127.0.0.1" -p "redis.port=$REDIS_PORT" \
+				-threads 4 -target 2000 -P "$YCSB_PROFILE_FILE" >>"$YCSB_LOG" 2>&1 || true
+			sleep 1
+		done
+	) &
+	YCSB_PID=$!
+	cm_append_extra_pid "$YCSB_PID"
+	return 0
+}
+
+ycsb_load_data() {
+	if [ -z "${YCSB_BIN:-}" ] || [ "$YCSB_LOADED" = "1" ]; then
+		return 0
+	fi
+
+	: >"$YCSB_LOAD_LOG"
+	if ! "$YCSB_BIN" load redis -p "redis.host=127.0.0.1" -p "redis.port=$REDIS_PORT" \
+		-threads 4 -P "$YCSB_PROFILE_FILE" >>"$YCSB_LOAD_LOG" 2>&1; then
+		cm_err "ycsb load failed"
+		return 1
+	fi
+
+	YCSB_LOADED=1
+	return 0
+}
+
 adapter_prepare() {
 	cm_require_cmd redis-server || return 1
 	cm_require_cmd redis-cli || return 1
@@ -42,8 +78,14 @@ adapter_prepare() {
 	REDIS_PID_FILE="$RUN_ROOT/redis.pid"
 	REDIS_LOG="$RUN_LOG_DIR/redis.log"
 	YCSB_LOG="$RUN_LOG_DIR/ycsb.log"
+	YCSB_LOAD_LOG="$RUN_LOG_DIR/ycsb-load.log"
 	REDIS_ADMIN_LOG="$RUN_LOG_DIR/redis-admin.log"
 	YCSB_PROBE_LOG="$RUN_LOG_DIR/ycsb-probe.log"
+	YCSB_PROFILE_FILE="$SCRIPT_DIR/redis-ycsb/profile-${WORKLOAD_PROFILE:-small}.conf"
+	if [ ! -f "$YCSB_PROFILE_FILE" ]; then
+		cm_err "missing YCSB profile: $YCSB_PROFILE_FILE"
+		return 1
+	fi
 
 	cat >"$REDIS_CONF" <<EOF
 bind 127.0.0.1
@@ -61,6 +103,7 @@ EOF
 	TARGET_RESOURCE_LOG_DIR="$RUN_LOG_DIR"
 	cm_append_log_path "$REDIS_LOG"
 	cm_append_log_path "$YCSB_LOG"
+	cm_append_log_path "$YCSB_LOAD_LOG"
 	cm_append_log_path "$REDIS_ADMIN_LOG"
 	cm_append_log_path "$YCSB_PROBE_LOG"
 
@@ -91,20 +134,8 @@ EOF
 }
 
 adapter_start() {
-	local profile_file="$SCRIPT_DIR/redis-ycsb/profile-small.conf"
-
 	redis-server "$REDIS_CONF" >"$RUN_LOG_DIR/redis-stdout.log" 2>"$RUN_LOG_DIR/redis-stderr.log" &
 	TARGET_PID=$!
-	if [ -n "${YCSB_BIN:-}" ]; then
-		(
-			while true; do
-				"$YCSB_BIN" run redis -p "redis.host=127.0.0.1" -p "redis.port=$REDIS_PORT" -threads 4 -target 2000 -P "$profile_file" >>"$YCSB_LOG" 2>&1 || true
-				sleep 1
-			done
-		) &
-		YCSB_PID=$!
-		cm_append_extra_pid "$YCSB_PID"
-	fi
 	return 0
 }
 
@@ -113,6 +144,12 @@ adapter_ready() {
 	local i
 	for i in $(seq 1 "$timeout_sec"); do
 		if redis_ping_ok; then
+			if ! ycsb_load_data; then
+				return 1
+			fi
+			if ! ycsb_start_runner; then
+				return 1
+			fi
 			return 0
 		fi
 		sleep 1
