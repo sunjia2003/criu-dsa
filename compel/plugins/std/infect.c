@@ -23,6 +23,21 @@
 static int tsock = -1;
 
 static struct rt_sigframe *sigframe;
+static unsigned long sigframe_init_hash;
+
+static unsigned long sigframe_hash(const void *ptr, unsigned long len)
+{
+	const unsigned char *p = ptr;
+	unsigned long h = 1469598103934665603UL;
+	unsigned long i;
+
+	for (i = 0; i < len; i++) {
+		h ^= p[i];
+		h *= 1099511628211UL;
+	}
+
+	return h;
+}
 
 #ifdef ARCH_HAS_LONG_PAGES
 /*
@@ -93,11 +108,19 @@ static unsigned long fini(void)
 {
 	unsigned long new_sp;
 
+	pr_info("FINI_TRACE: begin tid=%ld\n", sys_gettid());
+	pr_info("FINI_TRACE: parasite_cleanup begin\n");
 	parasite_cleanup();
+	pr_info("FINI_TRACE: parasite_cleanup end\n");
 
 	new_sp = (long)sigframe + RT_SIGFRAME_OFFSET(sigframe);
 	pr_debug("%ld: new_sp=%lx ip %lx\n", sys_gettid(), new_sp, RT_SIGFRAME_REGIP(sigframe));
 
+	pr_info("FINI_TRACE: sigreturn_prepare sigframe=%lx new_sp=%lx ip=%lx hash=%lx init_hash=%lx changed=%u\n",
+		(unsigned long)sigframe, new_sp, (unsigned long)RT_SIGFRAME_REGIP(sigframe),
+		sigframe_hash(sigframe, RESTORE_STACK_SIGFRAME), sigframe_init_hash,
+		sigframe_hash(sigframe, RESTORE_STACK_SIGFRAME) != sigframe_init_hash ? 1U : 0U);
+	pr_info("FINI_TRACE: close_socket begin\n");
 	sys_close(tsock);
 	std_log_set_fd(-1);
 
@@ -154,6 +177,7 @@ static noinline __used unsigned long parasite_init_daemon(void *data)
 	int ret;
 
 	sigframe = (void *)(uintptr_t)args->sigframe;
+	sigframe_init_hash = sigframe_hash(sigframe, RESTORE_STACK_SIGFRAME);
 #ifdef ARCH_HAS_LONG_PAGES
 	__page_size = args->page_size;
 #endif

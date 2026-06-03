@@ -374,7 +374,7 @@ int parasite_dsa_dump_pages_seized(struct parasite_ctl *ctl, struct parasite_dsa
 		/* Start the RPC call first */
 		ret = compel_rpc_call(PARASITE_CMD_DSA_DUMP_PAGES, ctl);
 		if (ret) {
-			pr_err("Parasite failed to start DSA dump pages call\n");
+			pr_err("Parasite failed to start DSA dump pages call ret=%d\n", ret);
 			return ret;
 		}
 
@@ -411,12 +411,10 @@ int parasite_dsa_dump_pages_seized(struct parasite_ctl *ctl, struct parasite_dsa
 		ret = compel_rpc_call_sync(PARASITE_CMD_DSA_DUMP_PAGES, ctl);
 	}
 
-	/* Copy back the results */
-	*args = *pa;
 	if (ret)
 		return ret;
 
-	return args->op_ret;
+	return 0;
 }
 
 static unsigned long parasite_args_size = PARASITE_ARG_SIZE_MIN;

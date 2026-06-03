@@ -261,7 +261,18 @@ struct parasite_dump_cgroup_args {
 #define DSA_DUMP_MAX_WQ        16
 #define DSA_SHARED_DATA_ALIGN  4096U
 #define PARASITE_DSA_SHM_HDR_MAGIC   0x4453414dU
-#define PARASITE_DSA_SHM_HDR_VERSION 1U
+#define PARASITE_DSA_SHM_HDR_VERSION 2U
+#define PARASITE_DSA_SHM_F_STREAM    0x1U
+#define DSA_STREAM_SLOT_COUNT        8U
+#define DSA_STREAM_SLOT_DESC_CAP     DSA_DUMP_BATCH_SIZE
+
+enum dsa_stream_slot_state {
+	DSA_STREAM_SLOT_EMPTY = 0,
+	DSA_STREAM_SLOT_READY = 1,
+	DSA_STREAM_SLOT_COPYING = 2,
+	DSA_STREAM_SLOT_DONE = 3,
+	DSA_STREAM_SLOT_ERROR = 4,
+};
 
 enum dsa_wq_policy {
 	DSA_WQ_POLICY_LPT = 0,
@@ -285,10 +296,50 @@ struct parasite_dsa_shm_hdr {
 	u32 reserved;
 };
 
+struct parasite_dsa_stream_slot {
+	volatile u32 state;
+	u32 seq;
+	u32 desc_off;
+	u32 desc_count;
+	u32 payload_off;
+	u32 payload_bytes;
+	u32 copied_bytes;
+	u32 status;
+};
+
+struct parasite_dsa_stream_hdr {
+	struct parasite_dsa_shm_hdr base;
+	volatile u32 producer_seq;
+	volatile u32 consumer_seq;
+	volatile u32 finish;
+	volatile u32 error;
+	volatile u32 consumer_ready;
+	u32 slot_count;
+	u32 slot_desc_cap;
+	u32 slots_off;
+	u32 desc_area_off;
+	u32 payload_base;
+	volatile u32 payload_head;
+	u32 payload_limit;
+	u32 reserved;
+	s32 result_op_ret;
+	u32 result_total_copied;
+	u32 result_completed_count;
+	s32 result_failed_idx;
+	u32 result_failed_status;
+	u32 result_new_buf_offset;
+	u64 result_setup_shared_recv_fd_us;
+	u64 result_setup_shared_mmap_us;
+	u64 result_cleanup_munmap_us;
+	u64 result_cleanup_close_us;
+	u64 result_setup_shared_us;
+};
+
 struct parasite_dsa_dump_pages_args {
 	/* Input from CRIU */
 	u64 shared_buf_addr;	/* Shared buffer address in parasite */
 	u32 shared_buf_size;	/* Total shared buffer size */
+	u64 shared_map_size;	/* Actual mmap/munmap size for the shared buffer */
 	u32 hdr_off;		/* Header offset inside shared buffer */
 	u32 buf_write_offset;	/* Current buffer write position */
 	u32 is_last_batch;	/* Is this the last batch */
@@ -327,4 +378,3 @@ struct parasite_dsa_dump_pages_args {
 #endif /* !__ASSEMBLY__ */
 
 #endif /* __CR_PARASITE_H__ */
-

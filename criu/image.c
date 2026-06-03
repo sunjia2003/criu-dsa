@@ -3,6 +3,9 @@
 #include <stdarg.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include "crtools.h"
 #include "cr_options.h"
@@ -599,11 +602,37 @@ static int userns_openat(void *arg, int dfd, int pid)
 	return ret;
 }
 
+static bool direct_pages_env_enabled(void)
+{
+	const char *v = getenv("CRIU_DSA_DIRECT_PAGES");
+
+	return v && (!strcmp(v, "1") || !strcasecmp(v, "true") ||
+		     !strcasecmp(v, "yes") || !strcasecmp(v, "on"));
+}
+
+static bool direct_pages_dump_requested(int type, unsigned long oflags)
+{
+	return type == CR_FD_PAGES && (oflags & O_CREAT) &&
+	       direct_pages_env_enabled();
+}
+
 static int do_open_image(struct cr_img *img, int dfd, int type, unsigned long oflags, char *path)
 {
 	int ret, flags;
+	bool direct_pages;
 
 	flags = oflags & ~(O_NOBUF | O_SERVICE | O_FORCE_LOCAL);
+	direct_pages = direct_pages_dump_requested(type, oflags);
+
+	if (direct_pages) {
+		if (opts.stream && !(oflags & O_FORCE_LOCAL)) {
+			pr_err("DIRECT_PAGES: O_DIRECT pages image is unsupported with image streaming\n");
+			goto err;
+		}
+
+		flags |= O_DIRECT;
+		pr_info("DIRECT_PAGES: opening %s with O_DIRECT\n", path);
+	}
 
 	if (opts.stream && !(oflags & O_FORCE_LOCAL)) {
 		ret = img_streamer_open(path, flags);

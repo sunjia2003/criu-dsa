@@ -1557,6 +1557,104 @@ err_cure:
 	goto err_free;
 }
 
+static u64 dump_wall_now_us(void);
+static u64 dump_wall_delta_us(u64 start, u64 end);
+
+
+enum frozen_phase {
+	FROZEN_PHASE_POST_FREEZE_PREP,
+	FROZEN_PHASE_TASK_PREPARE,
+	FROZEN_PHASE_MEMDUMP,
+	FROZEN_PHASE_OTHER_RESOURCES,
+	FROZEN_PHASE_ASYNC_WAIT,
+	FROZEN_PHASE_FINISH_PRE_UNFREEZE,
+	FROZEN_PHASE_UNFREEZE,
+	FROZEN_PHASE_NR,
+};
+
+struct frozen_timeline {
+	bool active;
+	int phase;
+	u64 start_us;
+	u64 last_us;
+	u64 phase_us[FROZEN_PHASE_NR];
+};
+
+static struct frozen_timeline frozen_tl;
+
+static bool frozen_timeline_dsa_mode(void)
+{
+	const char *env;
+
+	env = getenv("CRIU_DSA_DUMP");
+	return env && atoi(env) > 0;
+}
+
+void frozen_timeline_begin_after_freeze(void)
+{
+	memset(&frozen_tl, 0, sizeof(frozen_tl));
+	frozen_tl.active = true;
+	frozen_tl.phase = FROZEN_PHASE_POST_FREEZE_PREP;
+	frozen_tl.start_us = dump_wall_now_us();
+	frozen_tl.last_us = frozen_tl.start_us;
+}
+
+static void frozen_timeline_switch(int phase)
+{
+	u64 now;
+
+	if (!frozen_tl.active || !frozen_tl.start_us ||
+	    phase < 0 || phase >= FROZEN_PHASE_NR)
+		return;
+
+	now = dump_wall_now_us();
+	if (frozen_tl.phase >= 0 && frozen_tl.phase < FROZEN_PHASE_NR)
+		frozen_tl.phase_us[frozen_tl.phase] +=
+			dump_wall_delta_us(frozen_tl.last_us, now);
+	frozen_tl.phase = phase;
+	frozen_tl.last_us = now;
+}
+
+static void frozen_timeline_finish(int ret)
+{
+	u64 now;
+	u64 total_us;
+	u64 accounted_us = 0;
+	u64 gap_us;
+	u64 stats_frozen_us;
+	int i;
+
+	if (!frozen_tl.active || !frozen_tl.start_us)
+		return;
+
+	now = dump_wall_now_us();
+	if (frozen_tl.phase >= 0 && frozen_tl.phase < FROZEN_PHASE_NR)
+		frozen_tl.phase_us[frozen_tl.phase] +=
+			dump_wall_delta_us(frozen_tl.last_us, now);
+	total_us = dump_wall_delta_us(frozen_tl.start_us, now);
+
+	for (i = 0; i < FROZEN_PHASE_NR; i++)
+		accounted_us += frozen_tl.phase_us[i];
+	gap_us = accounted_us <= total_us ? total_us - accounted_us : 0;
+	stats_frozen_us = timing_total_usecs(TIME_FROZEN);
+
+	pr_info("FROZEN_TIMELINE: mode=%s ret=%d total_us=%llu stats_frozen_us=%llu post_freeze_prep_us=%llu task_prepare_us=%llu memdump_us=%llu other_resources_us=%llu async_wait_us=%llu finish_pre_unfreeze_us=%llu unfreeze_us=%llu accounted_us=%llu gap_us=%llu\n",
+		frozen_timeline_dsa_mode() ? "dsa" : "base", ret,
+		(unsigned long long)total_us,
+		(unsigned long long)stats_frozen_us,
+		(unsigned long long)frozen_tl.phase_us[FROZEN_PHASE_POST_FREEZE_PREP],
+		(unsigned long long)frozen_tl.phase_us[FROZEN_PHASE_TASK_PREPARE],
+		(unsigned long long)frozen_tl.phase_us[FROZEN_PHASE_MEMDUMP],
+		(unsigned long long)frozen_tl.phase_us[FROZEN_PHASE_OTHER_RESOURCES],
+		(unsigned long long)frozen_tl.phase_us[FROZEN_PHASE_ASYNC_WAIT],
+		(unsigned long long)frozen_tl.phase_us[FROZEN_PHASE_FINISH_PRE_UNFREEZE],
+		(unsigned long long)frozen_tl.phase_us[FROZEN_PHASE_UNFREEZE],
+		(unsigned long long)accounted_us,
+		(unsigned long long)gap_us);
+
+	frozen_tl.active = false;
+}
+
 static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 {
 	pid_t pid = item->pid->real;
@@ -1568,7 +1666,6 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	struct parasite_drain_fd *dfds = NULL;
 	struct proc_posix_timers_stat proc_args;
 	struct mem_dump_ctl mdc;
-	int work_scope = WORK_SCOPE_PREPARE;
 
 	vm_area_list_init(&vmas);
 
@@ -1582,7 +1679,7 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		 */
 		return 0;
 
-	workload_bind_scope(WORK_SCOPE_PREPARE);
+	frozen_timeline_switch(FROZEN_PHASE_TASK_PREPARE);
 
 	pr_info("Obtaining task stat ... \n");
 	ret = parse_pid_stat(pid, &pps_buf);
@@ -1705,14 +1802,11 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	mdc.stat = &pps_buf;
 	mdc.parent_ie = parent_ie;
 
-	workload_switch_scope(WORK_SCOPE_MEM_DUMP_MISC);
-	work_scope = WORK_SCOPE_MEM_DUMP_MISC;
+	frozen_timeline_switch(FROZEN_PHASE_MEMDUMP);
 	ret = parasite_dump_pages_seized(item, &vmas, &mdc, parasite_ctl);
 	if (ret)
 		goto err_cure;
-
-	workload_switch_scope(WORK_SCOPE_OTHER_RES_DUMP);
-	work_scope = WORK_SCOPE_OTHER_RES_DUMP;
+	frozen_timeline_switch(FROZEN_PHASE_OTHER_RESOURCES);
 
 	if (dfds) {
 		ret = dump_task_files_seized(parasite_ctl, item, dfds);
@@ -1758,16 +1852,14 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	}
 
 	if (dmpi(item)->mem_async && !parasite_mem_async_deferred(item)) {
-		workload_switch_scope(WORK_SCOPE_MEM_WRITE_WAIT);
-		work_scope = WORK_SCOPE_MEM_WRITE_WAIT;
+		frozen_timeline_switch(FROZEN_PHASE_ASYNC_WAIT);
 		ret = parasite_dump_pages_seized_wait(item);
 		if (ret) {
 			pr_err("Wait for async memory write (pid: %d) failed with %d\n",
 			       pid, ret);
 			goto err_cure;
 		}
-		workload_switch_scope(WORK_SCOPE_OTHER_RES_DUMP);
-		work_scope = WORK_SCOPE_OTHER_RES_DUMP;
+		frozen_timeline_switch(FROZEN_PHASE_OTHER_RESOURCES);
 	}
 
 	ret = compel_stop_daemon(parasite_ctl);
@@ -1811,13 +1903,10 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 err:
 	if (dmpi(item)->mem_async &&
 	    (exit_code || !parasite_mem_async_deferred(item))) {
-		workload_switch_scope(WORK_SCOPE_MEM_WRITE_WAIT);
 		if (parasite_dump_pages_seized_wait(item))
 			pr_err("Async memory write cleanup failed (pid: %d)\n", pid);
-		workload_switch_scope(work_scope);
 	}
 
-	workload_unbind_scope();
 
 	close_cr_imgset(&cr_imgset);
 	close_pid_proc();
@@ -1827,10 +1916,8 @@ err:
 
 err_cure:
 	if (dmpi(item)->mem_async) {
-		workload_switch_scope(WORK_SCOPE_MEM_WRITE_WAIT);
 		if (parasite_dump_pages_seized_wait(item))
 			pr_err("Async memory write cleanup failed (pid: %d)\n", pid);
-		workload_switch_scope(work_scope);
 	}
 
 	ret = compel_cure(parasite_ctl);
@@ -1874,21 +1961,36 @@ static int setup_alarm_handler(void)
 	return 0;
 }
 
+static u64 dump_wall_now_us(void)
+{
+	struct timeval tv;
+
+	if (gettimeofday(&tv, NULL))
+		return 0;
+
+	return (u64)tv.tv_sec * 1000000ULL + (u64)tv.tv_usec;
+}
+
+static u64 dump_wall_delta_us(u64 start, u64 end)
+{
+	if (!start || end <= start)
+		return 0;
+
+	return end - start;
+}
+
 static void print_dump_timing_summary(const char *tag)
 {
 	u64 frozen_us;
 	u64 memdump_us;
 	u64 memwrite_us;
-	u64 dsa_rpc_us;
-	u64 async_wait_us;
+
 
 	frozen_us = timing_total_usecs(TIME_FROZEN);
 	memdump_us = timing_total_usecs(TIME_MEMDUMP);
 	memwrite_us = timing_total_usecs(TIME_MEMWRITE);
-	dsa_rpc_us = timing_total_usecs(TIME_DSA_RPC);
-	async_wait_us = timing_total_usecs(TIME_ASYNC_WAIT);
 
-	pr_info("%s timing: frozen=%llu us (%llu.%03llu ms) memdump=%llu us (%llu.%03llu ms) memwrite=%llu us (%llu.%03llu ms) dsa_rpc=%llu us (%llu.%03llu ms) async_wait=%llu us (%llu.%03llu ms)\n",
+	pr_info("%s timing: frozen=%llu us (%llu.%03llu ms) memdump=%llu us (%llu.%03llu ms) memwrite=%llu us (%llu.%03llu ms)\n",
 		tag,
 		(unsigned long long)frozen_us,
 		(unsigned long long)(frozen_us / 1000),
@@ -1898,15 +2000,7 @@ static void print_dump_timing_summary(const char *tag)
 		(unsigned long long)(memdump_us % 1000),
 		(unsigned long long)memwrite_us,
 		(unsigned long long)(memwrite_us / 1000),
-		(unsigned long long)(memwrite_us % 1000),
-		(unsigned long long)dsa_rpc_us,
-		(unsigned long long)(dsa_rpc_us / 1000),
-		(unsigned long long)(dsa_rpc_us % 1000),
-		(unsigned long long)async_wait_us,
-		(unsigned long long)(async_wait_us / 1000),
-		(unsigned long long)(async_wait_us % 1000));
-
-	workload_dump_log(tag);
+		(unsigned long long)(memwrite_us % 1000));
 }
 
 static int cr_pre_dump_finish(int status)
@@ -1930,9 +2024,11 @@ static int cr_pre_dump_finish(int status)
 	he.has_pre_dump_mode = true;
 	he.pre_dump_mode = opts.pre_dump_mode;
 
+	frozen_timeline_switch(FROZEN_PHASE_UNFREEZE);
 	pstree_switch_state(root_item, TASK_ALIVE);
 
 	timing_stop(TIME_FROZEN);
+	frozen_timeline_finish(status);
 
 	if (status < 0) {
 		ret = status;
@@ -2166,6 +2262,8 @@ static int cr_dump_finish(int ret)
 	int post_dump_ret = 0;
 	bool dsa_live_mode = dsa_live_dump_active();
 
+	frozen_timeline_switch(FROZEN_PHASE_FINISH_PRE_UNFREEZE);
+
 	if (dsa_live_mode) {
 		/*
 		 * DSA live mode keeps tasks running after checkpoint and finalizes
@@ -2190,8 +2288,10 @@ static int cr_dump_finish(int ret)
 		if (!ret && ws_snapshot_gate_check_nonblocking(&dump_ws_snapshot))
 			ret = -1;
 
+		frozen_timeline_switch(FROZEN_PHASE_UNFREEZE);
 		pstree_switch_state(root_item, TASK_ALIVE);
 		timing_stop(TIME_FROZEN);
+		frozen_timeline_finish(ret);
 
 		if (!ret)
 			temp_cdf_dump_finalize_log();
@@ -2238,6 +2338,7 @@ static int cr_dump_finish(int ret)
 		    opts.imgs_dir && rmrf(opts.imgs_dir))
 			pr_warn("Failed to cleanup image dir %s after live dump failure\n",
 				opts.imgs_dir);
+
 
 		if (ret || post_dump_ret) {
 			if (fault_injected(FI_DUMP_CRASH)) {
@@ -2327,8 +2428,10 @@ static int cr_dump_finish(int ret)
 	if (!ret && ws_snapshot_gate_check_nonblocking(&dump_ws_snapshot))
 		ret = -1;
 
+	frozen_timeline_switch(FROZEN_PHASE_UNFREEZE);
 	pstree_switch_state(root_item, (ret || post_dump_ret) ? TASK_ALIVE : opts.final_state);
 	timing_stop(TIME_FROZEN);
+	frozen_timeline_finish(ret || post_dump_ret);
 
 	if (!ret && !post_dump_ret && opts.final_state == TASK_ALIVE)
 		temp_cdf_dump_finalize_log();
@@ -2339,6 +2442,7 @@ static int cr_dump_finish(int ret)
 		ret = -1;
 
 	dsa_shared_mem_cleanup_after_dump();
+
 	free_pstree(root_item);
 	seccomp_free_entries();
 	free_file_locks();
@@ -2348,6 +2452,7 @@ static int cr_dump_finish(int ret)
 
 	close_service_fd(CR_PROC_FD_OFF);
 	close_image_dir();
+
 
 	if (ret || post_dump_ret) {
 		if (fault_injected(FI_DUMP_CRASH)) {

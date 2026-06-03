@@ -26,6 +26,7 @@
 #include "util.h"
 
 static bool compel_interrupt_only_mode;
+extern void frozen_timeline_begin_after_freeze(void);
 
 /*
  * Disables the use of freeze cgroups for process seizing, even if explicitly
@@ -1123,6 +1124,7 @@ int collect_pstree(void)
 	exit_code = 0;
 	timing_stop(TIME_FREEZING);
 	timing_start(TIME_FROZEN);
+	frozen_timeline_begin_after_freeze();
 
 err:
 	/* Freezing stage finished in time - disable timer. */

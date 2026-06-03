@@ -38,3 +38,5 @@ build/**
 *.vscode
 workspace/*
 *.img
+*.csv
+*.png

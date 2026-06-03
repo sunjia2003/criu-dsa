@@ -260,7 +260,7 @@ static int write_pages_loc(struct page_xfer *xfer, int p, unsigned long len)
 	while (1) {
 		ret = splice(p, NULL, img_raw_fd(xfer->pi), NULL, len - curr, SPLICE_F_MOVE);
 		if (ret == -1) {
-			pr_perror("Unable to spice data");
+			pr_perror("Unable to splice pages data");
 			return -1;
 		}
 		if (ret == 0) {

@@ -38,11 +38,16 @@
 static struct parasite_dump_pages_args *mprotect_args = NULL;
 static void *dsa_cached_shared_map = (void *)-1;
 static u32 dsa_cached_shared_size;
+static u64 dsa_cached_shared_map_size;
 static int dsa_cached_wq_inited;
 static int dsa_cached_wq_fds[DSA_DUMP_MAX_WQ];
 static void *dsa_cached_wq_portals[DSA_DUMP_MAX_WQ];
 static unsigned long dsa_cached_wq_portal_off[DSA_DUMP_MAX_WQ];
 static char dsa_cached_wq_paths[DSA_DUMP_MAX_WQ][64];
+static struct dsa_hw_desc dsa_copy_hw_descs[DSA_DUMP_BATCH_SIZE] __attribute__((aligned(64)));
+static volatile struct dsa_completion_record dsa_copy_comps[DSA_DUMP_BATCH_SIZE] __attribute__((aligned(32)));
+static u32 dsa_copy_lpt_order[DSA_DUMP_BATCH_SIZE];
+static u32 dsa_copy_submitted_idx[DSA_DUMP_BATCH_SIZE];
 
 #ifndef SPLICE_F_GIFT
 #define SPLICE_F_GIFT 0x08
@@ -132,6 +137,7 @@ static inline void dsa_prefault_range(uint8_t *buf, uint32_t len)
 
 	for (i = 0; i < len; i += step)
 		sink ^= buf[i];
+
 	(void)sink;
 }
 
@@ -208,6 +214,339 @@ static void dsa_wq_cache_drop_idx(u32 i)
 	dsa_cached_wq_paths[i][0] = '\0';
 }
 
+static inline u32 dsa_atomic_load_u32(volatile u32 *p)
+{
+	return __atomic_load_n(p, __ATOMIC_ACQUIRE);
+}
+
+static inline void dsa_atomic_store_u32(volatile u32 *p, u32 v)
+{
+	__atomic_store_n(p, v, __ATOMIC_RELEASE);
+}
+
+static int dsa_copy_descs(struct parasite_dsa_dump_pages_args *a,
+			  uint8_t *shared_buf,
+			  struct dsa_dump_descriptor *descriptors,
+			  uint32_t nr_descriptors, uint32_t data_off,
+			  uint32_t data_bytes,
+			  uint32_t active_wq_count,
+			  uint32_t *active_wq_idx,
+			  uint64_t *active_wq_load,
+			  int *use_portal,
+			  unsigned long *portal_mask,
+			  unsigned long *portal_offset)
+{
+	struct dsa_hw_desc *dsa_descs = dsa_copy_hw_descs;
+	volatile struct dsa_completion_record *dsa_comps = dsa_copy_comps;
+	uint32_t *lpt_order = dsa_copy_lpt_order;
+	uint32_t *submitted_idx = dsa_copy_submitted_idx;
+	const uint32_t max_timeout_retries = 1000000;
+	uint32_t desc_base = 0;
+	uint32_t buf_write_offset = data_off;
+	uint32_t total_size = 0;
+	uint32_t i, j, k;
+
+
+	if (!nr_descriptors || data_off > a->shared_buf_size ||
+	    data_bytes > a->shared_buf_size - data_off) {
+		a->failed_idx = -1;
+		a->failed_status = 0;
+		a->op_ret = -EINVAL;
+		return -1;
+	}
+
+	if (!active_wq_count) {
+		a->failed_idx = -1;
+		a->failed_status = 0;
+		a->op_ret = -EIO;
+		return -1;
+	}
+
+	while (desc_base < nr_descriptors) {
+		uint32_t remaining = nr_descriptors - desc_base;
+		uint32_t window = a->wq_count * DSA_DESC_PER_WQ;
+		uint32_t submitted = 0;
+		uint32_t completed = 0;
+		uint32_t order_cnt;
+
+		if (window > DSA_DUMP_BATCH_SIZE)
+			window = DSA_DUMP_BATCH_SIZE;
+		if (window > remaining)
+			window = remaining;
+
+		for (i = 0; i < window; i++) {
+			struct dsa_dump_descriptor *desc = &descriptors[desc_base + i];
+			uint8_t *src = (uint8_t *)(unsigned long)desc->src_addr;
+			uint32_t copy_len = desc->copy_len;
+			uint8_t *dst = shared_buf + buf_write_offset;
+			u64 prefault_begin;
+			u64 prefault_end;
+
+			if (buf_write_offset + copy_len > a->shared_buf_size ||
+			    total_size + copy_len > data_bytes) {
+				pr_err("DSA stream copy overflow desc=%u copy_len=%u total=%u data_bytes=%u off=%u shared=%u\n",
+				       desc_base + i, copy_len, total_size, data_bytes,
+				       buf_write_offset, a->shared_buf_size);
+				a->op_ret = -ENOSPC;
+				return -1;
+			}
+
+			prefault_begin = dsa_now_us();
+			dsa_prefault_range(src, copy_len);
+			prefault_end = dsa_now_us();
+			if (prefault_end > prefault_begin)
+				a->prefault_us += prefault_end - prefault_begin;
+
+			dsa_memzero(&dsa_descs[i], sizeof(struct dsa_hw_desc));
+			dsa_descs[i].opcode = DSA_OPCODE_MEMMOVE;
+			dsa_descs[i].flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR | IDXD_OP_FLAG_BOF;
+			dsa_descs[i].src_addr = (uint64_t)(unsigned long)src;
+			dsa_descs[i].dst_addr = (uint64_t)(unsigned long)dst;
+			dsa_descs[i].xfer_size = copy_len;
+			dsa_descs[i].completion_addr = (uint64_t)(unsigned long)&dsa_comps[i];
+
+			dsa_memzero((void *)&dsa_comps[i], sizeof(struct dsa_completion_record));
+
+			buf_write_offset += copy_len;
+			total_size += copy_len;
+		}
+
+		order_cnt = window;
+		for (i = 0; i < order_cnt; i++)
+			lpt_order[i] = i;
+
+		if (a->wq_policy != DSA_WQ_POLICY_RR) {
+			for (i = 0; i < order_cnt; i++) {
+				uint32_t best = i;
+
+				for (j = i + 1; j < order_cnt; j++) {
+					struct dsa_dump_descriptor *desc;
+
+					desc = &descriptors[desc_base + lpt_order[j]];
+					if (desc->copy_len >
+					    descriptors[desc_base + lpt_order[best]].copy_len)
+						best = j;
+				}
+
+				if (best != i) {
+					uint32_t tmp = lpt_order[i];
+
+					lpt_order[i] = lpt_order[best];
+					lpt_order[best] = tmp;
+				}
+			}
+		}
+
+		for (k = 0; k < order_cnt; k++) {
+			uint32_t desc_idx = lpt_order[k];
+			uint32_t retry_count = 0;
+			uint32_t wq_sel;
+			uint32_t wq_idx;
+			u64 submit_begin;
+			u64 submit_end;
+
+			submit_begin = dsa_now_us();
+			if (a->wq_policy == DSA_WQ_POLICY_RR) {
+				wq_sel = k % active_wq_count;
+			} else {
+				wq_sel = 0;
+				for (j = 1; j < active_wq_count; j++) {
+					if (active_wq_load[j] < active_wq_load[wq_sel])
+						wq_sel = j;
+				}
+			}
+
+			wq_idx = active_wq_idx[wq_sel];
+			if (!use_portal[wq_idx]) {
+				a->failed_idx = desc_base + desc_idx;
+				a->op_ret = -EOPNOTSUPP;
+				submit_end = dsa_now_us();
+				if (submit_end > submit_begin)
+					a->submit_us += submit_end - submit_begin;
+				goto poll_completed;
+			}
+
+			for (retry_count = 0; retry_count < DSA_MAX_ENQ_RETRY; retry_count++) {
+				unsigned long off = ((unsigned long)portal_offset[wq_idx]++ << 6) & 0xfffUL;
+				void *slot = (void *)(portal_mask[wq_idx] | off);
+
+				if (dsa_enqcmd_local(slot, &dsa_descs[desc_idx]) == 0) {
+					submitted_idx[submitted++] = desc_idx;
+					a->submit_enqcmd++;
+					active_wq_load[wq_sel] +=
+						descriptors[desc_base + desc_idx].copy_len;
+					break;
+				}
+				dsa_cpu_relax();
+			}
+			if (retry_count == DSA_MAX_ENQ_RETRY) {
+				a->failed_idx = desc_base + desc_idx;
+				a->op_ret = -EAGAIN;
+				submit_end = dsa_now_us();
+				if (submit_end > submit_begin)
+					a->submit_us += submit_end - submit_begin;
+				goto poll_completed;
+			}
+
+			submit_end = dsa_now_us();
+			if (submit_end > submit_begin)
+				a->submit_us += submit_end - submit_begin;
+		}
+
+poll_completed:
+		if (!submitted) {
+			return -1;
+		}
+
+		for (k = 0; k < submitted; k++) {
+			uint32_t desc_idx = submitted_idx[k];
+			uint32_t timeout_count = 0;
+			u64 poll_begin;
+			u64 poll_end;
+			int poll_failed = 0;
+
+			poll_begin = dsa_now_us();
+			while (1) {
+				uint8_t comp_status = dsa_comps[desc_idx].status;
+				uint8_t comp_code = (uint8_t)DSA_COMP_STATUS(comp_status);
+
+				if (comp_status != 0 && comp_code != DSA_COMP_NONE) {
+					a->completed_count++;
+					if (comp_code == DSA_COMP_SUCCESS || comp_code == DSA_COMP_SUCCESS_PRED) {
+						completed++;
+					} else {
+						a->failed_idx = desc_base + desc_idx;
+						a->failed_status = comp_code;
+						a->op_ret = -(int)comp_code;
+						poll_failed = 1;
+					}
+					break;
+				}
+
+				if (timeout_count++ >= max_timeout_retries) {
+					a->failed_idx = desc_base + desc_idx;
+					a->op_ret = -ETIMEDOUT;
+					poll_failed = 1;
+					break;
+				}
+				dsa_cpu_relax();
+			}
+
+			poll_end = dsa_now_us();
+			if (poll_end > poll_begin)
+				a->poll_us += poll_end - poll_begin;
+
+			if (poll_failed) {
+				return -1;
+			}
+		}
+
+		if (completed != submitted) {
+			return -1;
+		}
+
+		desc_base += window;
+	}
+
+	if (total_size != data_bytes) {
+		pr_err("DSA stream copy size mismatch desc_sum=%u data_bytes=%u data_off=%u nr_desc=%u\n",
+		       total_size, data_bytes, data_off, nr_descriptors);
+		a->op_ret = -EINVAL;
+		return -1;
+	}
+
+	a->total_copied += total_size;
+	a->new_buf_offset = data_off + total_size;
+	return 0;
+}
+
+static int dsa_stream_consume(struct parasite_dsa_dump_pages_args *a,
+			      uint8_t *shared_buf,
+			      struct parasite_dsa_stream_hdr *hdr,
+			      uint32_t active_wq_count,
+			      uint32_t *active_wq_idx,
+			      uint64_t *active_wq_load,
+			      int *use_portal,
+			      unsigned long *portal_mask,
+			      unsigned long *portal_offset)
+{
+	uint32_t consumer_seq = 0;
+
+	if (hdr->slot_count != DSA_STREAM_SLOT_COUNT ||
+	    hdr->slot_desc_cap != DSA_STREAM_SLOT_DESC_CAP ||
+	    hdr->slots_off > a->shared_buf_size ||
+	    hdr->desc_area_off > a->shared_buf_size ||
+	    hdr->payload_base > a->shared_buf_size ||
+	    hdr->payload_limit > a->shared_buf_size ||
+	    hdr->payload_base > hdr->payload_limit) {
+		a->op_ret = -EINVAL;
+		return -1;
+	}
+
+	while (1) {
+		struct parasite_dsa_stream_slot *slots;
+		struct parasite_dsa_stream_slot *slot;
+		struct dsa_dump_descriptor *descriptors;
+		uint32_t idx;
+		uint32_t state;
+
+		if (dsa_atomic_load_u32(&hdr->error)) {
+			a->op_ret = -EIO;
+			return -1;
+		}
+
+		if (dsa_atomic_load_u32(&hdr->finish) &&
+		    consumer_seq == dsa_atomic_load_u32(&hdr->producer_seq)) {
+			a->op_ret = 0;
+			return 0;
+		}
+
+		slots = (struct parasite_dsa_stream_slot *)(shared_buf + hdr->slots_off);
+		idx = consumer_seq % hdr->slot_count;
+		slot = &slots[idx];
+		state = dsa_atomic_load_u32(&slot->state);
+		if (state != DSA_STREAM_SLOT_READY || slot->seq != consumer_seq) {
+			dsa_cpu_relax();
+			continue;
+		}
+
+		__atomic_thread_fence(__ATOMIC_ACQUIRE);
+
+		dsa_atomic_store_u32(&slot->state, DSA_STREAM_SLOT_COPYING);
+		if (!slot->desc_count || slot->desc_count > hdr->slot_desc_cap ||
+		    slot->desc_off < hdr->desc_area_off ||
+		    slot->desc_off >= hdr->payload_base ||
+		    slot->desc_count > (hdr->payload_base - slot->desc_off) / sizeof(struct dsa_dump_descriptor) ||
+		    slot->payload_off < hdr->payload_base ||
+		    slot->payload_off > hdr->payload_limit ||
+		    slot->payload_bytes > hdr->payload_limit - slot->payload_off) {
+			pr_err("DSA stream slot validation failed\n");
+			slot->status = (u32)-EINVAL;
+			dsa_atomic_store_u32(&slot->state, DSA_STREAM_SLOT_ERROR);
+			dsa_atomic_store_u32(&hdr->error, (u32)-EINVAL);
+			a->op_ret = -EINVAL;
+			return -1;
+		}
+
+		descriptors = (struct dsa_dump_descriptor *)(shared_buf + slot->desc_off);
+		if (dsa_copy_descs(a, shared_buf, descriptors, slot->desc_count,
+				   slot->payload_off, slot->payload_bytes,
+				   active_wq_count, active_wq_idx, active_wq_load,
+				   use_portal, portal_mask, portal_offset)) {
+			slot->status = (u32)a->op_ret;
+			dsa_atomic_store_u32(&slot->state, DSA_STREAM_SLOT_ERROR);
+			dsa_atomic_store_u32(&hdr->error, (u32)a->op_ret);
+			return -1;
+		}
+
+		slot->copied_bytes = slot->payload_bytes;
+		slot->status = 0;
+		dsa_atomic_store_u32(&slot->state, DSA_STREAM_SLOT_DONE);
+		consumer_seq++;
+		dsa_atomic_store_u32(&hdr->consumer_seq, consumer_seq);
+	}
+}
+
 
 /*
  * Batch DSA dump pages to shared buffer
@@ -216,6 +555,7 @@ static void dsa_wq_cache_drop_idx(u32 i)
  */
 static int parasite_dsa_dump_pages(struct parasite_dsa_dump_pages_args *a)
 {
+	struct parasite_dsa_dump_pages_args local_args = *a;
 	int wq_fds[DSA_DUMP_MAX_WQ];
 	int use_portal[DSA_DUMP_MAX_WQ];
 	unsigned long portal_mask[DSA_DUMP_MAX_WQ];
@@ -223,35 +563,11 @@ static int parasite_dsa_dump_pages(struct parasite_dsa_dump_pages_args *a)
 	void *portals[DSA_DUMP_MAX_WQ];
 	uint32_t active_wq_idx[DSA_DUMP_MAX_WQ];
 	uint64_t active_wq_load[DSA_DUMP_MAX_WQ];
-	uint32_t lpt_order[DSA_DUMP_BATCH_SIZE];
-	uint32_t submitted_idx[DSA_DUMP_BATCH_SIZE];
 	uint32_t active_wq_count = 0;
 	uint32_t i;
-	uint32_t j;
-	uint32_t k;
-	uint32_t desc_idx;
-	uint32_t order_cnt;
-	uint32_t wq_sel;
-	uint32_t total_size = 0;
 	uint8_t *shared_buf;
-	uint32_t buf_write_offset;
-	uint32_t nr_descriptors;
-	uint32_t desc_base = 0;
-	uint32_t window;
-	uint32_t remaining;
-	uint32_t desc_bytes;
-	uint32_t data_off;
-	uint32_t data_bytes;
-	struct dsa_dump_descriptor *descriptors;
 	struct parasite_dsa_shm_hdr *shm_hdr;
-	struct dsa_hw_desc dsa_descs[DSA_DUMP_BATCH_SIZE] __attribute__((aligned(64)));
-	volatile struct dsa_completion_record dsa_comps[DSA_DUMP_BATCH_SIZE] __attribute__((aligned(32)));
-	uint32_t submitted = 0;
-	uint32_t completed = 0;
-	uint32_t timeout_count = 0;
-	const uint32_t max_timeout_retries = 1000000;  /* Prevent infinite loops */
-	uint8_t comp_status;
-	uint8_t comp_code;
+	struct parasite_dsa_stream_hdr *stream_hdr = NULL;
 	void *portal_va;
 	int tsock;
 	int shared_buf_fd = -1;
@@ -264,6 +580,14 @@ static int parasite_dsa_dump_pages(struct parasite_dsa_dump_pages_args *a)
 	u64 wq_setup_end_us = 0;
 	u64 t_begin_us;
 	u64 t_end_us;
+
+	/*
+	 * The RPC argument area is shared with CRIU and can be reused by the
+	 * producer while this streaming RPC is still consuming slots. Keep all
+	 * long-lived inputs/results in a private copy; final results are published
+	 * through the DSA stream header.
+	 */
+	a = &local_args;
 
 	/* Initialize output fields */
 	a->op_ret = -1;
@@ -289,13 +613,33 @@ static int parasite_dsa_dump_pages(struct parasite_dsa_dump_pages_args *a)
 	a->cleanup_munmap_us = 0;
 	a->cleanup_close_us = 0;
 
+
 	/* Validate input parameters */
+	if (!a->shared_map_size)
+		a->shared_map_size = a->shared_buf_size;
+
+	if (a->shared_map_size < a->shared_buf_size) {
+		pr_err("DSA strict: shared map smaller than usable size map=%llu size=%u\n",
+		       (unsigned long long)a->shared_map_size, a->shared_buf_size);
+		a->op_ret = -EINVAL;
+		goto out_copy_results;
+	}
+
 	if ((!a->use_shared_buf_fd && !a->shared_buf_addr &&
-	     ((long)dsa_cached_shared_map < 0 || dsa_cached_shared_size != a->shared_buf_size)) ||
+	     ((long)dsa_cached_shared_map < 0 ||
+	      dsa_cached_shared_size != a->shared_buf_size ||
+	      dsa_cached_shared_map_size != a->shared_map_size)) ||
 	    !a->shared_buf_size || !a->wq_count ||
 	    a->wq_count > DSA_DUMP_MAX_WQ || a->buf_write_offset >= a->shared_buf_size) {
+		pr_err("DSA strict: invalid entry args use_fd=%u shared_addr=%llu cached=%u cached_size=%llu cached_map=%llu shared_size=%u map_size=%llu wq_count=%u buf_write_offset=%u\n",
+		       a->use_shared_buf_fd, (unsigned long long)a->shared_buf_addr,
+		       (long)dsa_cached_shared_map >= 0 ? 1U : 0U,
+		       (unsigned long long)dsa_cached_shared_size,
+		       (unsigned long long)dsa_cached_shared_map_size,
+		       a->shared_buf_size, (unsigned long long)a->shared_map_size,
+		       a->wq_count, a->buf_write_offset);
 		a->op_ret = -EINVAL;
-		return 0;
+		goto out_copy_results;
 	}
 
 	setup_begin_us = dsa_now_us();
@@ -311,54 +655,46 @@ static int parasite_dsa_dump_pages(struct parasite_dsa_dump_pages_args *a)
 		if (shared_buf_fd < 0) {
 			pr_err("DSA: recv shared buffer fd failed\n");
 			a->op_ret = -EIO;
-			return 0;
+			goto out_copy_results;
 		}
 
-		if ((long)dsa_cached_shared_map >= 0 &&
-		    dsa_cached_shared_size == a->shared_buf_size) {
-			shared_buf = (uint8_t *)dsa_cached_shared_map;
-			t_begin_us = dsa_now_us();
-			sys_close(shared_buf_fd);
-			t_end_us = dsa_now_us();
-			if (t_end_us > t_begin_us)
-				a->cleanup_close_us += t_end_us - t_begin_us;
-			shared_buf_fd = -1;
-		} else {
-			t_begin_us = dsa_now_us();
-			shared_map = (void *)sys_mmap(NULL, a->shared_buf_size,
-						     PROT_READ | PROT_WRITE,
-						     MAP_SHARED | MAP_POPULATE,
-						     shared_buf_fd, 0);
-			t_end_us = dsa_now_us();
-			if (t_end_us > t_begin_us)
-				a->setup_shared_mmap_us += t_end_us - t_begin_us;
-			if ((long)shared_map < 0) {
-				pr_err("DSA strict: shared mmap MAP_POPULATE failed\n");
-				a->op_ret = -EOPNOTSUPP;
-				goto out_cleanup;
-			}
-
-			if ((long)dsa_cached_shared_map >= 0) {
-				t_begin_us = dsa_now_us();
-				sys_munmap(dsa_cached_shared_map, dsa_cached_shared_size);
-				t_end_us = dsa_now_us();
-				if (t_end_us > t_begin_us)
-					a->cleanup_munmap_us += t_end_us - t_begin_us;
-			}
-			dsa_cached_shared_map = shared_map;
-			dsa_cached_shared_size = a->shared_buf_size;
-			shared_buf = (uint8_t *)dsa_cached_shared_map;
-			t_begin_us = dsa_now_us();
-			sys_close(shared_buf_fd);
-			t_end_us = dsa_now_us();
-			if (t_end_us > t_begin_us)
-				a->cleanup_close_us += t_end_us - t_begin_us;
-			shared_buf_fd = -1;
+		t_begin_us = dsa_now_us();
+		shared_map = (void *)sys_mmap(NULL, a->shared_map_size,
+					     PROT_READ | PROT_WRITE,
+					     MAP_SHARED | MAP_POPULATE,
+					     shared_buf_fd, 0);
+		t_end_us = dsa_now_us();
+		if (t_end_us > t_begin_us)
+			a->setup_shared_mmap_us += t_end_us - t_begin_us;
+		if ((long)shared_map < 0) {
+			pr_err("DSA strict: shared mmap MAP_POPULATE failed\n");
+			a->op_ret = -EOPNOTSUPP;
+			goto out_cleanup;
 		}
+
+		if ((long)dsa_cached_shared_map >= 0) {
+			t_begin_us = dsa_now_us();
+			sys_munmap(dsa_cached_shared_map, dsa_cached_shared_map_size);
+			t_end_us = dsa_now_us();
+			if (t_end_us > t_begin_us)
+				a->cleanup_munmap_us += t_end_us - t_begin_us;
+		}
+		dsa_cached_shared_map = shared_map;
+		dsa_cached_shared_size = a->shared_buf_size;
+		dsa_cached_shared_map_size = a->shared_map_size;
+		shared_buf = (uint8_t *)dsa_cached_shared_map;
+		shared_map = (void *)-1;
+		t_begin_us = dsa_now_us();
+		sys_close(shared_buf_fd);
+		t_end_us = dsa_now_us();
+		if (t_end_us > t_begin_us)
+			a->cleanup_close_us += t_end_us - t_begin_us;
+		shared_buf_fd = -1;
 	} else if (a->shared_buf_addr) {
 		shared_buf = (uint8_t *)(unsigned long)a->shared_buf_addr;
 	} else if ((long)dsa_cached_shared_map >= 0 &&
-		   dsa_cached_shared_size == a->shared_buf_size) {
+		   dsa_cached_shared_size == a->shared_buf_size &&
+		   dsa_cached_shared_map_size == a->shared_map_size) {
 		shared_buf = (uint8_t *)dsa_cached_shared_map;
 	} else {
 		a->op_ret = -EINVAL;
@@ -383,31 +719,12 @@ static int parasite_dsa_dump_pages(struct parasite_dsa_dump_pages_args *a)
 		goto out_cleanup;
 	}
 
-	desc_bytes = shm_hdr->desc_bytes;
-	nr_descriptors = shm_hdr->desc_count;
-	data_off = shm_hdr->data_off;
-	data_bytes = shm_hdr->data_bytes;
-
-	if (!nr_descriptors ||
-	    desc_bytes != nr_descriptors * sizeof(struct dsa_dump_descriptor)) {
+	if (!(shm_hdr->flags & PARASITE_DSA_SHM_F_STREAM)) {
+		pr_err("DSA strict: non-streaming shared header is unsupported\n");
 		a->op_ret = -EINVAL;
 		goto out_cleanup;
 	}
-
-	if (a->hdr_off + sizeof(*shm_hdr) + desc_bytes > a->shared_buf_size ||
-	    data_off > a->shared_buf_size || data_bytes > a->shared_buf_size - data_off) {
-		a->op_ret = -EINVAL;
-		goto out_cleanup;
-	}
-
-	if (data_off < dsa_align_up(a->hdr_off + sizeof(*shm_hdr) + desc_bytes,
-				   DSA_SHARED_DATA_ALIGN)) {
-		a->op_ret = -EINVAL;
-		goto out_cleanup;
-	}
-
-	buf_write_offset = data_off;
-	descriptors = (struct dsa_dump_descriptor *)((uint8_t *)shm_hdr + sizeof(*shm_hdr));
+	stream_hdr = (struct parasite_dsa_stream_hdr *)shm_hdr;
 	dsa_wq_cache_init_once();
 
 	/* Initialize all WQ pointers */
@@ -564,208 +881,12 @@ static int parasite_dsa_dump_pages(struct parasite_dsa_dump_pages_args *a)
 	if (setup_end_us > setup_begin_us)
 		a->setup_us = setup_end_us - setup_begin_us;
 
-	while (desc_base < nr_descriptors) {
-		remaining = nr_descriptors - desc_base;
-		window = a->wq_count * DSA_DESC_PER_WQ;
-		if (window > DSA_DUMP_BATCH_SIZE)
-			window = DSA_DUMP_BATCH_SIZE;
-		if (window > remaining)
-			window = remaining;
-
-		/* Initialize descriptors - prepare all DSA move operations */
-		for (i = 0; i < window; i++) {
-			struct dsa_dump_descriptor *desc = &descriptors[desc_base + i];
-			uint8_t *src = (uint8_t *)(unsigned long)desc->src_addr;
-			uint32_t copy_len = desc->copy_len;
-			uint8_t *dst = shared_buf + buf_write_offset;
-			u64 prefault_begin;
-			u64 prefault_end;
-
-			/* Verify buffer space */
-			if (buf_write_offset + copy_len > a->shared_buf_size ||
-			    total_size + copy_len > data_bytes) {
-				a->op_ret = -ENOSPC;
-				goto out_cleanup;
-			}
-
-			/* Prefault source */
-			prefault_begin = dsa_now_us();
-			dsa_prefault_range(src, copy_len);
-			prefault_end = dsa_now_us();
-			if (prefault_end > prefault_begin)
-				a->prefault_us += prefault_end - prefault_begin;
-
-			/* Prepare DSA descriptor */
-			dsa_memzero(&dsa_descs[i], sizeof(struct dsa_hw_desc));
-			dsa_descs[i].opcode = DSA_OPCODE_MEMMOVE;
-			dsa_descs[i].flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
-			dsa_descs[i].src_addr = (uint64_t)(unsigned long)src;
-			dsa_descs[i].dst_addr = (uint64_t)(unsigned long)dst;
-			dsa_descs[i].xfer_size = copy_len;
-			dsa_descs[i].completion_addr = (uint64_t)(unsigned long)&dsa_comps[i];
-
-			dsa_memzero((void *)&dsa_comps[i], sizeof(struct dsa_completion_record));
-
-			buf_write_offset += copy_len;
-			total_size += copy_len;
-		}
-
-		/* Submit all descriptors - load balance across available WQs */
-		submitted = 0;
-		order_cnt = window;
-		for (i = 0; i < order_cnt; i++)
-			lpt_order[i] = i;
-
-		if (a->wq_policy != DSA_WQ_POLICY_RR) {
-			for (i = 0; i < order_cnt; i++) {
-				uint32_t best = i;
-
-				for (j = i + 1; j < order_cnt; j++) {
-					struct dsa_dump_descriptor *desc;
-
-					desc = &descriptors[desc_base + lpt_order[j]];
-					if (desc->copy_len >
-					    descriptors[desc_base + lpt_order[best]].copy_len)
-						best = j;
-				}
-
-				if (best != i) {
-					uint32_t tmp = lpt_order[i];
-
-					lpt_order[i] = lpt_order[best];
-					lpt_order[best] = tmp;
-				}
-			}
-		}
-
-		for (k = 0; k < order_cnt; k++) {
-			uint32_t wq_idx;
-			uint32_t retry_count = 0;
-			u64 submit_begin;
-			u64 submit_end;
-
-			desc_idx = lpt_order[k];
-			submit_begin = dsa_now_us();
-
-			if (a->wq_policy == DSA_WQ_POLICY_RR) {
-				wq_sel = k % active_wq_count;
-			} else {
-				wq_sel = 0;
-				for (j = 1; j < active_wq_count; j++) {
-					if (active_wq_load[j] < active_wq_load[wq_sel])
-						wq_sel = j;
-				}
-			}
-
-			wq_idx = active_wq_idx[wq_sel];
-
-			if (!use_portal[wq_idx]) {
-				a->failed_idx = desc_base + desc_idx;
-				a->op_ret = -EOPNOTSUPP;
-				submit_end = dsa_now_us();
-				if (submit_end > submit_begin)
-					a->submit_us += submit_end - submit_begin;
-				goto poll_completed;
-			}
-
-			/* Use portal enqcmd submission */
-			for (retry_count = 0; retry_count < DSA_MAX_ENQ_RETRY; retry_count++) {
-				unsigned long off = ((unsigned long)portal_offset[wq_idx]++ << 6) & 0xfffUL;
-				void *slot = (void *)(portal_mask[wq_idx] | off);
-
-				if (dsa_enqcmd_local(slot, &dsa_descs[desc_idx]) == 0) {
-					submitted_idx[submitted++] = desc_idx;
-					a->submit_enqcmd++;
-					active_wq_load[wq_sel] +=
-						descriptors[desc_base + desc_idx].copy_len;
-					break;
-				}
-				dsa_cpu_relax();
-			}
-			if (retry_count == DSA_MAX_ENQ_RETRY) {
-				a->failed_idx = desc_base + desc_idx;
-				a->op_ret = -EAGAIN;
-				submit_end = dsa_now_us();
-				if (submit_end > submit_begin)
-					a->submit_us += submit_end - submit_begin;
-				goto poll_completed;
-			}
-
-			submit_end = dsa_now_us();
-			if (submit_end > submit_begin)
-				a->submit_us += submit_end - submit_begin;
-		}
-
-		/* Poll for completion of all submitted descriptors */
-poll_completed:
-		if (!submitted)
-			goto out_cleanup;
-
-		completed = 0;
-		timeout_count = 0;
-
-		for (k = 0; k < submitted; k++) {
-			u64 poll_begin;
-			u64 poll_end;
-			int poll_failed = 0;
-
-			desc_idx = submitted_idx[k];
-			timeout_count = 0;
-
-			poll_begin = dsa_now_us();
-			while (1) {
-				comp_status = dsa_comps[desc_idx].status;
-				comp_code = (uint8_t)DSA_COMP_STATUS(comp_status);
-
-				if (comp_status != 0 && comp_code != DSA_COMP_NONE) {
-					/* Completion received */
-					a->completed_count++;
-
-					if (comp_code == DSA_COMP_SUCCESS || comp_code == DSA_COMP_SUCCESS_PRED) {
-						/* Success - verify destination */
-						completed++;
-					} else {
-						/* Hardware failure */
-						a->failed_idx = desc_base + desc_idx;
-						a->failed_status = comp_code;
-						a->op_ret = -(int)comp_code;
-						poll_failed = 1;
-						break;
-					}
-					break;
-				}
-
-				if (timeout_count++ >= max_timeout_retries) {
-					a->failed_idx = desc_base + desc_idx;
-					a->op_ret = -ETIMEDOUT;
-					poll_failed = 1;
-					break;
-				}
-				dsa_cpu_relax();
-			}
-
-			poll_end = dsa_now_us();
-			if (poll_end > poll_begin)
-				a->poll_us += poll_end - poll_begin;
-
-			if (poll_failed)
-				goto out_cleanup;
-		}
-
-		if (completed != submitted)
-			goto out_cleanup;
-
-		desc_base += window;
-	}
-
-	/* All successfully completed */
-	if (desc_base == nr_descriptors) {
-		a->op_ret = 0;
-		a->total_copied = total_size;
-		a->new_buf_offset = buf_write_offset;
-		if (total_size != data_bytes)
-			a->op_ret = -EINVAL;
-	}
+	dsa_atomic_store_u32(&stream_hdr->consumer_ready, 1);
+	if (dsa_stream_consume(a, shared_buf, stream_hdr, active_wq_count,
+			       active_wq_idx, active_wq_load, use_portal,
+			       portal_mask, portal_offset))
+		goto out_cleanup;
+	goto out_cleanup;
 
 out_cleanup:
 	if (!a->setup_shared_us && shared_setup_begin_us) {
@@ -816,6 +937,21 @@ out_cleanup:
 			a->cleanup_close_us += t_end_us - t_begin_us;
 	}
 
+	out_copy_results:
+	if (stream_hdr) {
+		stream_hdr->result_op_ret = a->op_ret;
+		stream_hdr->result_total_copied = a->total_copied;
+		stream_hdr->result_completed_count = a->completed_count;
+		stream_hdr->result_failed_idx = a->failed_idx;
+		stream_hdr->result_failed_status = a->failed_status;
+		stream_hdr->result_new_buf_offset = a->new_buf_offset;
+		stream_hdr->result_setup_shared_recv_fd_us = a->setup_shared_recv_fd_us;
+		stream_hdr->result_setup_shared_mmap_us = a->setup_shared_mmap_us;
+		stream_hdr->result_cleanup_munmap_us = a->cleanup_munmap_us;
+		stream_hdr->result_cleanup_close_us = a->cleanup_close_us;
+		stream_hdr->result_setup_shared_us = a->setup_shared_us;
+		__atomic_thread_fence(__ATOMIC_RELEASE);
+	}
 	return 0;
 }
 
@@ -1642,22 +1778,36 @@ void parasite_cleanup(void)
 {
 	u32 i;
 
+	pr_info("PARASITE_CLEANUP_TRACE: begin shared_cached=%u wq_cached=%u mprotect_args=%u\n",
+		(long)dsa_cached_shared_map >= 0 ? 1U : 0U,
+		dsa_cached_wq_inited ? 1U : 0U, mprotect_args ? 1U : 0U);
+
 	if ((long)dsa_cached_shared_map >= 0) {
-		sys_munmap(dsa_cached_shared_map, dsa_cached_shared_size);
+		pr_info("PARASITE_CLEANUP_TRACE: shared_munmap begin map_size=%llu\n",
+			(unsigned long long)dsa_cached_shared_map_size);
+		sys_munmap(dsa_cached_shared_map, dsa_cached_shared_map_size);
 		dsa_cached_shared_map = (void *)-1;
 		dsa_cached_shared_size = 0;
+		dsa_cached_shared_map_size = 0;
+		pr_info("PARASITE_CLEANUP_TRACE: shared_munmap end\n");
 	}
 
 	if (dsa_cached_wq_inited) {
+		pr_info("PARASITE_CLEANUP_TRACE: wq_cache_drop begin\n");
 		for (i = 0; i < DSA_DUMP_MAX_WQ; i++)
 			dsa_wq_cache_drop_idx(i);
 		dsa_cached_wq_inited = 0;
+		pr_info("PARASITE_CLEANUP_TRACE: wq_cache_drop end\n");
 	}
 
 	if (mprotect_args) {
+		pr_info("PARASITE_CLEANUP_TRACE: mprotect_rollback begin nr_vmas=%u\n",
+			mprotect_args->nr_vmas);
 		mprotect_args->add_prot = 0;
 		mprotect_vmas(mprotect_args);
+		pr_info("PARASITE_CLEANUP_TRACE: mprotect_rollback end\n");
 	}
+	pr_info("PARASITE_CLEANUP_TRACE: end\n");
 }
 
 int parasite_daemon_cmd(int cmd, void *args)
