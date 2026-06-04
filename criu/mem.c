@@ -1331,8 +1331,8 @@ struct dsa_desc_scan_ctx {
 	unsigned int args_nr_vmas_saved;
 	unsigned int args_add_prot_saved;
 	unsigned int args_off_saved;
-	void *args_tail_saved;
-	size_t args_tail_sz;
+	void *args_vmas_saved;
+	size_t args_vmas_sz;
 
 	int dsa_pipe_fd;
 	struct parasite_dsa_dump_pages_args rpc_args;
@@ -1397,8 +1397,8 @@ static void dsa_stream_restore_parasite_args(struct dsa_desc_scan_ctx *sc)
 	sc->args->nr_vmas = sc->args_nr_vmas_saved;
 	sc->args->add_prot = sc->args_add_prot_saved;
 	sc->args->off = sc->args_off_saved;
-	if (sc->args_tail_saved && sc->args_tail_sz)
-		memcpy(pargs_vmas(sc->args), sc->args_tail_saved, sc->args_tail_sz);
+	if (sc->args_vmas_saved && sc->args_vmas_sz)
+		memcpy(pargs_vmas(sc->args), sc->args_vmas_saved, sc->args_vmas_sz);
 }
 
 static void *dsa_stream_rpc_thread(void *arg)
@@ -2501,6 +2501,20 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 		.dsa_pipe_fd = -1,
 	};
 	int parent_predump_mode = -1;
+	u64 setup_start_us = 0;
+	u64 setup_end_us = 0;
+	u64 setup_total_us = 0;
+	u64 setup_accounted_us = 0;
+	u64 setup_pmc_init_us = 0;
+	u64 setup_dsa_ctx_init_us = 0;
+	u64 setup_create_page_pipe_us = 0;
+	u64 setup_save_vmas_us = 0;
+	u64 setup_stream_layout_us = 0;
+	u64 setup_stream_start_rpc_us = 0;
+	u64 setup_open_page_xfer_us = 0;
+	u64 setup_detect_pid_reuse_us = 0;
+	u64 setup_t0;
+	u64 setup_t1;
 
 	pr_info("\n");
 	pr_info("Dumping pages (type: %d pid: %d)\n", CR_FD_PAGES, item->pid->real);
@@ -2508,6 +2522,7 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 
 	timing_start(TIME_MEMDUMP);
 	memdump_timeline_switch(timeline, MEMDUMP_PHASE_SETUP);
+	setup_start_us = dsa_wall_now_us();
 
 	pr_debug("   Private vmas %lu/%lu pages\n", vma_area_list->nr_priv_pages_longest, vma_area_list->nr_priv_pages);
 
@@ -2516,8 +2531,11 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	 */
 
 	pmc_size = max(vma_area_list->nr_priv_pages_longest, vma_area_list->nr_shared_pages_longest);
+	setup_t0 = dsa_wall_now_us();
 	if (pmc_init(&pmc, item->pid->real, &vma_area_list->h, pmc_size * PAGE_SIZE))
 		return -1;
+	setup_t1 = dsa_wall_now_us();
+	setup_pmc_init_us = dsa_wall_delta_us(setup_t0, setup_t1);
 
 	dsa_ctx = xzalloc(sizeof(*dsa_ctx));
 	if (!dsa_ctx)
@@ -2530,7 +2548,10 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	dsa_desc_scan_active = dsa_strict && !mdc->pre_dump && !mdc->lazy;
 
 	if (dsa_desc_scan_active) {
+		setup_t0 = dsa_wall_now_us();
 		ret = dsa_dump_ctx_init(dsa_ctx, item->pid->real);
+		setup_t1 = dsa_wall_now_us();
+		setup_dsa_ctx_init_us = dsa_wall_delta_us(setup_t0, setup_t1);
 		if (ret)
 			goto out;
 
@@ -2554,7 +2575,10 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 
 		if (dsa_strict)
 			pp_iovs = NULL;
+		setup_t0 = dsa_wall_now_us();
 		pp = create_page_pipe(vma_area_list->nr_priv_pages, pp_iovs, cpp_flags);
+		setup_t1 = dsa_wall_now_us();
+		setup_create_page_pipe_us = dsa_wall_delta_us(setup_t0, setup_t1);
 	}
 	if (!pp)
 		goto out;
@@ -2572,27 +2596,35 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 		dsa_sc.args_nr_vmas_saved = args->nr_vmas;
 		dsa_sc.args_add_prot_saved = args->add_prot;
 		dsa_sc.args_off_saved = args->off;
-		dsa_sc.args_tail_sz = args->nr_vmas * sizeof(struct parasite_vma_entry) +
-				       pp->nr_iovs * sizeof(struct iovec);
-		if (dsa_sc.args_tail_sz) {
-			dsa_sc.args_tail_saved = xmalloc(dsa_sc.args_tail_sz);
-			if (!dsa_sc.args_tail_saved) {
+		dsa_sc.args_vmas_sz = args->nr_vmas * sizeof(struct parasite_vma_entry);
+		if (dsa_sc.args_vmas_sz) {
+			setup_t0 = dsa_wall_now_us();
+			dsa_sc.args_vmas_saved = xmalloc(dsa_sc.args_vmas_sz);
+			if (!dsa_sc.args_vmas_saved) {
 				ret = -1;
 				goto out_pp;
 			}
-			memcpy(dsa_sc.args_tail_saved, pargs_vmas(args),
-			       dsa_sc.args_tail_sz);
+			memcpy(dsa_sc.args_vmas_saved, pargs_vmas(args),
+			       dsa_sc.args_vmas_sz);
+			setup_t1 = dsa_wall_now_us();
+			setup_save_vmas_us = dsa_wall_delta_us(setup_t0, setup_t1);
 		}
 
+		setup_t0 = dsa_wall_now_us();
 		if (dsa_stream_layout_init(&dsa_sc)) {
 			ret = -1;
 			goto out_pp;
 		}
+		setup_t1 = dsa_wall_now_us();
+		setup_stream_layout_us = dsa_wall_delta_us(setup_t0, setup_t1);
 		dsa_desc_scan_reset_batch(&dsa_sc);
+		setup_t0 = dsa_wall_now_us();
 		if (dsa_stream_start_rpc(&dsa_sc)) {
 			ret = -1;
 			goto out_pp;
 		}
+		setup_t1 = dsa_wall_now_us();
+		setup_stream_start_rpc_us = dsa_wall_delta_us(setup_t0, setup_t1);
 		dsa_desc_scan_ready = true;
 	}
 
@@ -2602,7 +2634,10 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 		 * right here. For pre-dumps the pp will be taken by the
 		 * caller and handled later.
 		 */
+		setup_t0 = dsa_wall_now_us();
 		ret = open_page_xfer(&xfer, CR_FD_PAGEMAP, vpid(item));
+		setup_t1 = dsa_wall_now_us();
+		setup_open_page_xfer_us = dsa_wall_delta_us(setup_t0, setup_t1);
 		if (ret < 0)
 			goto out_pp;
 
@@ -2617,10 +2652,33 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	}
 
 	if (xfer.parent) {
+		setup_t0 = dsa_wall_now_us();
 		possible_pid_reuse = detect_pid_reuse(item, mdc->stat, mdc->parent_ie);
+		setup_t1 = dsa_wall_now_us();
+		setup_detect_pid_reuse_us = dsa_wall_delta_us(setup_t0, setup_t1);
 		if (possible_pid_reuse == -1)
 			goto out_xfer;
 	}
+
+	setup_end_us = dsa_wall_now_us();
+	setup_total_us = dsa_wall_delta_us(setup_start_us, setup_end_us);
+	setup_accounted_us = setup_pmc_init_us + setup_dsa_ctx_init_us +
+		setup_create_page_pipe_us + setup_save_vmas_us +
+		setup_stream_layout_us + setup_stream_start_rpc_us +
+		setup_open_page_xfer_us + setup_detect_pid_reuse_us;
+	pr_info("MEMDUMP_SETUP_DETAIL: pid=%d mode=%s total_us=%llu pmc_init_us=%llu dsa_ctx_init_us=%llu create_page_pipe_us=%llu save_vmas_us=%llu stream_layout_us=%llu stream_start_rpc_us=%llu open_page_xfer_us=%llu detect_pid_reuse_us=%llu other_us=%llu\n",
+		item->pid->real, dsa_desc_scan_active ? "dsa" : "base",
+		(unsigned long long)setup_total_us,
+		(unsigned long long)setup_pmc_init_us,
+		(unsigned long long)setup_dsa_ctx_init_us,
+		(unsigned long long)setup_create_page_pipe_us,
+		(unsigned long long)setup_save_vmas_us,
+		(unsigned long long)setup_stream_layout_us,
+		(unsigned long long)setup_stream_start_rpc_us,
+		(unsigned long long)setup_open_page_xfer_us,
+		(unsigned long long)setup_detect_pid_reuse_us,
+		(unsigned long long)(setup_total_us >= setup_accounted_us ?
+			setup_total_us - setup_accounted_us : 0));
 
 	/*
 	 * Step 1 -- generate the pagemap
@@ -2788,7 +2846,7 @@ out:
 		dsa_shared_store_u32(&dsa_sc.stream_hdr->finish, 1);
 		(void)dsa_stream_join_rpc(&dsa_sc);
 	}
-	xfree(dsa_sc.args_tail_saved);
+	xfree(dsa_sc.args_vmas_saved);
 	if (dsa_ctx && !dsa_ctx_deferred) {
 		int fini_ret;
 

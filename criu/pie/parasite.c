@@ -1778,36 +1778,23 @@ void parasite_cleanup(void)
 {
 	u32 i;
 
-	pr_info("PARASITE_CLEANUP_TRACE: begin shared_cached=%u wq_cached=%u mprotect_args=%u\n",
-		(long)dsa_cached_shared_map >= 0 ? 1U : 0U,
-		dsa_cached_wq_inited ? 1U : 0U, mprotect_args ? 1U : 0U);
-
 	if ((long)dsa_cached_shared_map >= 0) {
-		pr_info("PARASITE_CLEANUP_TRACE: shared_munmap begin map_size=%llu\n",
-			(unsigned long long)dsa_cached_shared_map_size);
 		sys_munmap(dsa_cached_shared_map, dsa_cached_shared_map_size);
 		dsa_cached_shared_map = (void *)-1;
 		dsa_cached_shared_size = 0;
 		dsa_cached_shared_map_size = 0;
-		pr_info("PARASITE_CLEANUP_TRACE: shared_munmap end\n");
 	}
 
 	if (dsa_cached_wq_inited) {
-		pr_info("PARASITE_CLEANUP_TRACE: wq_cache_drop begin\n");
 		for (i = 0; i < DSA_DUMP_MAX_WQ; i++)
 			dsa_wq_cache_drop_idx(i);
 		dsa_cached_wq_inited = 0;
-		pr_info("PARASITE_CLEANUP_TRACE: wq_cache_drop end\n");
 	}
 
 	if (mprotect_args) {
-		pr_info("PARASITE_CLEANUP_TRACE: mprotect_rollback begin nr_vmas=%u\n",
-			mprotect_args->nr_vmas);
 		mprotect_args->add_prot = 0;
 		mprotect_vmas(mprotect_args);
-		pr_info("PARASITE_CLEANUP_TRACE: mprotect_rollback end\n");
 	}
-	pr_info("PARASITE_CLEANUP_TRACE: end\n");
 }
 
 int parasite_daemon_cmd(int cmd, void *args)
