@@ -2327,6 +2327,7 @@ static int cr_dump_finish(int ret)
 		if (arch_set_thread_regs(root_item, true) < 0) {
 			temp_cdf_dump_abort();
 			dsa_shared_mem_cleanup_after_dump();
+			dsa_parent_index_cleanup_after_dump();
 			ws_snapshot_ctx_destroy(&dump_ws_snapshot);
 			return -1;
 		}
@@ -2355,6 +2356,7 @@ static int cr_dump_finish(int ret)
 			ret = -1;
 
 		dsa_shared_mem_cleanup_after_dump();
+	dsa_parent_index_cleanup_after_dump();
 
 		if (disconnect_from_page_server())
 			ret = -1;
@@ -2469,6 +2471,7 @@ static int cr_dump_finish(int ret)
 	if (arch_set_thread_regs(root_item, true) < 0) {
 		temp_cdf_dump_abort();
 		dsa_shared_mem_cleanup_after_dump();
+	dsa_parent_index_cleanup_after_dump();
 		ws_snapshot_ctx_destroy(&dump_ws_snapshot);
 		return -1;
 	}
@@ -2494,6 +2497,7 @@ static int cr_dump_finish(int ret)
 		ret = -1;
 
 	dsa_shared_mem_cleanup_after_dump();
+	dsa_parent_index_cleanup_after_dump();
 
 	free_pstree(root_item);
 	seccomp_free_entries();
@@ -2603,6 +2607,8 @@ int cr_dump_tasks(pid_t pid)
 	 */
 
 	if (dsa_shared_mem_prepare_before_freeze())
+		goto err;
+	if (dsa_parent_index_prepare_before_freeze())
 		goto err;
 
 	if (opts.workspace_snapshot) {

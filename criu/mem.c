@@ -9,11 +9,14 @@
 #include <sys/prctl.h>
 #include <dirent.h>
 #include <limits.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <pthread.h>
 #include <linux/memfd.h>
+#include <sys/stat.h>
+
 
 #ifndef MFD_HUGE_1GB
 #define MFD_HUGE_1GB	(30 << MFD_HUGE_SHIFT)
@@ -28,6 +31,7 @@
 #include "parasite.h"
 #include "page-pipe.h"
 #include "page-xfer.h"
+#include "image.h"
 #include "log.h"
 #include "kerndat.h"
 #include "stats.h"
@@ -435,6 +439,339 @@ static __maybe_unused bool dsa_read_ull_file(const char *path, unsigned long lon
 		return false;
 
 	return true;
+}
+
+
+static bool dsa_dump_enabled(void);
+
+#define DSA_PARENT_INDEX_NAME "dsa-parent-index.bin"
+#define DSA_PARENT_INDEX_MAGIC 0x5844495041534455ULL /* UDSAPI DX */
+#define DSA_PARENT_INDEX_VERSION 1U
+
+struct dsa_parent_index_entry {
+	u64 start;
+	u64 end;
+};
+
+struct dsa_parent_index_file_hdr {
+	u64 magic;
+	u32 version;
+	u32 entry_size;
+	u64 nr_entries;
+};
+
+struct dsa_parent_index {
+	struct dsa_parent_index_entry *entries;
+	size_t nr;
+	size_t cap;
+	bool ready;
+	bool has_parent;
+};
+
+static struct dsa_parent_index dsa_parent_index_prev;
+static bool dsa_parent_index_prev_prepared;
+
+static void dsa_parent_index_reset(struct dsa_parent_index *idx)
+{
+	if (!idx)
+		return;
+	xfree(idx->entries);
+	idx->entries = NULL;
+	idx->nr = 0;
+	idx->cap = 0;
+	idx->ready = false;
+	idx->has_parent = false;
+}
+
+void dsa_parent_index_cleanup_after_dump(void)
+{
+	dsa_parent_index_reset(&dsa_parent_index_prev);
+	dsa_parent_index_prev_prepared = false;
+}
+
+static int dsa_parent_index_reserve(struct dsa_parent_index *idx, size_t need)
+{
+	struct dsa_parent_index_entry *new_entries;
+	size_t new_cap;
+
+	if (need <= idx->cap)
+		return 0;
+
+	new_cap = idx->cap ? idx->cap * 2 : 1024;
+	while (new_cap < need)
+		new_cap *= 2;
+
+	new_entries = xrealloc(idx->entries, new_cap * sizeof(*idx->entries));
+	if (!new_entries)
+		return -1;
+	idx->entries = new_entries;
+	idx->cap = new_cap;
+	return 0;
+}
+
+static int dsa_parent_index_add_range(struct dsa_parent_index *idx, u64 start, u64 len)
+{
+	u64 end;
+
+	if (!len)
+		return 0;
+	end = start + len;
+	if (end <= start)
+		return -1;
+
+	if (idx->nr > 0 && start <= idx->entries[idx->nr - 1].end) {
+		if (end > idx->entries[idx->nr - 1].end)
+			idx->entries[idx->nr - 1].end = end;
+		return 0;
+	}
+
+	if (dsa_parent_index_reserve(idx, idx->nr + 1))
+		return -1;
+	idx->entries[idx->nr].start = start;
+	idx->entries[idx->nr].end = end;
+	idx->nr++;
+	return 0;
+}
+
+static int dsa_parent_index_cmp(const void *a, const void *b)
+{
+	const struct dsa_parent_index_entry *ea = a;
+	const struct dsa_parent_index_entry *eb = b;
+
+	if (ea->start < eb->start)
+		return -1;
+	if (ea->start > eb->start)
+		return 1;
+	if (ea->end < eb->end)
+		return -1;
+	if (ea->end > eb->end)
+		return 1;
+	return 0;
+}
+
+static void dsa_parent_index_sort_merge(struct dsa_parent_index *idx)
+{
+	size_t i;
+	size_t out = 0;
+
+	if (idx->nr <= 1)
+		return;
+
+	qsort(idx->entries, idx->nr, sizeof(*idx->entries), dsa_parent_index_cmp);
+	for (i = 0; i < idx->nr; i++) {
+		if (idx->entries[i].start >= idx->entries[i].end)
+			continue;
+		if (out && idx->entries[i].start <= idx->entries[out - 1].end) {
+			if (idx->entries[i].end > idx->entries[out - 1].end)
+				idx->entries[out - 1].end = idx->entries[i].end;
+		} else {
+			idx->entries[out++] = idx->entries[i];
+		}
+	}
+	idx->nr = out;
+}
+
+static bool dsa_parent_index_contains_range(const struct dsa_parent_index *idx, u64 start, u64 len)
+{
+	size_t lo = 0, hi;
+	u64 end;
+
+	if (!idx || !idx->ready || !len)
+		return false;
+	end = start + len;
+	if (end <= start)
+		return false;
+
+	hi = idx->nr;
+	while (lo < hi) {
+		size_t mid = lo + (hi - lo) / 2;
+
+		if (idx->entries[mid].end <= start)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+
+	return lo < idx->nr && idx->entries[lo].start <= start && idx->entries[lo].end >= end;
+}
+
+static int dsa_parent_index_read_fd(int fd, struct dsa_parent_index *idx)
+{
+	struct dsa_parent_index_file_hdr hdr;
+	ssize_t need;
+
+	if (read(fd, &hdr, sizeof(hdr)) != sizeof(hdr)) {
+		pr_perror("DSA parent index: failed to read header");
+		return -1;
+	}
+	if (hdr.magic != DSA_PARENT_INDEX_MAGIC || hdr.version != DSA_PARENT_INDEX_VERSION ||
+	    hdr.entry_size != sizeof(struct dsa_parent_index_entry)) {
+		pr_err("DSA parent index: invalid header magic=%llx version=%u entry_size=%u\n",
+		       (unsigned long long)hdr.magic, hdr.version, hdr.entry_size);
+		return -1;
+	}
+	if (hdr.nr_entries > SIZE_MAX / sizeof(struct dsa_parent_index_entry)) {
+		pr_err("DSA parent index: too many entries %llu\n", (unsigned long long)hdr.nr_entries);
+		return -1;
+	}
+
+	dsa_parent_index_reset(idx);
+	if (dsa_parent_index_reserve(idx, hdr.nr_entries))
+		return -1;
+	idx->nr = hdr.nr_entries;
+	need = hdr.nr_entries * sizeof(struct dsa_parent_index_entry);
+	if (need && read(fd, idx->entries, need) != need) {
+		pr_perror("DSA parent index: failed to read entries");
+		dsa_parent_index_reset(idx);
+		return -1;
+	}
+	idx->ready = true;
+	idx->has_parent = true;
+	return 0;
+}
+
+int dsa_parent_index_prepare_before_freeze(void)
+{
+	int pfd = -1;
+	int fd = -1;
+	int ret = 0;
+
+	if (!dsa_dump_enabled())
+		return 0;
+
+	dsa_parent_index_cleanup_after_dump();
+	dsa_parent_index_prev_prepared = true;
+
+	if (open_parent(get_service_fd(IMG_FD_OFF), &pfd))
+		return -1;
+	if (pfd < 0)
+		return 0;
+
+	fd = openat(pfd, DSA_PARENT_INDEX_NAME, O_RDONLY);
+	if (fd < 0) {
+		pr_perror("DSA strict: parent image exists but %s is missing", DSA_PARENT_INDEX_NAME);
+		close(pfd);
+		return -1;
+	}
+
+	ret = dsa_parent_index_read_fd(fd, &dsa_parent_index_prev);
+	close(fd);
+	close(pfd);
+	if (!ret)
+		pr_info("DSA_PARENT_INDEX: loaded parent entries=%zu\n", dsa_parent_index_prev.nr);
+	return ret;
+}
+
+static int dsa_parent_index_write_current(const struct dsa_parent_index *idx)
+{
+	struct dsa_parent_index_file_hdr hdr;
+	char tmp_path[PATH_MAX];
+	char final_path[PATH_MAX];
+	int fd;
+	size_t bytes;
+	int ret = -1;
+
+	if (!opts.imgs_dir || !idx || !idx->ready)
+		return -1;
+
+	if (snprintf(tmp_path, sizeof(tmp_path), "%s/%s.tmp", opts.imgs_dir,
+	             DSA_PARENT_INDEX_NAME) >= sizeof(tmp_path) ||
+	    snprintf(final_path, sizeof(final_path), "%s/%s", opts.imgs_dir,
+	             DSA_PARENT_INDEX_NAME) >= sizeof(final_path)) {
+		pr_err("DSA parent index path too long\n");
+		return -1;
+	}
+
+	fd = open(tmp_path, O_CREAT | O_TRUNC | O_WRONLY, 0600);
+	if (fd < 0) {
+		pr_perror("DSA parent index: failed to open %s", tmp_path);
+		return -1;
+	}
+
+	hdr.magic = DSA_PARENT_INDEX_MAGIC;
+	hdr.version = DSA_PARENT_INDEX_VERSION;
+	hdr.entry_size = sizeof(struct dsa_parent_index_entry);
+	hdr.nr_entries = idx->nr;
+	if (write(fd, &hdr, sizeof(hdr)) != sizeof(hdr)) {
+		pr_perror("DSA parent index: failed to write header");
+		goto out;
+	}
+	bytes = idx->nr * sizeof(struct dsa_parent_index_entry);
+	if (bytes && write(fd, idx->entries, bytes) != bytes) {
+		pr_perror("DSA parent index: failed to write entries");
+		goto out;
+	}
+	if (fsync(fd)) {
+		pr_perror("DSA parent index: fsync failed");
+		goto out;
+	}
+	if (close(fd)) {
+		fd = -1;
+		pr_perror("DSA parent index: close failed");
+		goto out_unlink;
+	}
+	fd = -1;
+	if (rename(tmp_path, final_path)) {
+		pr_perror("DSA parent index: rename failed");
+		goto out_unlink;
+	}
+	ret = 0;
+	pr_info("DSA_PARENT_INDEX: wrote entries=%zu path=%s\n", idx->nr, final_path);
+	return 0;
+
+out:
+	if (fd >= 0)
+		close(fd);
+out_unlink:
+	unlink(tmp_path);
+	return ret;
+}
+
+static int dsa_parent_index_add_page_pipe(struct dsa_parent_index *idx, struct page_pipe *pp)
+{
+	struct page_pipe_buf *ppb;
+
+	list_for_each_entry(ppb, &pp->bufs, l) {
+		unsigned int i;
+
+		if (!(ppb->flags & PPB_LAZY)) {
+			for (i = 0; i < ppb->nr_segs; i++) {
+				if (dsa_parent_index_add_range(idx,
+					(u64)(unsigned long)ppb->iov[i].iov_base,
+					(u64)ppb->iov[i].iov_len))
+					return -1;
+			}
+		}
+	}
+	return 0;
+}
+
+static int dsa_parent_index_build_from_page_pipe(struct page_pipe *pp)
+{
+	struct dsa_parent_index cur = {};
+	int ret = -1;
+
+	if (!dsa_dump_enabled())
+		return 0;
+	if (!dsa_parent_index_prev_prepared) {
+		pr_err("DSA strict: parent index was not prepared before freeze\n");
+		return -1;
+	}
+	if (dsa_parent_index_prev.nr) {
+		if (dsa_parent_index_reserve(&cur, dsa_parent_index_prev.nr))
+			return -1;
+		memcpy(cur.entries, dsa_parent_index_prev.entries,
+		       dsa_parent_index_prev.nr * sizeof(*cur.entries));
+		cur.nr = dsa_parent_index_prev.nr;
+	}
+	if (dsa_parent_index_add_page_pipe(&cur, pp))
+		goto out;
+	dsa_parent_index_sort_merge(&cur);
+	cur.ready = true;
+	ret = dsa_parent_index_write_current(&cur);
+out:
+	dsa_parent_index_reset(&cur);
+	return ret;
 }
 
 static __maybe_unused unsigned int dsa_shared_buf_size_manual(void)
@@ -2548,6 +2885,9 @@ int parasite_dump_pages_seized_wait(struct pstree_item *item)
 	if (!ret && dsa_ret)
 		ret = dsa_ret;
 
+	if (!ret && dsa_live_defer && dsa_parent_index_build_from_page_pipe(async->pp))
+		ret = -1;
+
 	wait_us = dsa_wall_delta_us(wait_start_us, dsa_wall_now_us());
 	xfer_worker_us = async->xfer_worker_us;
 	dsa_replay_worker_us = async->dsa_replay_worker_us;
@@ -2767,7 +3107,8 @@ static int generate_iovs_dsa_desc_scan(struct pstree_item *item,
 		if (vma_entry_can_be_lazy(vma->e) && !is_stack(item, vaddr))
 			ppb_flags |= PPB_LAZY;
 
-		if (has_parent && page_in_parent(page_info.softdirty)) {
+		if (has_parent && page_in_parent(page_info.softdirty) &&
+		    dsa_parent_index_contains_range(&dsa_parent_index_prev, vaddr, PAGE_SIZE)) {
 			dsa_desc_scan_raw_flush(sc);
 			if (sc->scan_profile)
 				t0 = dsa_wall_now_us();
@@ -3051,7 +3392,10 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 		 * caller and handled later.
 		 */
 		setup_t0 = dsa_wall_now_us();
-		ret = open_page_xfer(&xfer, CR_FD_PAGEMAP, vpid(item));
+		if (dsa_desc_scan_active)
+			ret = open_page_xfer_no_parent(&xfer, CR_FD_PAGEMAP, vpid(item));
+		else
+			ret = open_page_xfer(&xfer, CR_FD_PAGEMAP, vpid(item));
 		setup_t1 = dsa_wall_now_us();
 		setup_open_page_xfer_us = dsa_wall_delta_us(setup_t0, setup_t1);
 		if (ret < 0)
@@ -3101,7 +3445,10 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	 * Step 1 -- generate the pagemap
 	 */
 	args->off = 0;
-	has_parent = !!xfer.parent && !possible_pid_reuse;
+	if (dsa_desc_scan_active)
+		has_parent = dsa_parent_index_prev.ready;
+	else
+		has_parent = !!xfer.parent && !possible_pid_reuse;
 	if (mdc->parent_ie)
 		parent_predump_mode = mdc->parent_ie->pre_dump_mode;
 

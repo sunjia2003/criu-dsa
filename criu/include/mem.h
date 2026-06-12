@@ -36,6 +36,8 @@ extern bool parasite_mem_async_deferred(const struct pstree_item *item);
 extern int collect_madv_guards(pid_t pid, struct vm_area_list *vma_area_list);
 extern int dsa_shared_mem_prepare_before_freeze(void);
 extern void dsa_shared_mem_cleanup_after_dump(void);
+extern int dsa_parent_index_prepare_before_freeze(void);
+extern void dsa_parent_index_cleanup_after_dump(void);
 extern void temp_cdf_dump_begin(void);
 extern void temp_cdf_dump_finalize_log(void);
 extern void temp_cdf_dump_abort(void);

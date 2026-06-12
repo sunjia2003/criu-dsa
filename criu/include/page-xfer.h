@@ -49,6 +49,7 @@ struct page_xfer {
 };
 
 extern int open_page_xfer(struct page_xfer *xfer, int fd_type, unsigned long id);
+extern int open_page_xfer_no_parent(struct page_xfer *xfer, int fd_type, unsigned long id);
 struct page_pipe;
 extern int page_xfer_dump_pages(struct page_xfer *, struct page_pipe *);
 extern int page_xfer_predump_pages(int pid, struct page_xfer *, struct page_pipe *);

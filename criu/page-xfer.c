@@ -440,6 +440,34 @@ int open_page_xfer(struct page_xfer *xfer, int fd_type, unsigned long img_id)
 		return open_page_local_xfer(xfer, fd_type, img_id);
 }
 
+int open_page_xfer_no_parent(struct page_xfer *xfer, int fd_type, unsigned long img_id)
+{
+	u32 pages_id;
+
+	if (opts.use_page_server) {
+		pr_err("DSA parent index mode does not support page server xfer\n");
+		return -1;
+	}
+
+	xfer->offset = 0;
+	xfer->transfer_lazy = true;
+	xfer->parent = NULL;
+	xfer->pmi = open_image(fd_type, O_DUMP, img_id);
+	if (!xfer->pmi)
+		return -1;
+
+	xfer->pi = open_pages_image(O_DUMP, xfer->pmi, &pages_id);
+	if (!xfer->pi) {
+		close_image(xfer->pmi);
+		return -1;
+	}
+
+	xfer->write_pagemap = write_pagemap_loc;
+	xfer->write_pages = write_pages_loc;
+	xfer->close = close_page_xfer;
+	return 0;
+}
+
 static int page_xfer_dump_hole(struct page_xfer *xfer, struct iovec *hole, u32 flags)
 {
 	BUG_ON(hole->iov_base < (void *)xfer->offset);
