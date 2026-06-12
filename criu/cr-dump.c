@@ -1580,7 +1580,19 @@ struct frozen_timeline {
 	u64 phase_us[FROZEN_PHASE_NR];
 };
 
+struct frozen_timeline_record {
+	bool valid;
+	bool dsa_mode;
+	int ret;
+	u64 total_us;
+	u64 stats_frozen_us;
+	u64 phase_us[FROZEN_PHASE_NR];
+	u64 accounted_us;
+	u64 gap_us;
+};
+
 static struct frozen_timeline frozen_tl;
+static struct frozen_timeline_record frozen_timeline_last;
 
 static bool frozen_timeline_dsa_mode(void)
 {
@@ -1638,21 +1650,55 @@ static void frozen_timeline_finish(int ret)
 	gap_us = accounted_us <= total_us ? total_us - accounted_us : 0;
 	stats_frozen_us = timing_total_usecs(TIME_FROZEN);
 
-	pr_info("FROZEN_TIMELINE: mode=%s ret=%d total_us=%llu stats_frozen_us=%llu post_freeze_prep_us=%llu task_prepare_us=%llu memdump_us=%llu other_resources_us=%llu async_wait_us=%llu finish_pre_unfreeze_us=%llu unfreeze_us=%llu accounted_us=%llu gap_us=%llu\n",
-		frozen_timeline_dsa_mode() ? "dsa" : "base", ret,
-		(unsigned long long)total_us,
-		(unsigned long long)stats_frozen_us,
-		(unsigned long long)frozen_tl.phase_us[FROZEN_PHASE_POST_FREEZE_PREP],
-		(unsigned long long)frozen_tl.phase_us[FROZEN_PHASE_TASK_PREPARE],
-		(unsigned long long)frozen_tl.phase_us[FROZEN_PHASE_MEMDUMP],
-		(unsigned long long)frozen_tl.phase_us[FROZEN_PHASE_OTHER_RESOURCES],
-		(unsigned long long)frozen_tl.phase_us[FROZEN_PHASE_ASYNC_WAIT],
-		(unsigned long long)frozen_tl.phase_us[FROZEN_PHASE_FINISH_PRE_UNFREEZE],
-		(unsigned long long)frozen_tl.phase_us[FROZEN_PHASE_UNFREEZE],
-		(unsigned long long)accounted_us,
-		(unsigned long long)gap_us);
+	frozen_timeline_last.valid = true;
+	frozen_timeline_last.dsa_mode = frozen_timeline_dsa_mode();
+	frozen_timeline_last.ret = ret;
+	frozen_timeline_last.total_us = total_us;
+	frozen_timeline_last.stats_frozen_us = stats_frozen_us;
+	memcpy(frozen_timeline_last.phase_us, frozen_tl.phase_us,
+	       sizeof(frozen_timeline_last.phase_us));
+	frozen_timeline_last.accounted_us = accounted_us;
+	frozen_timeline_last.gap_us = gap_us;
 
 	frozen_tl.active = false;
+}
+
+static void frozen_timeline_write_csv(void)
+{
+	char path[PATH_MAX];
+	FILE *f;
+
+	if (!frozen_timeline_last.valid || !opts.imgs_dir)
+		return;
+
+	if (snprintf(path, sizeof(path), "%s/frozen_timeline.csv",
+		     opts.imgs_dir) >= sizeof(path)) {
+		pr_err("FROZEN_TIMELINE csv path too long\n");
+		return;
+	}
+
+	f = fopen(path, "w");
+	if (!f) {
+		pr_perror("Failed to open %s", path);
+		return;
+	}
+
+	fprintf(f, "mode,ret,total_us,stats_frozen_us,post_freeze_prep_us,task_prepare_us,memdump_us,other_resources_us,async_wait_us,finish_pre_unfreeze_us,unfreeze_us,accounted_us,gap_us\n");
+	fprintf(f, "%s,%d,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+		frozen_timeline_last.dsa_mode ? "dsa" : "base",
+		frozen_timeline_last.ret,
+		(unsigned long long)frozen_timeline_last.total_us,
+		(unsigned long long)frozen_timeline_last.stats_frozen_us,
+		(unsigned long long)frozen_timeline_last.phase_us[FROZEN_PHASE_POST_FREEZE_PREP],
+		(unsigned long long)frozen_timeline_last.phase_us[FROZEN_PHASE_TASK_PREPARE],
+		(unsigned long long)frozen_timeline_last.phase_us[FROZEN_PHASE_MEMDUMP],
+		(unsigned long long)frozen_timeline_last.phase_us[FROZEN_PHASE_OTHER_RESOURCES],
+		(unsigned long long)frozen_timeline_last.phase_us[FROZEN_PHASE_ASYNC_WAIT],
+		(unsigned long long)frozen_timeline_last.phase_us[FROZEN_PHASE_FINISH_PRE_UNFREEZE],
+		(unsigned long long)frozen_timeline_last.phase_us[FROZEN_PHASE_UNFREEZE],
+		(unsigned long long)frozen_timeline_last.accounted_us,
+		(unsigned long long)frozen_timeline_last.gap_us);
+	fclose(f);
 }
 
 static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
@@ -2029,6 +2075,8 @@ static int cr_pre_dump_finish(int status)
 
 	timing_stop(TIME_FROZEN);
 	frozen_timeline_finish(status);
+	frozen_timeline_write_csv();
+	memdump_timeline_write_csv();
 
 	if (status < 0) {
 		ret = status;
@@ -2292,6 +2340,8 @@ static int cr_dump_finish(int ret)
 		pstree_switch_state(root_item, TASK_ALIVE);
 		timing_stop(TIME_FROZEN);
 		frozen_timeline_finish(ret);
+		frozen_timeline_write_csv();
+		memdump_timeline_write_csv();
 
 		if (!ret)
 			temp_cdf_dump_finalize_log();
@@ -2432,6 +2482,8 @@ static int cr_dump_finish(int ret)
 	pstree_switch_state(root_item, (ret || post_dump_ret) ? TASK_ALIVE : opts.final_state);
 	timing_stop(TIME_FROZEN);
 	frozen_timeline_finish(ret || post_dump_ret);
+	frozen_timeline_write_csv();
+	memdump_timeline_write_csv();
 
 	if (!ret && !post_dump_ret && opts.final_state == TASK_ALIVE)
 		temp_cdf_dump_finalize_log();

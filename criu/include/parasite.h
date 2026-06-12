@@ -263,6 +263,9 @@ struct parasite_dump_cgroup_args {
 #define PARASITE_DSA_SHM_HDR_MAGIC   0x4453414dU
 #define PARASITE_DSA_SHM_HDR_VERSION 2U
 #define PARASITE_DSA_SHM_F_STREAM    0x1U
+#ifdef CRIU_DSA_ENABLE_LEGACY_SINGLE_RPC
+#define PARASITE_DSA_SHM_F_SINGLE_RPC 0x2U
+#endif
 #define DSA_STREAM_SLOT_COUNT        8U
 #define DSA_STREAM_SLOT_DESC_CAP     DSA_DUMP_BATCH_SIZE
 
@@ -333,6 +336,11 @@ struct parasite_dsa_stream_hdr {
 	u64 result_cleanup_munmap_us;
 	u64 result_cleanup_close_us;
 	u64 result_setup_shared_us;
+	u64 result_prefault_us;
+	u64 result_submit_us;
+	u64 result_poll_us;
+	u32 result_submit_enqcmd;
+	u32 result_submit_write;
 };
 
 struct parasite_dsa_dump_pages_args {

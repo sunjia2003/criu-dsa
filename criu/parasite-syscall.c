@@ -411,10 +411,11 @@ int parasite_dsa_dump_pages_seized(struct parasite_ctl *ctl, struct parasite_dsa
 		ret = compel_rpc_call_sync(PARASITE_CMD_DSA_DUMP_PAGES, ctl);
 	}
 
+	*args = *pa;
 	if (ret)
 		return ret;
 
-	return 0;
+	return args->op_ret;
 }
 
 static unsigned long parasite_args_size = PARASITE_ARG_SIZE_MIN;

@@ -548,6 +548,64 @@ static int dsa_stream_consume(struct parasite_dsa_dump_pages_args *a,
 }
 
 
+#ifdef CRIU_DSA_ENABLE_LEGACY_SINGLE_RPC
+static int dsa_legacy_single_rpc_consume(struct parasite_dsa_dump_pages_args *a,
+					  uint8_t *shared_buf,
+					  struct parasite_dsa_shm_hdr *hdr,
+					  uint32_t active_wq_count,
+					  uint32_t *active_wq_idx,
+					  uint64_t *active_wq_load,
+					  int *use_portal,
+					  unsigned long *portal_mask,
+					  unsigned long *portal_offset)
+{
+	struct dsa_dump_descriptor *descriptors;
+	u32 desc_bytes;
+	u32 min_data_off;
+
+	if (!(hdr->flags & PARASITE_DSA_SHM_F_SINGLE_RPC)) {
+		a->op_ret = -EINVAL;
+		return -1;
+	}
+
+	desc_bytes = hdr->desc_count * sizeof(struct dsa_dump_descriptor);
+	if (!hdr->desc_count || hdr->desc_bytes != desc_bytes) {
+		pr_err("DSA legacy single-RPC invalid descriptor count=%u bytes=%u expected=%u\n",
+		       hdr->desc_count, hdr->desc_bytes, desc_bytes);
+		a->op_ret = -EINVAL;
+		return -1;
+	}
+
+	if (a->hdr_off + sizeof(*hdr) > a->shared_buf_size ||
+	    desc_bytes > a->shared_buf_size - (a->hdr_off + sizeof(*hdr))) {
+		a->op_ret = -EINVAL;
+		return -1;
+	}
+
+	min_data_off = (u32)(((a->hdr_off + sizeof(*hdr) + desc_bytes) +
+			     DSA_SHARED_DATA_ALIGN - 1) & ~(DSA_SHARED_DATA_ALIGN - 1));
+	if (hdr->data_off < min_data_off || hdr->data_off > a->shared_buf_size ||
+	    hdr->data_bytes > a->shared_buf_size - hdr->data_off) {
+		pr_err("DSA legacy single-RPC invalid layout desc_bytes=%u data_off=%u min_data_off=%u data_bytes=%u shared=%u\n",
+		       desc_bytes, hdr->data_off, min_data_off, hdr->data_bytes,
+		       a->shared_buf_size);
+		a->op_ret = -EINVAL;
+		return -1;
+	}
+
+	descriptors = (struct dsa_dump_descriptor *)((uint8_t *)hdr + sizeof(*hdr));
+	if (dsa_copy_descs(a, shared_buf, descriptors, hdr->desc_count,
+			   hdr->data_off, hdr->data_bytes, active_wq_count,
+			   active_wq_idx, active_wq_load, use_portal,
+			   portal_mask, portal_offset))
+		return -1;
+
+	a->op_ret = 0;
+	return 0;
+}
+#endif
+
+
 /*
  * Batch DSA dump pages to shared buffer
  * This function performs bulk copy of memory pages using DSA hardware acceleration
@@ -555,6 +613,7 @@ static int dsa_stream_consume(struct parasite_dsa_dump_pages_args *a,
  */
 static int parasite_dsa_dump_pages(struct parasite_dsa_dump_pages_args *a)
 {
+	struct parasite_dsa_dump_pages_args *orig_args = a;
 	struct parasite_dsa_dump_pages_args local_args = *a;
 	int wq_fds[DSA_DUMP_MAX_WQ];
 	int use_portal[DSA_DUMP_MAX_WQ];
@@ -719,12 +778,20 @@ static int parasite_dsa_dump_pages(struct parasite_dsa_dump_pages_args *a)
 		goto out_cleanup;
 	}
 
-	if (!(shm_hdr->flags & PARASITE_DSA_SHM_F_STREAM)) {
-		pr_err("DSA strict: non-streaming shared header is unsupported\n");
+	if (shm_hdr->flags & PARASITE_DSA_SHM_F_STREAM) {
+		stream_hdr = (struct parasite_dsa_stream_hdr *)shm_hdr;
+	}
+#ifdef CRIU_DSA_ENABLE_LEGACY_SINGLE_RPC
+	else if (shm_hdr->flags & PARASITE_DSA_SHM_F_SINGLE_RPC) {
+		stream_hdr = NULL;
+	}
+#endif
+	else {
+		pr_err("DSA strict: unsupported shared header flags=%u\n",
+		       shm_hdr->flags);
 		a->op_ret = -EINVAL;
 		goto out_cleanup;
 	}
-	stream_hdr = (struct parasite_dsa_stream_hdr *)shm_hdr;
 	dsa_wq_cache_init_once();
 
 	/* Initialize all WQ pointers */
@@ -881,11 +948,21 @@ static int parasite_dsa_dump_pages(struct parasite_dsa_dump_pages_args *a)
 	if (setup_end_us > setup_begin_us)
 		a->setup_us = setup_end_us - setup_begin_us;
 
-	dsa_atomic_store_u32(&stream_hdr->consumer_ready, 1);
-	if (dsa_stream_consume(a, shared_buf, stream_hdr, active_wq_count,
-			       active_wq_idx, active_wq_load, use_portal,
-			       portal_mask, portal_offset))
-		goto out_cleanup;
+	if (stream_hdr) {
+		dsa_atomic_store_u32(&stream_hdr->consumer_ready, 1);
+		if (dsa_stream_consume(a, shared_buf, stream_hdr, active_wq_count,
+				       active_wq_idx, active_wq_load, use_portal,
+				       portal_mask, portal_offset))
+			goto out_cleanup;
+	} else {
+#ifdef CRIU_DSA_ENABLE_LEGACY_SINGLE_RPC
+		if (dsa_legacy_single_rpc_consume(a, shared_buf, shm_hdr,
+						  active_wq_count, active_wq_idx,
+						  active_wq_load, use_portal,
+						  portal_mask, portal_offset))
+			goto out_cleanup;
+#endif
+	}
 	goto out_cleanup;
 
 out_cleanup:
@@ -938,6 +1015,7 @@ out_cleanup:
 	}
 
 	out_copy_results:
+	*orig_args = *a;
 	if (stream_hdr) {
 		stream_hdr->result_op_ret = a->op_ret;
 		stream_hdr->result_total_copied = a->total_copied;
@@ -950,6 +1028,11 @@ out_cleanup:
 		stream_hdr->result_cleanup_munmap_us = a->cleanup_munmap_us;
 		stream_hdr->result_cleanup_close_us = a->cleanup_close_us;
 		stream_hdr->result_setup_shared_us = a->setup_shared_us;
+		stream_hdr->result_prefault_us = a->prefault_us;
+		stream_hdr->result_submit_us = a->submit_us;
+		stream_hdr->result_poll_us = a->poll_us;
+		stream_hdr->result_submit_enqcmd = a->submit_enqcmd;
+		stream_hdr->result_submit_write = a->submit_write;
 		__atomic_thread_fence(__ATOMIC_RELEASE);
 	}
 	return 0;
