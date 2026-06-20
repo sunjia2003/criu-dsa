@@ -1594,6 +1594,8 @@ struct frozen_timeline_record {
 static struct frozen_timeline frozen_tl;
 static struct frozen_timeline_record frozen_timeline_last;
 
+static void frozen_detail_reset(void);
+
 static bool frozen_timeline_dsa_mode(void)
 {
 	const char *env;
@@ -1605,6 +1607,7 @@ static bool frozen_timeline_dsa_mode(void)
 void frozen_timeline_begin_after_freeze(void)
 {
 	memset(&frozen_tl, 0, sizeof(frozen_tl));
+	frozen_detail_reset();
 	frozen_tl.active = true;
 	frozen_tl.phase = FROZEN_PHASE_POST_FREEZE_PREP;
 	frozen_tl.start_us = dump_wall_now_us();
@@ -1701,6 +1704,111 @@ static void frozen_timeline_write_csv(void)
 	fclose(f);
 }
 
+
+enum frozen_detail_phase {
+	FROZEN_DETAIL_COLLECT_PSTREE,
+	FROZEN_DETAIL_WS_SNAPSHOT_START,
+	FROZEN_DETAIL_CHECKPOINT_DEVICES,
+	FROZEN_DETAIL_COLLECT_PSTREE_IDS,
+	FROZEN_DETAIL_NETWORK_LOCK,
+	FROZEN_DETAIL_RPC_EXTERNAL_FILES,
+	FROZEN_DETAIL_COLLECT_FILE_LOCKS,
+	FROZEN_DETAIL_COLLECT_NAMESPACES,
+	FROZEN_DETAIL_GLOB_IMGSET_OPEN,
+	FROZEN_DETAIL_SECCOMP_COLLECT,
+	FROZEN_DETAIL_PARENT_INVENTORY,
+	FROZEN_DETAIL_COLLECT_LSM,
+	FROZEN_DETAIL_PARSE_PID_STAT,
+	FROZEN_DETAIL_COLLECT_MAPPINGS,
+	FROZEN_DETAIL_COLLECT_FDS,
+	FROZEN_DETAIL_PARSE_POSIX_TIMERS,
+	FROZEN_DETAIL_DUMP_SIGNALS,
+	FROZEN_DETAIL_DUMP_RSEQ,
+	FROZEN_DETAIL_PARASITE_INFECT,
+	FROZEN_DETAIL_FIXUP_RSEQ,
+	FROZEN_DETAIL_PROC_FD_INSTALL,
+	FROZEN_DETAIL_VDSO_FIXUP,
+	FROZEN_DETAIL_COLLECT_AIOS,
+	FROZEN_DETAIL_DUMP_MISC,
+	FROZEN_DETAIL_OPEN_TASK_IMGSET,
+	FROZEN_DETAIL_DUMP_TASK_IDS,
+	FROZEN_DETAIL_DUMP_FILES,
+	FROZEN_DETAIL_FLUSH_EVENTPOLL,
+	FROZEN_DETAIL_DUMP_SIGACTS,
+	FROZEN_DETAIL_DUMP_ITIMERS,
+	FROZEN_DETAIL_DUMP_POSIX_TIMERS,
+	FROZEN_DETAIL_DUMP_CORE,
+	FROZEN_DETAIL_DUMP_CGROUP,
+	FROZEN_DETAIL_STOP_DAEMON,
+	FROZEN_DETAIL_DUMP_THREADS,
+	FROZEN_DETAIL_CURE,
+	FROZEN_DETAIL_DUMP_MM,
+	FROZEN_DETAIL_DUMP_FS,
+	FROZEN_DETAIL_NR,
+};
+
+struct frozen_detail_timeline {
+	bool enabled;
+	u64 phase_us[FROZEN_DETAIL_NR];
+};
+
+static struct frozen_detail_timeline frozen_detail_tl;
+
+static bool frozen_detail_enabled(void)
+{
+	const char *env = getenv("CRIU_DSA_SCAN_PROFILE");
+
+	return env && atoi(env) > 0;
+}
+
+static void frozen_detail_reset(void)
+{
+	memset(&frozen_detail_tl, 0, sizeof(frozen_detail_tl));
+	frozen_detail_tl.enabled = frozen_detail_enabled();
+}
+
+static u64 frozen_detail_enter(void)
+{
+	return frozen_detail_tl.enabled ? dump_wall_now_us() : 0;
+}
+
+static void frozen_detail_add(int phase, u64 start_us)
+{
+	if (!frozen_detail_tl.enabled || !start_us ||
+	    phase < 0 || phase >= FROZEN_DETAIL_NR)
+		return;
+	frozen_detail_tl.phase_us[phase] +=
+		dump_wall_delta_us(start_us, dump_wall_now_us());
+}
+
+static void frozen_detail_write_csv(int ret)
+{
+	char path[PATH_MAX];
+	FILE *f;
+
+	if (!frozen_detail_tl.enabled || !opts.imgs_dir)
+		return;
+
+	if (snprintf(path, sizeof(path), "%s/frozen_detail_timeline.csv",
+		     opts.imgs_dir) >= sizeof(path)) {
+		pr_err("FROZEN_DETAIL_TIMELINE csv path too long\n");
+		return;
+	}
+
+	f = fopen(path, "w");
+	if (!f) {
+		pr_perror("Failed to open %s", path);
+		return;
+	}
+
+	fprintf(f, "mode,ret,collect_pstree_us,ws_snapshot_start_us,checkpoint_devices_us,collect_pstree_ids_us,network_lock_us,rpc_external_files_us,collect_file_locks_us,collect_namespaces_us,glob_imgset_open_us,seccomp_collect_us,parent_inventory_us,collect_lsm_us,parse_pid_stat_us,collect_mappings_us,collect_fds_us,parse_posix_timers_us,dump_signals_us,dump_rseq_us,parasite_infect_us,fixup_rseq_us,proc_fd_install_us,vdso_fixup_us,collect_aios_us,dump_misc_us,open_task_imgset_us,dump_task_ids_us,dump_files_us,flush_eventpoll_us,dump_sigacts_us,dump_itimers_us,dump_posix_timers_us,dump_core_us,dump_cgroup_us,stop_daemon_us,dump_threads_us,cure_us,dump_mm_us,dump_fs_us\n");
+	fprintf(f, "%s,%d", frozen_timeline_dsa_mode() ? "dsa" : "base", ret);
+	for (int i = 0; i < FROZEN_DETAIL_NR; i++)
+		fprintf(f, ",%llu", (unsigned long long)frozen_detail_tl.phase_us[i]);
+	fprintf(f, "\n");
+	fclose(f);
+}
+
 static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 {
 	pid_t pid = item->pid->real;
@@ -1712,6 +1820,7 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	struct parasite_drain_fd *dfds = NULL;
 	struct proc_posix_timers_stat proc_args;
 	struct mem_dump_ctl mdc;
+	u64 detail_start;
 
 	vm_area_list_init(&vmas);
 
@@ -1728,17 +1837,22 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	frozen_timeline_switch(FROZEN_PHASE_TASK_PREPARE);
 
 	pr_info("Obtaining task stat ... \n");
+	detail_start = frozen_detail_enter();
 	ret = parse_pid_stat(pid, &pps_buf);
+	frozen_detail_add(FROZEN_DETAIL_PARSE_PID_STAT, detail_start);
 	if (ret < 0)
 		goto err;
 
+	detail_start = frozen_detail_enter();
 	ret = collect_mappings(pid, &vmas, dump_filemap);
+	frozen_detail_add(FROZEN_DETAIL_COLLECT_MAPPINGS, detail_start);
 	if (ret) {
 		pr_err("Collect mappings (pid: %d) failed with %d\n", pid, ret);
 		goto err;
 	}
 
 	if (!shared_fdtable(item)) {
+		detail_start = frozen_detail_enter();
 		dfds = xmalloc(sizeof(*dfds));
 		if (!dfds)
 			goto err;
@@ -1750,9 +1864,12 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		}
 
 		parasite_ensure_args_size(drain_fds_size(dfds));
+		frozen_detail_add(FROZEN_DETAIL_COLLECT_FDS, detail_start);
 	}
 
+	detail_start = frozen_detail_enter();
 	ret = parse_posix_timers(pid, &proc_args);
+	frozen_detail_add(FROZEN_DETAIL_PARSE_POSIX_TIMERS, detail_start);
 	if (ret < 0) {
 		pr_err("Can't read posix timers file (pid: %d)\n", pid);
 		goto err;
@@ -1760,25 +1877,33 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 
 	parasite_ensure_args_size(posix_timers_dump_size(proc_args.timer_n));
 
+	detail_start = frozen_detail_enter();
 	ret = dump_task_signals(pid, item);
+	frozen_detail_add(FROZEN_DETAIL_DUMP_SIGNALS, detail_start);
 	if (ret) {
 		pr_err("Dump %d signals failed %d\n", pid, ret);
 		goto err;
 	}
 
+	detail_start = frozen_detail_enter();
 	ret = dump_task_rseq(pid, item);
+	frozen_detail_add(FROZEN_DETAIL_DUMP_RSEQ, detail_start);
 	if (ret) {
 		pr_err("Dump %d rseq failed %d\n", pid, ret);
 		goto err;
 	}
 
+	detail_start = frozen_detail_enter();
 	parasite_ctl = parasite_infect_seized(pid, item, &vmas);
+	frozen_detail_add(FROZEN_DETAIL_PARASITE_INFECT, detail_start);
 	if (!parasite_ctl) {
 		pr_err("Can't infect (pid: %d) with parasite\n", pid);
 		goto err;
 	}
 
+	detail_start = frozen_detail_enter();
 	ret = fixup_thread_rseq(item, 0);
+	frozen_detail_add(FROZEN_DETAIL_FIXUP_RSEQ, detail_start);
 	if (ret) {
 		pr_err("Fixup rseq for %d failed %d\n", pid, ret);
 		goto err;
@@ -1791,6 +1916,7 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 
 	if (root_ns_mask & CLONE_NEWPID && root_item == item) {
 		int pfd;
+		detail_start = frozen_detail_enter();
 
 		pfd = parasite_get_proc_fd_seized(parasite_ctl);
 		if (pfd < 0) {
@@ -1800,21 +1926,28 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 
 		if (install_service_fd(CR_PROC_FD_OFF, pfd) < 0)
 			goto err_cure;
+		frozen_detail_add(FROZEN_DETAIL_PROC_FD_INSTALL, detail_start);
 	}
 
+	detail_start = frozen_detail_enter();
 	ret = parasite_fixup_vdso(parasite_ctl, pid, &vmas);
+	frozen_detail_add(FROZEN_DETAIL_VDSO_FIXUP, detail_start);
 	if (ret) {
 		pr_err("Can't fixup vdso VMAs (pid: %d)\n", pid);
 		goto err_cure;
 	}
 
+	detail_start = frozen_detail_enter();
 	ret = parasite_collect_aios(parasite_ctl, &vmas); /* FIXME -- merge with above */
+	frozen_detail_add(FROZEN_DETAIL_COLLECT_AIOS, detail_start);
 	if (ret) {
 		pr_err("Failed to check aio rings (pid: %d)\n", pid);
 		goto err_cure;
 	}
 
+	detail_start = frozen_detail_enter();
 	ret = parasite_dump_misc_seized(parasite_ctl, &misc);
+	frozen_detail_add(FROZEN_DETAIL_DUMP_MISC, detail_start);
 	if (ret) {
 		pr_err("Can't dump misc (pid: %d)\n", pid);
 		goto err_cure;
@@ -1833,11 +1966,15 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		goto err_cure;
 	}
 
+	detail_start = frozen_detail_enter();
 	cr_imgset = cr_task_imgset_open(vpid(item), O_DUMP);
+	frozen_detail_add(FROZEN_DETAIL_OPEN_TASK_IMGSET, detail_start);
 	if (!cr_imgset)
 		goto err_cure;
 
+	detail_start = frozen_detail_enter();
 	ret = dump_task_ids(item, cr_imgset);
+	frozen_detail_add(FROZEN_DETAIL_DUMP_TASK_IDS, detail_start);
 	if (ret) {
 		pr_err("Dump ids (pid: %d) failed with %d\n", pid, ret);
 		goto err_cure;
@@ -1855,43 +1992,57 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	frozen_timeline_switch(FROZEN_PHASE_OTHER_RESOURCES);
 
 	if (dfds) {
+		detail_start = frozen_detail_enter();
 		ret = dump_task_files_seized(parasite_ctl, item, dfds);
+		frozen_detail_add(FROZEN_DETAIL_DUMP_FILES, detail_start);
 		if (ret) {
 			pr_err("Dump files (pid: %d) failed with %d\n", pid, ret);
 			goto err_cure;
 		}
+		detail_start = frozen_detail_enter();
 		ret = flush_eventpoll_dinfo_queue();
+		frozen_detail_add(FROZEN_DETAIL_FLUSH_EVENTPOLL, detail_start);
 		if (ret) {
 			pr_err("Dump eventpoll (pid: %d) failed with %d\n", pid, ret);
 			goto err_cure;
 		}
 	}
 
+	detail_start = frozen_detail_enter();
 	ret = parasite_dump_sigacts_seized(parasite_ctl, item);
+	frozen_detail_add(FROZEN_DETAIL_DUMP_SIGACTS, detail_start);
 	if (ret) {
 		pr_err("Can't dump sigactions (pid: %d) with parasite\n", pid);
 		goto err_cure;
 	}
 
+	detail_start = frozen_detail_enter();
 	ret = parasite_dump_itimers_seized(parasite_ctl, item);
+	frozen_detail_add(FROZEN_DETAIL_DUMP_ITIMERS, detail_start);
 	if (ret) {
 		pr_err("Can't dump itimers (pid: %d)\n", pid);
 		goto err_cure;
 	}
 
+	detail_start = frozen_detail_enter();
 	ret = parasite_dump_posix_timers_seized(&proc_args, parasite_ctl, item);
+	frozen_detail_add(FROZEN_DETAIL_DUMP_POSIX_TIMERS, detail_start);
 	if (ret) {
 		pr_err("Can't dump posix timers (pid: %d)\n", pid);
 		goto err_cure;
 	}
 
+	detail_start = frozen_detail_enter();
 	ret = dump_task_core_all(parasite_ctl, item, &pps_buf, cr_imgset, &misc);
+	frozen_detail_add(FROZEN_DETAIL_DUMP_CORE, detail_start);
 	if (ret) {
 		pr_err("Dump core (pid: %d) failed with %d\n", pid, ret);
 		goto err_cure;
 	}
 
+	detail_start = frozen_detail_enter();
 	ret = dump_task_cgroup(parasite_ctl, item);
+	frozen_detail_add(FROZEN_DETAIL_DUMP_CGROUP, detail_start);
 	if (ret) {
 		pr_err("Dump cgroup of threads in process (pid: %d) failed with %d\n", pid, ret);
 		goto err_cure;
@@ -1908,13 +2059,17 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		frozen_timeline_switch(FROZEN_PHASE_OTHER_RESOURCES);
 	}
 
+	detail_start = frozen_detail_enter();
 	ret = compel_stop_daemon(parasite_ctl);
+	frozen_detail_add(FROZEN_DETAIL_STOP_DAEMON, detail_start);
 	if (ret) {
 		pr_err("Can't stop daemon in parasite (pid: %d)\n", pid);
 		goto err_cure;
 	}
 
+	detail_start = frozen_detail_enter();
 	ret = dump_task_threads(parasite_ctl, item);
+	frozen_detail_add(FROZEN_DETAIL_DUMP_THREADS, detail_start);
 	if (ret) {
 		pr_err("Can't dump threads\n");
 		goto err_cure;
@@ -1924,22 +2079,28 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	 * On failure local map will be cured in cr_dump_finish()
 	 * for lazy pages.
 	 */
+	detail_start = frozen_detail_enter();
 	if (opts.lazy_pages)
 		ret = compel_cure_remote(parasite_ctl);
 	else
 		ret = compel_cure(parasite_ctl);
+	frozen_detail_add(FROZEN_DETAIL_CURE, detail_start);
 	if (ret) {
 		pr_err("Can't cure (pid: %d) from parasite\n", pid);
 		goto err;
 	}
 
+	detail_start = frozen_detail_enter();
 	ret = dump_task_mm(pid, &pps_buf, &misc, &vmas, cr_imgset);
+	frozen_detail_add(FROZEN_DETAIL_DUMP_MM, detail_start);
 	if (ret) {
 		pr_err("Dump mappings (pid: %d) failed with %d\n", pid, ret);
 		goto err;
 	}
 
+	detail_start = frozen_detail_enter();
 	ret = dump_task_fs(pid, &misc, cr_imgset);
+	frozen_detail_add(FROZEN_DETAIL_DUMP_FS, detail_start);
 	if (ret) {
 		pr_err("Dump fs (pid: %d) failed with %d\n", pid, ret);
 		goto err;
@@ -2486,6 +2647,7 @@ static int cr_dump_finish(int ret)
 	timing_stop(TIME_FROZEN);
 	frozen_timeline_finish(ret || post_dump_ret);
 	frozen_timeline_write_csv();
+	frozen_detail_write_csv(ret || post_dump_ret);
 	memdump_timeline_write_csv();
 
 	if (!ret && !post_dump_ret && opts.final_state == TASK_ALIVE)
@@ -2535,6 +2697,7 @@ int cr_dump_tasks(pid_t pid)
 	struct pstree_item *item;
 	int ret;
 	int exit_code = -1;
+	u64 detail_start;
 
 	kerndat_warn_about_madv_guards();
 
@@ -2623,44 +2786,78 @@ int cr_dump_tasks(pid_t pid)
 		}
 	}
 
-	if (collect_pstree())
+	detail_start = frozen_detail_enter();
+	ret = collect_pstree();
+	frozen_detail_add(FROZEN_DETAIL_COLLECT_PSTREE, detail_start);
+	if (ret)
 		goto err;
 
-	if (ws_snapshot_ctx_enabled(&dump_ws_snapshot) &&
-	    ws_snapshot_start(&dump_ws_snapshot)) {
+	detail_start = frozen_detail_enter();
+	ret = ws_snapshot_ctx_enabled(&dump_ws_snapshot) ?
+		ws_snapshot_start(&dump_ws_snapshot) : 0;
+	frozen_detail_add(FROZEN_DETAIL_WS_SNAPSHOT_START, detail_start);
+	if (ret) {
 		pr_err("Failed to start workspace snapshot thread\n");
 		goto err;
 	}
 
-	if (checkpoint_devices())
+	detail_start = frozen_detail_enter();
+	ret = checkpoint_devices();
+	frozen_detail_add(FROZEN_DETAIL_CHECKPOINT_DEVICES, detail_start);
+	if (ret)
 		goto err;
 
-	if (collect_pstree_ids())
+	detail_start = frozen_detail_enter();
+	ret = collect_pstree_ids();
+	frozen_detail_add(FROZEN_DETAIL_COLLECT_PSTREE_IDS, detail_start);
+	if (ret)
 		goto err;
 
-	if (network_lock())
+	detail_start = frozen_detail_enter();
+	ret = network_lock();
+	frozen_detail_add(FROZEN_DETAIL_NETWORK_LOCK, detail_start);
+	if (ret)
 		goto err;
 
-	if (rpc_query_external_files())
+	detail_start = frozen_detail_enter();
+	ret = rpc_query_external_files();
+	frozen_detail_add(FROZEN_DETAIL_RPC_EXTERNAL_FILES, detail_start);
+	if (ret)
 		goto err;
 
-	if (collect_file_locks())
+	detail_start = frozen_detail_enter();
+	ret = collect_file_locks();
+	frozen_detail_add(FROZEN_DETAIL_COLLECT_FILE_LOCKS, detail_start);
+	if (ret)
 		goto err;
 
-	if (collect_namespaces(true) < 0)
+	detail_start = frozen_detail_enter();
+	ret = collect_namespaces(true);
+	frozen_detail_add(FROZEN_DETAIL_COLLECT_NAMESPACES, detail_start);
+	if (ret < 0)
 		goto err;
 
+	detail_start = frozen_detail_enter();
 	glob_imgset = cr_glob_imgset_open(O_DUMP);
+	frozen_detail_add(FROZEN_DETAIL_GLOB_IMGSET_OPEN, detail_start);
 	if (!glob_imgset)
 		goto err;
 
-	if (seccomp_collect_dump_filters() < 0)
+	detail_start = frozen_detail_enter();
+	ret = seccomp_collect_dump_filters();
+	frozen_detail_add(FROZEN_DETAIL_SECCOMP_COLLECT, detail_start);
+	if (ret < 0)
 		goto err;
 
 	/* Errors handled later in detect_pid_reuse */
+	detail_start = frozen_detail_enter();
 	parent_ie = get_parent_inventory();
+	frozen_detail_add(FROZEN_DETAIL_PARENT_INVENTORY, detail_start);
 
-	if (collect_and_suspend_lsm() < 0)
+	detail_start = frozen_detail_enter();
+	ret = collect_and_suspend_lsm();
+	frozen_detail_add(FROZEN_DETAIL_COLLECT_LSM, detail_start);
+	if (ret < 0)
 		goto err;
 
 	for_each_pstree_item(item) {

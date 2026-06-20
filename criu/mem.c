@@ -1506,7 +1506,7 @@ static void temp_cdf_collect_one(u64 start, u64 len)
 void temp_cdf_dump_begin(void)
 {
 	memset(&g_temp_cdf_stats, 0, sizeof(g_temp_cdf_stats));
-	g_temp_cdf_stats.enabled = true;
+	g_temp_cdf_stats.enabled = dsa_scan_profile_enabled();
 	temp_cdf_reset_prev();
 }
 
@@ -1656,8 +1656,14 @@ struct dsa_desc_scan_ctx {
 	u64 scan_dump_pages;
 	u64 scan_hole_pages;
 	u64 scan_lazy_pages;
+	u64 scan_wall_us;
 	u64 should_dump_us;
+	u64 lazy_stack_check_us;
+	u64 parent_coverage_us;
 	u64 page_pipe_us;
+	u64 page_pipe_hole_us;
+	u64 page_pipe_page_us;
+	u64 raw_flush_us;
 	u64 raw_cdf_us;
 	u64 desc_append_us;
 	u64 flush_slot_us;
@@ -1968,22 +1974,29 @@ static void dsa_desc_scan_reset_batch(struct dsa_desc_scan_ctx *sc)
 
 static void dsa_desc_scan_raw_flush(struct dsa_desc_scan_ctx *sc)
 {
-	u64 t0 = 0;
+	u64 flush_t0 = 0;
+	u64 cdf_t0 = 0;
 	u64 t1;
 
 	if (!sc->raw_has_extent)
 		return;
 
 	if (sc->scan_profile)
-		t0 = dsa_wall_now_us();
+		flush_t0 = dsa_wall_now_us();
+	if (sc->scan_profile)
+		cdf_t0 = dsa_wall_now_us();
 	temp_cdf_collect_one(sc->raw_start, sc->raw_len);
 	if (sc->scan_profile) {
 		t1 = dsa_wall_now_us();
-		sc->raw_cdf_us += dsa_wall_delta_us(t0, t1);
+		sc->raw_cdf_us += dsa_wall_delta_us(cdf_t0, t1);
 	}
 	sc->raw_has_extent = false;
 	sc->raw_start = 0;
 	sc->raw_len = 0;
+	if (sc->scan_profile) {
+		t1 = dsa_wall_now_us();
+		sc->raw_flush_us += dsa_wall_delta_us(flush_t0, t1);
+	}
 }
 
 #ifdef CRIU_DSA_ENABLE_LEGACY_SINGLE_RPC
@@ -2200,25 +2213,38 @@ static int dsa_stream_finish(struct dsa_desc_scan_ctx *sc)
 			sc->rpc_args.submit_enqcmd,
 			sc->rpc_args.submit_write);
 	if (sc->scan_profile)
-		pr_info("DSA_SCAN_HOST_PROFILE: mode=streaming scan_pages=%llu dump_pages=%llu hole_pages=%llu lazy_pages=%llu should_dump_us=%llu page_pipe_us=%llu raw_cdf_us=%llu desc_append_us=%llu flush_slot_us=%llu flush_nonwait_us=%llu flush_desc_sum_us=%llu flush_desc_memcpy_us=%llu flush_publish_us=%llu host_nonwait_us=%llu\n",
-			(unsigned long long)sc->scan_pages,
-			(unsigned long long)sc->scan_dump_pages,
-			(unsigned long long)sc->scan_hole_pages,
-			(unsigned long long)sc->scan_lazy_pages,
-			(unsigned long long)sc->should_dump_us,
-			(unsigned long long)sc->page_pipe_us,
-			(unsigned long long)sc->raw_cdf_us,
-			(unsigned long long)sc->desc_append_us,
-			(unsigned long long)sc->flush_slot_us,
-			(unsigned long long)(sc->flush_slot_us >= sc->producer_wait_slot_us ?
-				sc->flush_slot_us - sc->producer_wait_slot_us : 0),
-			(unsigned long long)sc->flush_desc_sum_us,
-			(unsigned long long)sc->flush_desc_memcpy_us,
-			(unsigned long long)sc->flush_publish_us,
-			(unsigned long long)(sc->should_dump_us + sc->page_pipe_us +
-				sc->raw_cdf_us + sc->desc_append_us +
-				(sc->flush_slot_us >= sc->producer_wait_slot_us ?
-				 sc->flush_slot_us - sc->producer_wait_slot_us : 0)));
+		{
+			u64 flush_nonwait_us = sc->flush_slot_us >= sc->producer_wait_slot_us ?
+				sc->flush_slot_us - sc->producer_wait_slot_us : 0;
+			u64 scan_accounted_us = sc->should_dump_us + sc->lazy_stack_check_us +
+				sc->parent_coverage_us + sc->page_pipe_us + sc->raw_flush_us +
+				sc->desc_append_us + flush_nonwait_us;
+			u64 scan_misc_us = sc->scan_wall_us >= scan_accounted_us ?
+				sc->scan_wall_us - scan_accounted_us : 0;
+
+			pr_info("DSA_SCAN_HOST_PROFILE: mode=streaming scan_pages=%llu dump_pages=%llu hole_pages=%llu lazy_pages=%llu scan_wall_us=%llu should_dump_us=%llu lazy_stack_check_us=%llu parent_coverage_us=%llu page_pipe_us=%llu page_pipe_hole_us=%llu page_pipe_page_us=%llu raw_flush_us=%llu raw_cdf_us=%llu desc_append_us=%llu flush_slot_us=%llu flush_nonwait_us=%llu flush_desc_sum_us=%llu flush_desc_memcpy_us=%llu flush_publish_us=%llu host_nonwait_us=%llu scan_misc_us=%llu\n",
+				(unsigned long long)sc->scan_pages,
+				(unsigned long long)sc->scan_dump_pages,
+				(unsigned long long)sc->scan_hole_pages,
+				(unsigned long long)sc->scan_lazy_pages,
+				(unsigned long long)sc->scan_wall_us,
+				(unsigned long long)sc->should_dump_us,
+				(unsigned long long)sc->lazy_stack_check_us,
+				(unsigned long long)sc->parent_coverage_us,
+				(unsigned long long)sc->page_pipe_us,
+				(unsigned long long)sc->page_pipe_hole_us,
+				(unsigned long long)sc->page_pipe_page_us,
+				(unsigned long long)sc->raw_flush_us,
+				(unsigned long long)sc->raw_cdf_us,
+				(unsigned long long)sc->desc_append_us,
+				(unsigned long long)sc->flush_slot_us,
+				(unsigned long long)flush_nonwait_us,
+				(unsigned long long)sc->flush_desc_sum_us,
+				(unsigned long long)sc->flush_desc_memcpy_us,
+				(unsigned long long)sc->flush_publish_us,
+				(unsigned long long)scan_accounted_us,
+				(unsigned long long)scan_misc_us);
+		}
 
 	return 0;
 }
@@ -2991,45 +3017,76 @@ static int generate_iovs_dsa_desc_scan(struct pstree_item *item,
 		}
 
 		if (!dump_all_pages && page_info.next != vaddr) {
-			dsa_desc_scan_raw_flush(sc);
+			if (sc->scan_profile)
+				dsa_desc_scan_raw_flush(sc);
 			vaddr = page_info.next - PAGE_SIZE;
 			continue;
 		}
 
+		if (sc->scan_profile)
+			t0 = dsa_wall_now_us();
 		if (vma_entry_can_be_lazy(vma->e) && !is_stack(item, vaddr))
 			ppb_flags |= PPB_LAZY;
+		if (sc->scan_profile) {
+			t1 = dsa_wall_now_us();
+			sc->lazy_stack_check_us += dsa_wall_delta_us(t0, t1);
+		}
 
-		if (has_parent && page_in_parent(page_info.softdirty) &&
-		    dsa_parent_coverage_contains_range(&dsa_parent_coverage_prev, vaddr, PAGE_SIZE)) {
-			dsa_desc_scan_raw_flush(sc);
-			if (sc->scan_profile)
-				t0 = dsa_wall_now_us();
-			ret = page_pipe_add_hole(pp, vaddr, PP_HOLE_PARENT);
-			if (sc->scan_profile) {
-				t1 = dsa_wall_now_us();
-				sc->page_pipe_us += dsa_wall_delta_us(t0, t1);
+		{
+			bool in_parent = false;
+
+			if (has_parent && page_in_parent(page_info.softdirty)) {
+				if (sc->scan_profile)
+					t0 = dsa_wall_now_us();
+				in_parent = dsa_parent_coverage_contains_range(&dsa_parent_coverage_prev,
+								     vaddr, PAGE_SIZE);
+				if (sc->scan_profile) {
+					t1 = dsa_wall_now_us();
+					sc->parent_coverage_us += dsa_wall_delta_us(t0, t1);
+				}
 			}
-			st = 0;
-		} else {
-			if (sc->scan_profile)
-				t0 = dsa_wall_now_us();
-			ret = page_pipe_add_page_unbounded(pp, vaddr, ppb_flags);
-			if (sc->scan_profile) {
-				t1 = dsa_wall_now_us();
-				sc->page_pipe_us += dsa_wall_delta_us(t0, t1);
+
+			if (in_parent) {
+				if (sc->scan_profile)
+					dsa_desc_scan_raw_flush(sc);
+				if (sc->scan_profile)
+					t0 = dsa_wall_now_us();
+				ret = page_pipe_add_hole(pp, vaddr, PP_HOLE_PARENT);
+				if (sc->scan_profile) {
+					u64 delta;
+
+					t1 = dsa_wall_now_us();
+					delta = dsa_wall_delta_us(t0, t1);
+					sc->page_pipe_us += delta;
+					sc->page_pipe_hole_us += delta;
+				}
+				st = 0;
+			} else {
+				if (sc->scan_profile)
+					t0 = dsa_wall_now_us();
+				ret = page_pipe_add_page_unbounded(pp, vaddr, ppb_flags);
+				if (sc->scan_profile) {
+					u64 delta;
+
+					t1 = dsa_wall_now_us();
+					delta = dsa_wall_delta_us(t0, t1);
+					sc->page_pipe_us += delta;
+					sc->page_pipe_page_us += delta;
+				}
+				if (!ret) {
+					if (sc->scan_profile)
+						dsa_desc_scan_raw_append(sc,
+							(u64)(unsigned long)vaddr,
+							PAGE_SIZE);
+					ret = dsa_desc_scan_batch_append(sc,
+						(u64)(unsigned long)vaddr,
+						PAGE_SIZE);
+				}
+				if (ppb_flags & PPB_LAZY && opts.lazy_pages)
+					st = 1;
+				else
+					st = 2;
 			}
-			if (!ret) {
-				dsa_desc_scan_raw_append(sc,
-					(u64)(unsigned long)vaddr,
-					PAGE_SIZE);
-				ret = dsa_desc_scan_batch_append(sc,
-					(u64)(unsigned long)vaddr,
-					PAGE_SIZE);
-			}
-			if (ppb_flags & PPB_LAZY && opts.lazy_pages)
-				st = 1;
-			else
-				st = 2;
 		}
 
 		if (ret)
@@ -3344,11 +3401,13 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	if (mdc->parent_ie)
 		parent_predump_mode = mdc->parent_ie->pre_dump_mode;
 
-	if (dsa_desc_scan_active) {
+	if (dsa_desc_scan_active && dsa_sc.scan_profile) {
 		temp_cdf_dump_task_boundary();
 	}
 
 	memdump_timeline_switch(timeline, MEMDUMP_PHASE_SCAN_BUILD);
+	if (dsa_desc_scan_active && dsa_sc.scan_profile)
+		dsa_sc.scan_wall_us = dsa_wall_now_us();
 	list_for_each_entry(vma_area, &vma_area_list->h, list) {
 		if (vma_area_is(vma_area, VMA_AREA_GUARD))
 			continue;
@@ -3368,7 +3427,10 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	}
 
 	if (dsa_desc_scan_active) {
-		dsa_desc_scan_raw_flush(&dsa_sc);
+		if (dsa_sc.scan_profile)
+			dsa_desc_scan_raw_flush(&dsa_sc);
+		if (dsa_sc.scan_profile)
+			dsa_sc.scan_wall_us = dsa_wall_delta_us(dsa_sc.scan_wall_us, dsa_wall_now_us());
 	}
 
 	if (dsa_desc_scan_active && dsa_desc_scan_ready) {

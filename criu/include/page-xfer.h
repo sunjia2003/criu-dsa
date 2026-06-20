@@ -7,6 +7,8 @@ struct ps_info {
 	unsigned short port;
 };
 
+struct hot_apply_ctx;
+
 extern int cr_page_server(bool daemon_mode, bool lazy_dump, int cfd);
 
 /* User buffer for read-mode pre-dump*/
@@ -46,6 +48,7 @@ struct page_xfer {
 	};
 
 	struct page_read *parent;
+	struct hot_apply_ctx *hot_apply;
 };
 
 extern int open_page_xfer(struct page_xfer *xfer, int fd_type, unsigned long id);
