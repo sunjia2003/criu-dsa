@@ -8,9 +8,13 @@
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <dirent.h>
+#include <linux/idxd.h>
 #include <time.h>
 #include <errno.h>
 #include <inttypes.h>
+#include <limits.h>
+#include <stdlib.h>
 #include <string.h>
 
 #undef LOG_PREFIX
@@ -31,6 +35,12 @@
 #include "rst_info.h"
 #include "stats.h"
 #include "tls.h"
+
+#define HOT_APPLY_SCRATCH_PAGES 32
+#define HOT_DSA_PORTAL_MAP_SIZE 0x1000UL
+#define HOT_DSA_MAX_WQ 16
+#define HOT_DSA_MAX_ENQ_RETRY 1000000U
+#define HOT_DSA_MAX_POLL_RETRY 1000000U
 
 static int page_server_sk = -1;
 
@@ -68,7 +78,32 @@ struct hot_apply_ctx {
 	uint64_t append_time_us;
 	uint64_t reorder_time_us;
 	uint64_t moved_pages;
+	uint64_t moved_ranges;
+	uint64_t range_count;
+	uint64_t max_range_pages;
+	uint64_t patch_pages;
+	uint64_t patch_ranges;
 	uint64_t scratch_uses;
+	uint64_t scratch_bytes;
+	uint64_t dsa_copy_pages;
+	uint64_t dsa_copy_ranges;
+	uint64_t dsa_copy_bytes;
+	uint64_t dsa_submit_us;
+	uint64_t dsa_poll_us;
+	uint64_t dsa_enqcmd;
+	uint64_t dsa_submit_batches;
+	uint64_t dsa_max_batch_ranges;
+	uint64_t ready_scan_us;
+	uint64_t ready_rounds;
+	uint64_t ready_empty_rounds;
+	void *map;
+	size_t map_size;
+	off_t file_size;
+	int dsa_wq_count;
+	int dsa_wq_fds[HOT_DSA_MAX_WQ];
+	void *dsa_portals[HOT_DSA_MAX_WQ];
+	unsigned long dsa_portal_offset[HOT_DSA_MAX_WQ];
+	unsigned int dsa_next_wq;
 	struct hot_apply_extent pending;
 };
 
@@ -76,6 +111,20 @@ struct hot_old_range {
 	unsigned long vaddr;
 	unsigned long len;
 	off_t off;
+};
+
+struct hot_move_range {
+	off_t src_page;
+	off_t dst_page;
+	size_t nr_pages;
+	bool pending;
+	bool scratch;
+	bool patch;
+};
+
+struct hot_page_source {
+	off_t src_page;
+	bool patch;
 };
 
 static uint64_t hot_now_us(void)
@@ -96,6 +145,505 @@ static bool dsa_hot_apply_enabled(void)
 	       dsa && strcmp(dsa, "1") == 0;
 }
 
+static inline int hot_dsa_enqcmd(void *portal_slot, const void *desc)
+{
+#if defined(__x86_64__)
+	unsigned char retry = 0;
+
+	asm volatile(
+		"sfence\n\t"
+		".byte 0xf2, 0x0f, 0x38, 0xf8, 0x02\n\t"
+		"setz %0\n\t"
+		: "=r"(retry)
+		: "a"(portal_slot), "d"(desc)
+		: "memory", "cc");
+
+	return (int)retry;
+#else
+	(void)portal_slot;
+	(void)desc;
+	return 1;
+#endif
+}
+
+static inline void hot_dsa_cpu_relax(void)
+{
+#if defined(__x86_64__)
+	asm volatile("pause" ::: "memory");
+#else
+	asm volatile("" ::: "memory");
+#endif
+}
+
+static void hot_dsa_prefault_range(void *addr, unsigned long bytes, bool write)
+{
+	volatile char *p = addr;
+	unsigned long i;
+	volatile char sink = 0;
+
+	if (!addr || !bytes)
+		return;
+
+	for (i = 0; i < bytes; i += PAGE_SIZE) {
+		sink ^= p[i];
+		if (write)
+			p[i] = p[i];
+	}
+	sink ^= p[bytes - 1];
+	if (write)
+		p[bytes - 1] = p[bytes - 1];
+
+	(void)sink;
+}
+
+static size_t hot_align_up_size(size_t val, size_t align)
+{
+	return (val + align - 1) & ~(align - 1);
+}
+
+static int hot_read_small_file(const char *path, char *buf, size_t len)
+{
+	int fd;
+	ssize_t ret;
+
+	if (!len)
+		return -1;
+
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return -1;
+
+	ret = read(fd, buf, len - 1);
+	close(fd);
+	if (ret <= 0)
+		return -1;
+
+	buf[ret] = '\0';
+	return 0;
+}
+
+static int hot_dsa_collect_workqueues(char paths[HOT_DSA_MAX_WQ][64])
+{
+	DIR *dir;
+	struct dirent *de;
+	int nr = 0;
+	int i;
+
+	for (i = 0; i < HOT_DSA_MAX_WQ; i++)
+		paths[i][0] = '\0';
+
+	dir = opendir("/dev/dsa");
+	if (!dir)
+		return 0;
+
+	while ((de = readdir(dir)) && nr < HOT_DSA_MAX_WQ) {
+		char type_path[160];
+		char state_path[160];
+		char type_buf[32];
+		char state_buf[32];
+		int n;
+
+		if (strncmp(de->d_name, "wq", 2))
+			continue;
+
+		n = snprintf(type_path, sizeof(type_path),
+			     "/sys/bus/dsa/devices/%s/type", de->d_name);
+		if (n < 0 || n >= (int)sizeof(type_path))
+			continue;
+		n = snprintf(state_path, sizeof(state_path),
+			     "/sys/bus/dsa/devices/%s/state", de->d_name);
+		if (n < 0 || n >= (int)sizeof(state_path))
+			continue;
+
+		if (hot_read_small_file(type_path, type_buf, sizeof(type_buf)))
+			continue;
+		if (strncmp(type_buf, "user", 4))
+			continue;
+		if (hot_read_small_file(state_path, state_buf, sizeof(state_buf)))
+			continue;
+		if (strncmp(state_buf, "enabled", 7))
+			continue;
+
+		n = snprintf(paths[nr], sizeof(paths[nr]), "/dev/dsa/%s", de->d_name);
+		if (n < 0 || n >= (int)sizeof(paths[nr]))
+			continue;
+		nr++;
+	}
+
+	closedir(dir);
+	return nr;
+}
+
+static void hot_dsa_close(struct hot_apply_ctx *ctx)
+{
+	int i;
+
+	for (i = 0; i < ctx->dsa_wq_count; i++) {
+		if (ctx->dsa_portals[i] && ctx->dsa_portals[i] != MAP_FAILED)
+			munmap(ctx->dsa_portals[i], HOT_DSA_PORTAL_MAP_SIZE);
+		ctx->dsa_portals[i] = MAP_FAILED;
+
+		if (ctx->dsa_wq_fds[i] >= 0)
+			close(ctx->dsa_wq_fds[i]);
+		ctx->dsa_wq_fds[i] = -1;
+	}
+
+	ctx->dsa_wq_count = 0;
+}
+
+static int hot_dsa_open(struct hot_apply_ctx *ctx)
+{
+	char paths[HOT_DSA_MAX_WQ][64];
+	int nr;
+	int i;
+
+	for (i = 0; i < HOT_DSA_MAX_WQ; i++) {
+		ctx->dsa_wq_fds[i] = -1;
+		ctx->dsa_portals[i] = MAP_FAILED;
+		ctx->dsa_portal_offset[i] = 0;
+	}
+
+	nr = hot_dsa_collect_workqueues(paths);
+	if (nr <= 0) {
+		pr_err("DSA hot apply requires DSA reorder, but no enabled user WQ is available\n");
+		return -1;
+	}
+
+	for (i = 0; i < nr; i++) {
+		ctx->dsa_wq_fds[i] = open(paths[i], O_RDWR | O_CLOEXEC);
+		if (ctx->dsa_wq_fds[i] < 0) {
+			pr_perror("DSA hot apply can't open workqueue %s", paths[i]);
+			goto err;
+		}
+
+		ctx->dsa_portals[i] = mmap(NULL, HOT_DSA_PORTAL_MAP_SIZE,
+					   PROT_WRITE, MAP_SHARED | MAP_POPULATE,
+					   ctx->dsa_wq_fds[i], 0);
+		if (ctx->dsa_portals[i] == MAP_FAILED) {
+			pr_perror("DSA hot apply can't mmap workqueue portal %s", paths[i]);
+			goto err;
+		}
+	}
+
+	ctx->dsa_wq_count = nr;
+	ctx->dsa_next_wq = 0;
+	pr_info("DSA hot apply reorder opened %d DSA workqueues\n", nr);
+	return 0;
+
+err:
+	ctx->dsa_wq_count = nr;
+	hot_dsa_close(ctx);
+	return -1;
+}
+
+static int hot_apply_remap_current(struct hot_apply_ctx *ctx, off_t need_size)
+{
+	size_t map_size;
+	void *map;
+
+	if (need_size < 0)
+		return -1;
+
+	map_size = hot_align_up_size((size_t)need_size, PAGE_SIZE);
+	if (!map_size)
+		map_size = PAGE_SIZE;
+
+	if (ctx->map && ctx->map != MAP_FAILED && ctx->map_size >= map_size) {
+		if (need_size > ctx->file_size)
+			ctx->file_size = need_size;
+		return 0;
+	}
+
+	if (ftruncate(ctx->append_fd, (off_t)map_size)) {
+		pr_perror("DSA hot apply can't extend current pages for mmap");
+		return -1;
+	}
+
+	map = mmap(NULL, map_size, PROT_READ | PROT_WRITE, MAP_SHARED,
+		   ctx->append_fd, 0);
+	if (map == MAP_FAILED) {
+		pr_perror("DSA hot apply can't mmap current pages for DSA reorder");
+		return -1;
+	}
+
+	if (ctx->map && ctx->map != MAP_FAILED)
+		munmap(ctx->map, ctx->map_size);
+
+	ctx->map = map;
+	ctx->map_size = map_size;
+	ctx->file_size = need_size;
+	return 0;
+}
+
+static void hot_apply_unmap_current(struct hot_apply_ctx *ctx)
+{
+	if (ctx->map && ctx->map != MAP_FAILED)
+		munmap(ctx->map, ctx->map_size);
+	ctx->map = MAP_FAILED;
+	ctx->map_size = 0;
+	ctx->file_size = 0;
+}
+
+static int hot_dsa_copy_bytes(struct hot_apply_ctx *ctx, off_t src, off_t dst,
+			      unsigned long bytes)
+{
+	struct dsa_hw_desc desc __attribute__((aligned(64)));
+	volatile struct dsa_completion_record comp __attribute__((aligned(32)));
+	uint32_t retry_count;
+	uint32_t poll_count;
+	unsigned int wq_idx;
+	unsigned long off;
+	unsigned long portal_mask;
+	void *slot;
+	uint64_t start_us = 0;
+	uint64_t end_us = 0;
+
+	if (!bytes)
+		return 0;
+	if (src < 0 || dst < 0 || (uint64_t)bytes > UINT_MAX) {
+		pr_err("DSA hot apply invalid copy src=%" PRId64 " dst=%" PRId64 " bytes=%lu\n",
+		       (int64_t)src, (int64_t)dst, bytes);
+		return -1;
+	}
+	if (!ctx->map || ctx->map == MAP_FAILED ||
+	    (size_t)src + bytes > ctx->map_size ||
+	    (size_t)dst + bytes > ctx->map_size) {
+		pr_err("DSA hot apply copy outside mmap src=%" PRId64 " dst=%" PRId64 " bytes=%lu map=%zu\n",
+		       (int64_t)src, (int64_t)dst, bytes, ctx->map_size);
+		return -1;
+	}
+	if (ctx->dsa_wq_count <= 0) {
+		pr_err("DSA hot apply has no DSA workqueue for reorder copy\n");
+		return -1;
+	}
+
+	wq_idx = ctx->dsa_next_wq++ % (unsigned int)ctx->dsa_wq_count;
+	portal_mask = ((unsigned long)ctx->dsa_portals[wq_idx]) & ~0xfffUL;
+
+	memset(&desc, 0, sizeof(desc));
+	memset((void *)&comp, 0, sizeof(comp));
+
+	hot_dsa_prefault_range((char *)ctx->map + src, bytes, false);
+	hot_dsa_prefault_range((char *)ctx->map + dst, bytes, true);
+
+	desc.opcode = DSA_OPCODE_MEMMOVE;
+	desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR | IDXD_OP_FLAG_BOF;
+	desc.src_addr = (uint64_t)(unsigned long)((char *)ctx->map + src);
+	desc.dst_addr = (uint64_t)(unsigned long)((char *)ctx->map + dst);
+	desc.xfer_size = (uint32_t)bytes;
+	desc.completion_addr = (uint64_t)(unsigned long)&comp;
+
+	start_us = hot_now_us();
+	for (retry_count = 0; retry_count < HOT_DSA_MAX_ENQ_RETRY; retry_count++) {
+		off = ((ctx->dsa_portal_offset[wq_idx]++ << 6) & 0xfffUL);
+		slot = (void *)(portal_mask | off);
+		if (hot_dsa_enqcmd(slot, &desc) == 0) {
+			ctx->dsa_enqcmd++;
+			break;
+		}
+		hot_dsa_cpu_relax();
+	}
+	end_us = hot_now_us();
+	if (end_us > start_us)
+		ctx->dsa_submit_us += end_us - start_us;
+
+	if (retry_count == HOT_DSA_MAX_ENQ_RETRY) {
+		pr_err("DSA hot apply enqcmd timed out\n");
+		return -1;
+	}
+
+	start_us = hot_now_us();
+	for (poll_count = 0; poll_count < HOT_DSA_MAX_POLL_RETRY; poll_count++) {
+		uint8_t status = comp.status;
+		uint8_t code = (uint8_t)DSA_COMP_STATUS(status);
+
+		if (status != 0 && code != DSA_COMP_NONE) {
+			end_us = hot_now_us();
+			if (end_us > start_us)
+				ctx->dsa_poll_us += end_us - start_us;
+			if (code == DSA_COMP_SUCCESS || code == DSA_COMP_SUCCESS_PRED)
+				return 0;
+			pr_err("DSA hot apply completion failed status=%u code=%u\n",
+			       status, code);
+			return -1;
+		}
+		hot_dsa_cpu_relax();
+	}
+
+	end_us = hot_now_us();
+	if (end_us > start_us)
+		ctx->dsa_poll_us += end_us - start_us;
+	pr_err("DSA hot apply completion timed out\n");
+	return -1;
+}
+
+static int hot_dsa_alloc_aligned(void **ptr, size_t align, size_t size)
+{
+	int ret;
+
+	*ptr = NULL;
+	ret = posix_memalign(ptr, align, size);
+	if (ret) {
+		errno = ret;
+		pr_perror("DSA hot apply can't allocate aligned buffer");
+		return -1;
+	}
+	memset(*ptr, 0, size);
+	return 0;
+}
+
+static int hot_dsa_submit_range_batch(struct hot_apply_ctx *ctx,
+				      struct hot_move_range *ranges,
+				      size_t *batch, size_t batch_count)
+{
+	struct dsa_hw_desc *descs = NULL;
+	volatile struct dsa_completion_record *comps = NULL;
+	size_t *submitted = NULL;
+	size_t submitted_count = 0;
+	uint64_t start_us = 0;
+	uint64_t end_us = 0;
+	size_t i;
+	int ret = -1;
+
+	if (!batch_count)
+		return 0;
+	if (ctx->dsa_wq_count <= 0) {
+		pr_err("DSA hot apply has no DSA workqueue for batch copy\n");
+		return -1;
+	}
+
+	if (hot_dsa_alloc_aligned((void **)&descs, 64,
+				  batch_count * sizeof(descs[0])))
+		goto out;
+	if (hot_dsa_alloc_aligned((void **)&comps, 32,
+				  batch_count * sizeof(comps[0])))
+		goto out;
+	submitted = xmalloc(batch_count * sizeof(submitted[0]));
+	if (!submitted)
+		goto out;
+
+	for (i = 0; i < batch_count; i++) {
+		struct hot_move_range *r = &ranges[batch[i]];
+		unsigned long bytes;
+		off_t src;
+		off_t dst;
+
+		if (r->src_page == r->dst_page)
+			continue;
+		if (r->nr_pages > UINT_MAX / PAGE_SIZE) {
+			pr_err("DSA hot apply range too large for DSA xfer: pages=%zu\n",
+			       r->nr_pages);
+			goto submit_done;
+		}
+
+		bytes = (unsigned long)r->nr_pages * PAGE_SIZE;
+		src = r->src_page * PAGE_SIZE;
+		dst = r->dst_page * PAGE_SIZE;
+
+		if (src < 0 || dst < 0 ||
+		    (size_t)src + bytes > ctx->map_size ||
+		    (size_t)dst + bytes > ctx->map_size) {
+			pr_err("DSA hot apply batch copy outside mmap src=%" PRId64 " dst=%" PRId64 " bytes=%lu map=%zu\n",
+			       (int64_t)src, (int64_t)dst, bytes, ctx->map_size);
+			goto submit_done;
+		}
+
+		hot_dsa_prefault_range((char *)ctx->map + src, bytes, false);
+		hot_dsa_prefault_range((char *)ctx->map + dst, bytes, true);
+
+		descs[i].opcode = DSA_OPCODE_MEMMOVE;
+		descs[i].flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR | IDXD_OP_FLAG_BOF;
+		descs[i].src_addr = (uint64_t)(unsigned long)((char *)ctx->map + src);
+		descs[i].dst_addr = (uint64_t)(unsigned long)((char *)ctx->map + dst);
+		descs[i].xfer_size = (uint32_t)bytes;
+		descs[i].completion_addr = (uint64_t)(unsigned long)&comps[i];
+	}
+
+	start_us = hot_now_us();
+	for (i = 0; i < batch_count; i++) {
+		struct hot_move_range *r = &ranges[batch[i]];
+		uint32_t retry_count;
+		unsigned int wq_idx;
+		unsigned long portal_mask;
+
+		if (r->src_page == r->dst_page)
+			continue;
+
+		wq_idx = ctx->dsa_next_wq++ % (unsigned int)ctx->dsa_wq_count;
+		portal_mask = ((unsigned long)ctx->dsa_portals[wq_idx]) & ~0xfffUL;
+
+		for (retry_count = 0; retry_count < HOT_DSA_MAX_ENQ_RETRY; retry_count++) {
+			unsigned long off = ((ctx->dsa_portal_offset[wq_idx]++ << 6) & 0xfffUL);
+			void *slot = (void *)(portal_mask | off);
+
+			if (hot_dsa_enqcmd(slot, &descs[i]) == 0) {
+				ctx->dsa_enqcmd++;
+				submitted[submitted_count++] = i;
+				break;
+			}
+			hot_dsa_cpu_relax();
+		}
+
+		if (retry_count == HOT_DSA_MAX_ENQ_RETRY) {
+			pr_err("DSA hot apply batch enqcmd timed out idx=%zu\n", i);
+			goto submit_done;
+		}
+	}
+	ret = 0;
+
+submit_done:
+	end_us = hot_now_us();
+	if (end_us > start_us)
+		ctx->dsa_submit_us += end_us - start_us;
+
+	start_us = hot_now_us();
+	for (i = 0; i < submitted_count; i++) {
+		size_t desc_idx = submitted[i];
+		uint32_t poll_count;
+		int done = 0;
+
+		for (poll_count = 0; poll_count < HOT_DSA_MAX_POLL_RETRY; poll_count++) {
+			uint8_t status = comps[desc_idx].status;
+			uint8_t code = (uint8_t)DSA_COMP_STATUS(status);
+
+			if (status != 0 && code != DSA_COMP_NONE) {
+				if (code == DSA_COMP_SUCCESS || code == DSA_COMP_SUCCESS_PRED) {
+					done = 1;
+					break;
+				}
+				pr_err("DSA hot apply batch completion failed idx=%zu status=%u code=%u\n",
+				       desc_idx, status, code);
+				ret = -1;
+				done = 1;
+				break;
+			}
+			hot_dsa_cpu_relax();
+		}
+
+		if (!done) {
+			pr_err("DSA hot apply batch completion timed out idx=%zu\n",
+			       desc_idx);
+			ret = -1;
+		}
+	}
+	end_us = hot_now_us();
+	if (end_us > start_us)
+		ctx->dsa_poll_us += end_us - start_us;
+
+	if (ret)
+		goto out;
+
+	ctx->dsa_submit_batches++;
+	if (batch_count > ctx->dsa_max_batch_ranges)
+		ctx->dsa_max_batch_ranges = batch_count;
+
+out:
+	xfree(submitted);
+	free((void *)comps);
+	free(descs);
+	return ret;
+}
+
 static int write_full_fd(int fd, const void *buf, size_t len)
 {
 	const char *p = buf;
@@ -114,98 +662,6 @@ static int write_full_fd(int fd, const void *buf, size_t len)
 		}
 		p += ret;
 		len -= ret;
-	}
-
-	return 0;
-}
-
-static int hot_copy_exact_at(int fd, off_t src, off_t dst, unsigned long len, void *buf,
-			     size_t buf_len)
-{
-	while (len) {
-		size_t chunk = len < buf_len ? len : buf_len;
-		size_t done = 0;
-
-		while (done < chunk) {
-			ssize_t ret = pread(fd, (char *)buf + done, chunk - done, src + done);
-
-			if (ret < 0) {
-				if (errno == EINTR)
-					continue;
-				pr_perror("DSA hot apply read move failed");
-				return -1;
-			}
-			if (ret == 0) {
-				pr_err("DSA hot apply unexpected EOF while moving pages\n");
-				return -1;
-			}
-			done += ret;
-		}
-
-		done = 0;
-		while (done < chunk) {
-			ssize_t ret = pwrite(fd, (char *)buf + done, chunk - done, dst + done);
-
-			if (ret < 0) {
-				if (errno == EINTR)
-					continue;
-				pr_perror("DSA hot apply write move failed");
-				return -1;
-			}
-			if (ret == 0) {
-				pr_err("DSA hot apply short write while moving pages\n");
-				return -1;
-			}
-			done += ret;
-		}
-
-		src += chunk;
-		dst += chunk;
-		len -= chunk;
-	}
-
-	return 0;
-}
-
-static int hot_pread_full(int fd, void *buf, size_t len, off_t off)
-{
-	size_t done = 0;
-
-	while (done < len) {
-		ssize_t ret = pread(fd, (char *)buf + done, len - done, off + done);
-
-		if (ret < 0) {
-			if (errno == EINTR)
-				continue;
-			return -1;
-		}
-		if (ret == 0) {
-			errno = EIO;
-			return -1;
-		}
-		done += ret;
-	}
-
-	return 0;
-}
-
-static int hot_pwrite_full(int fd, const void *buf, size_t len, off_t off)
-{
-	size_t done = 0;
-
-	while (done < len) {
-		ssize_t ret = pwrite(fd, (const char *)buf + done, len - done, off + done);
-
-		if (ret < 0) {
-			if (errno == EINTR)
-				continue;
-			return -1;
-		}
-		if (ret == 0) {
-			errno = EIO;
-			return -1;
-		}
-		done += ret;
 	}
 
 	return 0;
@@ -455,17 +911,17 @@ static int hot_apply_find_old_range(struct hot_old_range *ranges, size_t nr,
 	return -1;
 }
 
-static int hot_apply_fill_src_pages(struct hot_apply_ctx *ctx,
-				    struct hot_old_range *old_ranges, size_t nr_old,
-				    off_t old_size, off_t **src_pages_out,
-				    size_t *final_pages_out, off_t *final_size_out)
+static int hot_apply_fill_sources(struct hot_apply_ctx *ctx,
+				  struct hot_old_range *old_ranges, size_t nr_old,
+				  off_t old_size, struct hot_page_source **sources_out,
+				  size_t *final_pages_out, off_t *final_size_out)
 {
-	off_t *src_pages = NULL;
+	struct hot_page_source *sources = NULL;
 	size_t final_pages = 0;
 	size_t old_idx = 0;
 	size_t i;
 
-	*src_pages_out = NULL;
+	*sources_out = NULL;
 	*final_pages_out = 0;
 	*final_size_out = 0;
 
@@ -481,8 +937,8 @@ static int hot_apply_fill_src_pages(struct hot_apply_ctx *ctx,
 	if (!final_pages)
 		return 0;
 
-	src_pages = xmalloc(final_pages * sizeof(src_pages[0]));
-	if (!src_pages)
+	sources = xmalloc(final_pages * sizeof(sources[0]));
+	if (!sources)
 		return -1;
 
 	final_pages = 0;
@@ -499,8 +955,11 @@ static int hot_apply_fill_src_pages(struct hot_apply_ctx *ctx,
 				pr_err("DSA hot apply present entry lacks aligned append offset\n");
 				goto err;
 			}
-			for (p = 0; p < pages; p++)
-				src_pages[final_pages++] = e->append_offset / PAGE_SIZE + p;
+			for (p = 0; p < pages; p++) {
+				sources[final_pages].src_page = e->append_offset / PAGE_SIZE + p;
+				sources[final_pages].patch = true;
+				final_pages++;
+			}
 			continue;
 		}
 
@@ -533,173 +992,496 @@ static int hot_apply_fill_src_pages(struct hot_apply_ctx *ctx,
 				goto err;
 			}
 			pages = in_range / PAGE_SIZE;
-			for (p = 0; p < pages; p++)
-				src_pages[final_pages++] = src_off / PAGE_SIZE + p;
+			for (p = 0; p < pages; p++) {
+				sources[final_pages].src_page = src_off / PAGE_SIZE + p;
+				sources[final_pages].patch = false;
+				final_pages++;
+			}
 
 			pos += in_range;
 			left -= in_range;
 		}
 	}
 
-	*src_pages_out = src_pages;
+	*sources_out = sources;
 	*final_pages_out = final_pages;
 	*final_size_out = (off_t)final_pages * PAGE_SIZE;
 	return 0;
 
 err:
-	xfree(src_pages);
+	xfree(sources);
 	return -1;
 }
 
-static int hot_apply_copy_page(struct hot_apply_ctx *ctx, int fd, off_t src_page,
-			       off_t dst_page, void *buf)
+static int hot_apply_reserve_ranges(struct hot_move_range **ranges,
+				    size_t *cap, size_t need)
 {
-	if (src_page == dst_page)
+	struct hot_move_range *new_ranges;
+	size_t new_cap = *cap ? *cap : 128;
+
+	if (need <= *cap)
 		return 0;
-	if (hot_copy_exact_at(fd, src_page * PAGE_SIZE, dst_page * PAGE_SIZE,
-			      PAGE_SIZE, buf, PAGE_SIZE))
+	while (new_cap < need)
+		new_cap *= 2;
+
+	new_ranges = xrealloc(*ranges, new_cap * sizeof((*ranges)[0]));
+	if (!new_ranges)
 		return -1;
-	ctx->moved_pages++;
+	*ranges = new_ranges;
+	*cap = new_cap;
 	return 0;
 }
 
-static int hot_apply_rebuild_needed(off_t *src_pages, bool *pending, bool *needed,
-				    size_t final_pages)
+static int hot_apply_add_move_range(struct hot_move_range **ranges,
+				    size_t *nr, size_t *cap,
+				    off_t src_page, off_t dst_page,
+				    size_t nr_pages, bool scratch, bool patch)
 {
-	size_t i;
+	struct hot_move_range *r;
 
-	memset(needed, 0, final_pages * sizeof(needed[0]));
-	for (i = 0; i < final_pages; i++) {
-		if (!pending[i])
-			continue;
-		if (src_pages[i] >= 0 && (size_t)src_pages[i] < final_pages)
-			needed[src_pages[i]] = true;
-	}
-
-	return 0;
-}
-
-static int hot_apply_enqueue_ready(off_t *src_pages, bool *pending, bool *needed,
-				   size_t final_pages, size_t *queue, size_t *q_tail)
-{
-	size_t i;
-
-	*q_tail = 0;
-	for (i = 0; i < final_pages; i++) {
-		if (pending[i] && !needed[i])
-			queue[(*q_tail)++] = i;
-	}
-
-	return 0;
-}
-
-static int hot_apply_break_cycle(struct hot_apply_ctx *ctx, int fd, off_t *src_pages, bool *pending,
-				 size_t final_pages, void *buf, size_t *pending_count)
-{
-	size_t start, d;
-
-	for (start = 0; start < final_pages; start++) {
-		if (pending[start])
-			break;
-	}
-	if (start == final_pages)
+	if (!nr_pages || src_page == dst_page)
 		return 0;
-
-	if (hot_pread_full(fd, buf, PAGE_SIZE, (off_t)start * PAGE_SIZE)) {
-		pr_perror("DSA hot apply can't read scratch page");
+	if (hot_apply_reserve_ranges(ranges, cap, *nr + 1))
 		return -1;
+
+	r = &(*ranges)[(*nr)++];
+	r->src_page = src_page;
+	r->dst_page = dst_page;
+	r->nr_pages = nr_pages;
+	r->pending = true;
+	r->scratch = scratch;
+	r->patch = patch;
+	return 0;
+}
+
+static int hot_apply_add_or_extend_move_range(struct hot_move_range **ranges,
+					      size_t *nr, size_t *cap,
+					      off_t src_page, off_t dst_page,
+					      size_t nr_pages, bool scratch,
+					      bool patch)
+{
+	struct hot_move_range *last;
+
+	if (!*nr)
+		return hot_apply_add_move_range(ranges, nr, cap, src_page,
+						dst_page, nr_pages, scratch, patch);
+
+	last = &(*ranges)[*nr - 1];
+	if (last->pending && last->scratch == scratch && last->patch == patch &&
+	    last->src_page + (off_t)last->nr_pages == src_page &&
+	    last->dst_page + (off_t)last->nr_pages == dst_page) {
+		last->nr_pages += nr_pages;
+		return 0;
 	}
-	ctx->scratch_uses++;
 
-	d = start;
-	while (pending[d]) {
-		off_t s = src_pages[d];
+	return hot_apply_add_move_range(ranges, nr, cap, src_page,
+					dst_page, nr_pages, scratch, patch);
+}
 
-		if (s == (off_t)start) {
-			if (hot_pwrite_full(fd, buf, PAGE_SIZE, (off_t)d * PAGE_SIZE)) {
-				pr_perror("DSA hot apply can't write scratch page");
-				return -1;
+static int hot_apply_build_move_ranges(struct hot_apply_ctx *ctx,
+				       struct hot_page_source *sources,
+				       size_t final_pages,
+				       struct hot_move_range **ranges_out,
+				       size_t *nr_ranges_out)
+{
+	struct hot_move_range *ranges = NULL;
+	size_t nr = 0, cap = 0;
+	size_t i = 0;
+	bool pass_patch;
+
+	*ranges_out = NULL;
+	*nr_ranges_out = 0;
+
+	for (pass_patch = false; ; pass_patch = true) {
+		i = 0;
+		while (i < final_pages) {
+			off_t src = sources[i].src_page;
+			size_t pages = 1;
+
+			if (sources[i].patch != pass_patch || src == (off_t)i) {
+				i++;
+				continue;
 			}
-			pending[d] = false;
-			(*pending_count)--;
-			return 0;
+
+			while (i + pages < final_pages &&
+			       sources[i + pages].patch == pass_patch &&
+			       sources[i + pages].src_page != (off_t)(i + pages) &&
+			       sources[i + pages].src_page == src + (off_t)pages)
+				pages++;
+
+			if (hot_apply_add_or_extend_move_range(&ranges, &nr, &cap, src,
+							       (off_t)i, pages, false,
+							       pass_patch))
+				goto err;
+			if (pages > ctx->max_range_pages)
+				ctx->max_range_pages = pages;
+			i += pages;
 		}
 
-		if (hot_apply_copy_page(ctx, fd, s, d, buf))
-			return -1;
-		pending[d] = false;
-		(*pending_count)--;
+		if (pass_patch)
+			break;
+	}
 
-		if (s < 0 || (size_t)s >= final_pages)
-			return 0;
-		d = (size_t)s;
+	ctx->range_count = nr;
+	*ranges_out = ranges;
+	*nr_ranges_out = nr;
+	return 0;
+
+err:
+	xfree(ranges);
+	return -1;
+}
+
+static void hot_apply_live_counts_add(unsigned int *live_counts, size_t final_pages,
+				      off_t start, size_t nr_pages, int delta)
+{
+	size_t i, begin, end;
+
+	if (start < 0 || (size_t)start >= final_pages)
+		return;
+
+	begin = (size_t)start;
+	end = begin + nr_pages;
+	if (end > final_pages)
+		end = final_pages;
+
+	for (i = begin; i < end; i++) {
+		if (delta > 0) {
+			live_counts[i] += (unsigned int)delta;
+			continue;
+		}
+		if (live_counts[i] < (unsigned int)(-delta))
+			live_counts[i] = 0;
+		else
+			live_counts[i] -= (unsigned int)(-delta);
+	}
+}
+
+static void hot_apply_live_counts_build(unsigned int *live_counts,
+					size_t final_pages,
+					struct hot_move_range *ranges,
+					size_t nr_ranges)
+{
+	size_t i;
+
+	memset(live_counts, 0, final_pages * sizeof(live_counts[0]));
+	for (i = 0; i < nr_ranges; i++) {
+		if (!ranges[i].pending || ranges[i].scratch)
+			continue;
+		hot_apply_live_counts_add(live_counts, final_pages,
+					  ranges[i].src_page, ranges[i].nr_pages, 1);
+	}
+}
+
+static bool hot_apply_range_contains_page(struct hot_move_range *r, size_t page)
+{
+	if (r->scratch || r->src_page < 0)
+		return false;
+	if (page < (size_t)r->src_page)
+		return false;
+	return page < (size_t)r->src_page + r->nr_pages;
+}
+
+static bool hot_apply_range_is_safe(struct hot_move_range *r,
+				    unsigned int *live_counts,
+				    size_t final_pages)
+{
+	size_t i, begin, end;
+
+	if (r->dst_page < 0 || (size_t)r->dst_page >= final_pages)
+		return true;
+
+	begin = (size_t)r->dst_page;
+	end = begin + r->nr_pages;
+	if (end > final_pages)
+		end = final_pages;
+
+	for (i = begin; i < end; i++) {
+		unsigned int self_live = hot_apply_range_contains_page(r, i) ? 1 : 0;
+
+		if (live_counts[i] > self_live)
+			return false;
+	}
+
+	return true;
+}
+
+static bool hot_apply_dst_conflicts(uint32_t *dst_epoch, uint32_t epoch,
+				    struct hot_move_range *r,
+				    size_t final_pages)
+{
+	size_t i, begin, end;
+
+	if (r->dst_page < 0 || (size_t)r->dst_page >= final_pages)
+		return false;
+
+	begin = (size_t)r->dst_page;
+	end = begin + r->nr_pages;
+	if (end > final_pages)
+		end = final_pages;
+
+	for (i = begin; i < end; i++) {
+		if (dst_epoch[i] == epoch)
+			return true;
+	}
+
+	return false;
+}
+
+static void hot_apply_mark_dst(uint32_t *dst_epoch, uint32_t epoch,
+			       struct hot_move_range *r, size_t final_pages)
+{
+	size_t i, begin, end;
+
+	if (r->dst_page < 0 || (size_t)r->dst_page >= final_pages)
+		return;
+
+	begin = (size_t)r->dst_page;
+	end = begin + r->nr_pages;
+	if (end > final_pages)
+		end = final_pages;
+
+	for (i = begin; i < end; i++)
+		dst_epoch[i] = epoch;
+}
+
+static int hot_apply_stage_scratch_range(struct hot_apply_ctx *ctx,
+					 struct hot_move_range **ranges,
+					 size_t *nr_ranges, size_t *cap,
+					 size_t idx, size_t *added_pending,
+					 unsigned int *live_counts,
+					 size_t final_pages)
+{
+	struct hot_move_range *r = &(*ranges)[idx];
+	struct hot_move_range scratch;
+	size_t chunk_pages = r->nr_pages;
+	off_t old_src_page = r->src_page;
+	off_t scratch_off, scratch_page;
+	unsigned long bytes;
+
+	if (chunk_pages > HOT_APPLY_SCRATCH_PAGES)
+		chunk_pages = HOT_APPLY_SCRATCH_PAGES;
+	if (!chunk_pages)
+		return -1;
+	if (chunk_pages > ULONG_MAX / PAGE_SIZE) {
+		pr_err("DSA hot apply scratch range is too large: pages=%zu\n",
+		       chunk_pages);
+		return -1;
+	}
+
+	scratch_off = ctx->file_size;
+	if (scratch_off % PAGE_SIZE) {
+		pr_err("DSA hot apply scratch tail is not page aligned: %" PRId64 "\n",
+		       (int64_t)scratch_off);
+		return -1;
+	}
+	scratch_page = scratch_off / PAGE_SIZE;
+	bytes = (unsigned long)chunk_pages * PAGE_SIZE;
+
+	if (hot_apply_remap_current(ctx, scratch_off + bytes))
+		return -1;
+	if (hot_dsa_copy_bytes(ctx, r->src_page * PAGE_SIZE, scratch_off, bytes))
+		return -1;
+	ctx->file_size = scratch_off + bytes;
+	ctx->dsa_copy_pages += chunk_pages;
+	ctx->dsa_copy_ranges++;
+	ctx->dsa_copy_bytes += bytes;
+
+	hot_apply_live_counts_add(live_counts, final_pages, old_src_page,
+				  chunk_pages, -1);
+
+	scratch.src_page = scratch_page;
+	scratch.dst_page = r->dst_page;
+	scratch.nr_pages = chunk_pages;
+	scratch.pending = true;
+	scratch.scratch = true;
+	scratch.patch = r->patch;
+
+	if (chunk_pages == r->nr_pages) {
+		*r = scratch;
+		*added_pending = 0;
+	} else {
+		r->src_page += chunk_pages;
+		r->dst_page += chunk_pages;
+		r->nr_pages -= chunk_pages;
+		if (hot_apply_reserve_ranges(ranges, cap, *nr_ranges + 1))
+			return -1;
+		(*ranges)[(*nr_ranges)++] = scratch;
+		*added_pending = 1;
+	}
+
+	ctx->scratch_uses++;
+	ctx->scratch_bytes += bytes;
+	return 0;
+}
+
+static int hot_apply_break_range_cycle(struct hot_apply_ctx *ctx,
+				       struct hot_move_range **ranges,
+				       size_t *nr_ranges, size_t *cap,
+				       size_t *added_pending,
+				       unsigned int *live_counts,
+				       size_t final_pages)
+{
+	size_t i;
+
+	for (i = 0; i < *nr_ranges; i++) {
+		if ((*ranges)[i].pending && !(*ranges)[i].scratch)
+			return hot_apply_stage_scratch_range(ctx, ranges,
+							     nr_ranges, cap,
+							     i, added_pending,
+							     live_counts,
+							     final_pages);
+	}
+
+	pr_err("DSA hot apply couldn't find a non-scratch range to break cycle\n");
+	return -1;
+}
+
+static int hot_apply_stage_blocking_patch_source(struct hot_apply_ctx *ctx,
+						 struct hot_move_range **ranges,
+						 size_t *nr_ranges, size_t *cap,
+						 size_t *added_pending,
+						 unsigned int *live_counts,
+						 size_t final_pages,
+						 bool *staged)
+{
+	size_t i;
+
+	*staged = false;
+	for (i = 0; i < *nr_ranges; i++) {
+		struct hot_move_range *r = &(*ranges)[i];
+
+		if (!r->pending || r->scratch || !r->patch)
+			continue;
+		if (r->src_page < 0 || (size_t)r->src_page >= final_pages)
+			continue;
+		*staged = true;
+		return hot_apply_stage_scratch_range(ctx, ranges, nr_ranges,
+						     cap, i,
+						     added_pending, live_counts,
+						     final_pages);
 	}
 
 	return 0;
 }
 
-static int hot_apply_move_pages(struct hot_apply_ctx *ctx, int fd, off_t *src_pages,
-				size_t final_pages)
+static int hot_apply_move_pages(struct hot_apply_ctx *ctx,
+				struct hot_page_source *sources, size_t final_pages)
 {
-	bool *pending = NULL;
-	bool *needed = NULL;
-	size_t *queue = NULL;
-	void *buf = NULL;
+	struct hot_move_range *ranges = NULL;
+	size_t nr_ranges = 0, cap_ranges = 0;
 	size_t pending_count = 0;
+	unsigned int *live_counts = NULL;
+	uint32_t *dst_epoch = NULL;
+	uint32_t epoch = 0;
+	size_t *batch = NULL;
 	size_t i;
 	int ret = -1;
 
 	if (!final_pages)
 		return 0;
 
-	pending = xmalloc(final_pages * sizeof(pending[0]));
-	needed = xmalloc(final_pages * sizeof(needed[0]));
-	queue = xmalloc(final_pages * sizeof(queue[0]));
-	buf = xmalloc(PAGE_SIZE);
-	if (!pending || !needed || !queue || !buf)
+	live_counts = xmalloc(final_pages * sizeof(live_counts[0]));
+	dst_epoch = xzalloc(final_pages * sizeof(dst_epoch[0]));
+	if (!live_counts || !dst_epoch)
 		goto out;
 
-	for (i = 0; i < final_pages; i++) {
-		pending[i] = src_pages[i] != (off_t)i;
-		if (pending[i])
-			pending_count++;
-	}
+	if (hot_apply_build_move_ranges(ctx, sources, final_pages,
+					&ranges, &nr_ranges))
+		goto out;
+	cap_ranges = nr_ranges;
+	pending_count = nr_ranges;
+	batch = xmalloc(nr_ranges * sizeof(batch[0]));
+	if (!batch)
+		goto out;
+	hot_apply_live_counts_build(live_counts, final_pages, ranges, nr_ranges);
 
 	while (pending_count) {
-		size_t q_head = 0, q_tail = 0;
+		size_t batch_count = 0;
+		uint64_t scan_start;
+		uint64_t scan_end;
+		bool progress = false;
 
-		hot_apply_rebuild_needed(src_pages, pending, needed, final_pages);
-		hot_apply_enqueue_ready(src_pages, pending, needed, final_pages,
-					queue, &q_tail);
+		epoch++;
+		if (!epoch) {
+			memset(dst_epoch, 0, final_pages * sizeof(dst_epoch[0]));
+			epoch++;
+		}
 
-		if (q_tail == 0) {
-			if (hot_apply_break_cycle(ctx, fd, src_pages, pending, final_pages,
-						  buf, &pending_count))
+		scan_start = hot_now_us();
+		for (i = 0; i < nr_ranges; i++) {
+			if (!ranges[i].pending)
+				continue;
+			if (!hot_apply_range_is_safe(&ranges[i], live_counts, final_pages))
+				continue;
+			if (hot_apply_dst_conflicts(dst_epoch, epoch, &ranges[i],
+						    final_pages))
+				continue;
+			batch[batch_count++] = i;
+			hot_apply_mark_dst(dst_epoch, epoch, &ranges[i], final_pages);
+		}
+		scan_end = hot_now_us();
+		if (scan_end > scan_start)
+			ctx->ready_scan_us += scan_end - scan_start;
+		ctx->ready_rounds++;
+
+		if (batch_count) {
+			if (hot_dsa_submit_range_batch(ctx, ranges, batch, batch_count))
 				goto out;
+
+			for (i = 0; i < batch_count; i++) {
+				struct hot_move_range *r = &ranges[batch[i]];
+				unsigned long bytes = (unsigned long)r->nr_pages * PAGE_SIZE;
+
+				ctx->moved_pages += r->nr_pages;
+				ctx->moved_ranges++;
+				ctx->dsa_copy_pages += r->nr_pages;
+				ctx->dsa_copy_ranges++;
+				ctx->dsa_copy_bytes += bytes;
+				if (r->patch) {
+					ctx->patch_pages += r->nr_pages;
+					ctx->patch_ranges++;
+				}
+				if (!r->scratch)
+					hot_apply_live_counts_add(live_counts, final_pages,
+								  r->src_page,
+								  r->nr_pages, -1);
+				r->pending = false;
+				pending_count--;
+			}
 			continue;
 		}
 
-		while (q_head < q_tail) {
-			size_t d = queue[q_head++];
-			off_t s;
+		ctx->ready_empty_rounds++;
 
-			if (!pending[d])
-				continue;
-			s = src_pages[d];
-			if (hot_apply_copy_page(ctx, fd, s, d, buf))
-				goto out;
-			pending[d] = false;
-			pending_count--;
+		i = 0;
+		if (hot_apply_stage_blocking_patch_source(ctx, &ranges,
+							  &nr_ranges,
+							  &cap_ranges,
+							  &i, live_counts,
+							  final_pages,
+							  &progress))
+			goto out;
+		if (progress) {
+			pending_count += i;
+			continue;
 		}
+
+		i = 0;
+		if (hot_apply_break_range_cycle(ctx, &ranges, &nr_ranges,
+						&cap_ranges,
+						&i, live_counts, final_pages))
+			goto out;
+		pending_count += i;
 	}
 
 	ret = 0;
 
 out:
-	xfree(buf);
-	xfree(queue);
-	xfree(needed);
-	xfree(pending);
+	xfree(batch);
+	xfree(dst_epoch);
+	xfree(live_counts);
+	xfree(ranges);
 	return ret;
 }
 
@@ -751,24 +1533,42 @@ out:
 static int hot_apply_reorder_current(struct hot_apply_ctx *ctx)
 {
 	struct hot_old_range *old_ranges = NULL;
-	off_t *src_pages = NULL;
+	struct hot_page_source *sources = NULL;
 	size_t nr_old = 0;
 	size_t final_pages = 0;
 	off_t old_size = 0;
 	off_t final_size = 0;
 	uint64_t start_us = hot_now_us();
+	off_t append_size;
 	int ret = -1;
 
 	if (hot_apply_load_old_ranges(ctx, &old_ranges, &nr_old, &old_size))
 		goto out;
 
-	if (hot_apply_fill_src_pages(ctx, old_ranges, nr_old, old_size,
-				     &src_pages, &final_pages, &final_size))
+	if (hot_apply_fill_sources(ctx, old_ranges, nr_old, old_size,
+				   &sources, &final_pages, &final_size))
 		goto out;
 
-	if (hot_apply_move_pages(ctx, ctx->append_fd, src_pages, final_pages))
+	append_size = lseek(ctx->append_fd, 0, SEEK_END);
+	if (append_size == (off_t)-1) {
+		pr_perror("DSA hot apply can't seek current pages image");
+		goto out;
+	}
+	if (append_size % PAGE_SIZE) {
+		pr_err("DSA hot apply current pages size is not page aligned: %" PRId64 "\n",
+		       (int64_t)append_size);
+		goto out;
+	}
+
+	if (hot_dsa_open(ctx))
+		goto out;
+	if (hot_apply_remap_current(ctx, append_size))
 		goto out;
 
+	if (hot_apply_move_pages(ctx, sources, final_pages))
+		goto out;
+
+	hot_apply_unmap_current(ctx);
 	if (ftruncate(ctx->append_fd, final_size)) {
 		pr_perror("DSA hot apply can't truncate current pages image");
 		goto out;
@@ -778,15 +1578,23 @@ static int hot_apply_reorder_current(struct hot_apply_ctx *ctx)
 		goto out;
 
 	ctx->reorder_time_us = hot_now_us() - start_us;
-	pr_info("DSA hot apply reordered current img_id=%lu pages_id=%u old_size=%" PRId64 " final_size=%" PRId64 " entries=%zu append_bytes=%" PRIu64 " append_time_us=%" PRIu64 " reorder_time_us=%" PRIu64 " moved_pages=%" PRIu64 " scratch_uses=%" PRIu64 "\n",
+	pr_info("DSA hot apply reordered current img_id=%lu pages_id=%u old_size=%" PRId64 " final_size=%" PRId64 " entries=%zu append_bytes=%" PRIu64 " append_time_us=%" PRIu64 " reorder_time_us=%" PRIu64 " moved_pages=%" PRIu64 " moved_ranges=%" PRIu64 " range_count=%" PRIu64 " max_range_pages=%" PRIu64 " patch_pages=%" PRIu64 " patch_ranges=%" PRIu64 " scratch_uses=%" PRIu64 " scratch_bytes=%" PRIu64 " dsa_copy_pages=%" PRIu64 " dsa_copy_ranges=%" PRIu64 " dsa_copy_bytes=%" PRIu64 " dsa_submit_us=%" PRIu64 " dsa_poll_us=%" PRIu64 " dsa_enqcmd=%" PRIu64 " dsa_submit_batches=%" PRIu64 " dsa_max_batch_ranges=%" PRIu64 " ready_scan_us=%" PRIu64 " ready_rounds=%" PRIu64 " ready_empty_rounds=%" PRIu64 "\n",
 		ctx->img_id, ctx->current_pages_id, (int64_t)old_size,
 		(int64_t)final_size, ctx->nr_entries, ctx->append_bytes,
 		ctx->append_time_us, ctx->reorder_time_us, ctx->moved_pages,
-		ctx->scratch_uses);
+		ctx->moved_ranges, ctx->range_count, ctx->max_range_pages,
+		ctx->patch_pages, ctx->patch_ranges, ctx->scratch_uses,
+		ctx->scratch_bytes, ctx->dsa_copy_pages, ctx->dsa_copy_ranges,
+		ctx->dsa_copy_bytes, ctx->dsa_submit_us, ctx->dsa_poll_us,
+		ctx->dsa_enqcmd, ctx->dsa_submit_batches,
+		ctx->dsa_max_batch_ranges, ctx->ready_scan_us,
+		ctx->ready_rounds, ctx->ready_empty_rounds);
 	ret = 0;
 
 out:
-	xfree(src_pages);
+	hot_apply_unmap_current(ctx);
+	hot_dsa_close(ctx);
+	xfree(sources);
 	hot_apply_free_old_ranges(old_ranges);
 	return ret;
 }
@@ -804,6 +1612,8 @@ static void hot_apply_abort(struct page_xfer *xfer)
 	}
 	if (!ctx->finished)
 		(void)hot_apply_write_manifest(ctx->manifest_path, "failed");
+	hot_apply_unmap_current(ctx);
+	hot_dsa_close(ctx);
 	if (ctx->pipefd[0] >= 0)
 		close(ctx->pipefd[0]);
 	if (ctx->append_fd >= 0)
