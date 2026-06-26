@@ -76,6 +76,9 @@ struct hot_apply_ctx {
 	size_t pending_index;
 	uint64_t append_bytes;
 	uint64_t append_time_us;
+	uint64_t append_prepare_us;
+	uint64_t append_tee_us;
+	uint64_t append_splice_us;
 	uint64_t reorder_time_us;
 	uint64_t moved_pages;
 	uint64_t moved_ranges;
@@ -96,6 +99,19 @@ struct hot_apply_ctx {
 	uint64_t ready_scan_us;
 	uint64_t ready_rounds;
 	uint64_t ready_empty_rounds;
+	uint64_t reorder_load_old_us;
+	uint64_t reorder_fill_sources_us;
+	uint64_t reorder_seek_us;
+	uint64_t reorder_dsa_open_us;
+	uint64_t reorder_mmap_us;
+	uint64_t reorder_move_us;
+	uint64_t reorder_unmap_us;
+	uint64_t reorder_truncate_us;
+	uint64_t reorder_rewrite_pagemap_us;
+	uint64_t move_alloc_us;
+	uint64_t move_build_ranges_us;
+	uint64_t move_live_counts_us;
+	uint64_t move_schedule_us;
 	void *map;
 	size_t map_size;
 	off_t file_size;
@@ -1377,25 +1393,36 @@ static int hot_apply_move_pages(struct hot_apply_ctx *ctx,
 	size_t *batch = NULL;
 	size_t i;
 	int ret = -1;
+	uint64_t phase_start;
+	uint64_t schedule_start;
 
 	if (!final_pages)
 		return 0;
 
+	phase_start = hot_now_us();
 	live_counts = xmalloc(final_pages * sizeof(live_counts[0]));
 	dst_epoch = xzalloc(final_pages * sizeof(dst_epoch[0]));
 	if (!live_counts || !dst_epoch)
 		goto out;
+	ctx->move_alloc_us += hot_now_us() - phase_start;
 
+	phase_start = hot_now_us();
 	if (hot_apply_build_move_ranges(ctx, sources, final_pages,
 					&ranges, &nr_ranges))
 		goto out;
+	ctx->move_build_ranges_us += hot_now_us() - phase_start;
 	cap_ranges = nr_ranges;
 	pending_count = nr_ranges;
+	phase_start = hot_now_us();
 	batch = xmalloc(nr_ranges * sizeof(batch[0]));
 	if (!batch)
 		goto out;
+	ctx->move_alloc_us += hot_now_us() - phase_start;
+	phase_start = hot_now_us();
 	hot_apply_live_counts_build(live_counts, final_pages, ranges, nr_ranges);
+	ctx->move_live_counts_us += hot_now_us() - phase_start;
 
+	schedule_start = hot_now_us();
 	while (pending_count) {
 		size_t batch_count = 0;
 		uint64_t scan_start;
@@ -1474,6 +1501,7 @@ static int hot_apply_move_pages(struct hot_apply_ctx *ctx,
 			goto out;
 		pending_count += i;
 	}
+	ctx->move_schedule_us += hot_now_us() - schedule_start;
 
 	ret = 0;
 
@@ -1539,16 +1567,22 @@ static int hot_apply_reorder_current(struct hot_apply_ctx *ctx)
 	off_t old_size = 0;
 	off_t final_size = 0;
 	uint64_t start_us = hot_now_us();
+	uint64_t phase_start;
 	off_t append_size;
 	int ret = -1;
 
+	phase_start = hot_now_us();
 	if (hot_apply_load_old_ranges(ctx, &old_ranges, &nr_old, &old_size))
 		goto out;
+	ctx->reorder_load_old_us += hot_now_us() - phase_start;
 
+	phase_start = hot_now_us();
 	if (hot_apply_fill_sources(ctx, old_ranges, nr_old, old_size,
 				   &sources, &final_pages, &final_size))
 		goto out;
+	ctx->reorder_fill_sources_us += hot_now_us() - phase_start;
 
+	phase_start = hot_now_us();
 	append_size = lseek(ctx->append_fd, 0, SEEK_END);
 	if (append_size == (off_t)-1) {
 		pr_perror("DSA hot apply can't seek current pages image");
@@ -1559,32 +1593,53 @@ static int hot_apply_reorder_current(struct hot_apply_ctx *ctx)
 		       (int64_t)append_size);
 		goto out;
 	}
+	ctx->reorder_seek_us += hot_now_us() - phase_start;
 
+	phase_start = hot_now_us();
 	if (hot_dsa_open(ctx))
 		goto out;
+	ctx->reorder_dsa_open_us += hot_now_us() - phase_start;
+	phase_start = hot_now_us();
 	if (hot_apply_remap_current(ctx, append_size))
 		goto out;
+	ctx->reorder_mmap_us += hot_now_us() - phase_start;
 
+	phase_start = hot_now_us();
 	if (hot_apply_move_pages(ctx, sources, final_pages))
 		goto out;
+	ctx->reorder_move_us += hot_now_us() - phase_start;
 
+	phase_start = hot_now_us();
 	hot_apply_unmap_current(ctx);
+	ctx->reorder_unmap_us += hot_now_us() - phase_start;
+	phase_start = hot_now_us();
 	if (ftruncate(ctx->append_fd, final_size)) {
 		pr_perror("DSA hot apply can't truncate current pages image");
 		goto out;
 	}
+	ctx->reorder_truncate_us += hot_now_us() - phase_start;
 
+	phase_start = hot_now_us();
 	if (hot_apply_rewrite_pagemap(ctx))
 		goto out;
+	ctx->reorder_rewrite_pagemap_us += hot_now_us() - phase_start;
 
 	ctx->reorder_time_us = hot_now_us() - start_us;
-	pr_info("DSA hot apply reordered current img_id=%lu pages_id=%u old_size=%" PRId64 " final_size=%" PRId64 " entries=%zu append_bytes=%" PRIu64 " append_time_us=%" PRIu64 " reorder_time_us=%" PRIu64 " moved_pages=%" PRIu64 " moved_ranges=%" PRIu64 " range_count=%" PRIu64 " max_range_pages=%" PRIu64 " patch_pages=%" PRIu64 " patch_ranges=%" PRIu64 " scratch_uses=%" PRIu64 " scratch_bytes=%" PRIu64 " dsa_copy_pages=%" PRIu64 " dsa_copy_ranges=%" PRIu64 " dsa_copy_bytes=%" PRIu64 " dsa_submit_us=%" PRIu64 " dsa_poll_us=%" PRIu64 " dsa_enqcmd=%" PRIu64 " dsa_submit_batches=%" PRIu64 " dsa_max_batch_ranges=%" PRIu64 " ready_scan_us=%" PRIu64 " ready_rounds=%" PRIu64 " ready_empty_rounds=%" PRIu64 "\n",
+	pr_info("DSA hot apply reordered current img_id=%lu pages_id=%u old_size=%" PRId64 " final_size=%" PRId64 " entries=%zu append_bytes=%" PRIu64 " append_time_us=%" PRIu64 " append_prepare_us=%" PRIu64 " append_tee_us=%" PRIu64 " append_splice_us=%" PRIu64 " reorder_time_us=%" PRIu64 " reorder_load_old_us=%" PRIu64 " reorder_fill_sources_us=%" PRIu64 " reorder_seek_us=%" PRIu64 " reorder_dsa_open_us=%" PRIu64 " reorder_mmap_us=%" PRIu64 " reorder_move_us=%" PRIu64 " reorder_unmap_us=%" PRIu64 " reorder_truncate_us=%" PRIu64 " reorder_rewrite_pagemap_us=%" PRIu64 " move_alloc_us=%" PRIu64 " move_build_ranges_us=%" PRIu64 " move_live_counts_us=%" PRIu64 " move_schedule_us=%" PRIu64 " moved_pages=%" PRIu64 " moved_ranges=%" PRIu64 " range_count=%" PRIu64 " max_range_pages=%" PRIu64 " patch_pages=%" PRIu64 " patch_ranges=%" PRIu64 " scratch_uses=%" PRIu64 " scratch_bytes=%" PRIu64 " dsa_copy_pages=%" PRIu64 " dsa_copy_ranges=%" PRIu64 " dsa_copy_bytes=%" PRIu64 " dsa_submit_us=%" PRIu64 " dsa_poll_us=%" PRIu64 " dsa_enqcmd=%" PRIu64 " dsa_submit_batches=%" PRIu64 " dsa_max_batch_ranges=%" PRIu64 " ready_scan_us=%" PRIu64 " ready_rounds=%" PRIu64 " ready_empty_rounds=%" PRIu64 "\n",
 		ctx->img_id, ctx->current_pages_id, (int64_t)old_size,
 		(int64_t)final_size, ctx->nr_entries, ctx->append_bytes,
-		ctx->append_time_us, ctx->reorder_time_us, ctx->moved_pages,
-		ctx->moved_ranges, ctx->range_count, ctx->max_range_pages,
-		ctx->patch_pages, ctx->patch_ranges, ctx->scratch_uses,
-		ctx->scratch_bytes, ctx->dsa_copy_pages, ctx->dsa_copy_ranges,
+		ctx->append_time_us, ctx->append_prepare_us, ctx->append_tee_us,
+		ctx->append_splice_us, ctx->reorder_time_us,
+		ctx->reorder_load_old_us, ctx->reorder_fill_sources_us,
+		ctx->reorder_seek_us, ctx->reorder_dsa_open_us,
+		ctx->reorder_mmap_us, ctx->reorder_move_us,
+		ctx->reorder_unmap_us, ctx->reorder_truncate_us,
+		ctx->reorder_rewrite_pagemap_us, ctx->move_alloc_us,
+		ctx->move_build_ranges_us, ctx->move_live_counts_us,
+		ctx->move_schedule_us, ctx->moved_pages, ctx->moved_ranges,
+		ctx->range_count, ctx->max_range_pages, ctx->patch_pages,
+		ctx->patch_ranges, ctx->scratch_uses, ctx->scratch_bytes,
+		ctx->dsa_copy_pages, ctx->dsa_copy_ranges,
 		ctx->dsa_copy_bytes, ctx->dsa_submit_us, ctx->dsa_poll_us,
 		ctx->dsa_enqcmd, ctx->dsa_submit_batches,
 		ctx->dsa_max_batch_ranges, ctx->ready_scan_us,
@@ -2063,10 +2118,12 @@ static int write_pages_loc(struct page_xfer *xfer, int p, unsigned long len)
 	struct hot_apply_ctx *ctx = xfer->hot_apply;
 	unsigned long curr = 0;
 	off_t append_offset;
+	uint64_t append_prepare_start_us;
 
 	if (!ctx)
 		return splice_exact(p, img_raw_fd(xfer->pi), len);
 
+	append_prepare_start_us = hot_now_us();
 	append_offset = lseek(ctx->append_fd, 0, SEEK_END);
 	if (append_offset == (off_t)-1) {
 		pr_perror("DSA hot apply can't seek append file");
@@ -2075,14 +2132,18 @@ static int write_pages_loc(struct page_xfer *xfer, int p, unsigned long len)
 
 	if (hot_apply_log_pending(ctx, len, append_offset))
 		return -1;
+	ctx->append_prepare_us += hot_now_us() - append_prepare_start_us;
 
 	while (curr < len) {
 		uint64_t append_start_us;
+		uint64_t append_delta_us;
 		ssize_t ret;
 
 		append_start_us = hot_now_us();
 		ret = tee(p, ctx->pipefd[1], len - curr, 0);
-		ctx->append_time_us += hot_now_us() - append_start_us;
+		append_delta_us = hot_now_us() - append_start_us;
+		ctx->append_tee_us += append_delta_us;
+		ctx->append_time_us += append_delta_us;
 		if (ret < 0) {
 			pr_perror("DSA hot apply tee failed");
 			return -1;
@@ -2098,7 +2159,9 @@ static int write_pages_loc(struct page_xfer *xfer, int p, unsigned long len)
 		append_start_us = hot_now_us();
 		if (splice_exact(ctx->pipefd[0], ctx->append_fd, ret))
 			return -1;
-		ctx->append_time_us += hot_now_us() - append_start_us;
+		append_delta_us = hot_now_us() - append_start_us;
+		ctx->append_splice_us += append_delta_us;
+		ctx->append_time_us += append_delta_us;
 		ctx->append_bytes += ret;
 
 		curr += ret;
