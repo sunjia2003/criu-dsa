@@ -4,6 +4,9 @@
 #include <linux/falloc.h>
 #include <sys/uio.h>
 #include <limits.h>
+#include <errno.h>
+#include <string.h>
+#include <stdlib.h>
 
 #include "types.h"
 #include "image.h"
@@ -25,6 +28,124 @@
 #endif
 
 #define MAX_BUNCH_SIZE 256
+
+struct hot_read_segment {
+	unsigned long img_id;
+	unsigned long vaddr;
+	unsigned long len;
+	off_t off;
+	int fd;
+	char file[PATH_MAX];
+};
+
+struct hot_read_ctx {
+	struct hot_read_segment *segs;
+	size_t nr;
+};
+
+static bool hot_restore_enabled(void)
+{
+	const char *enabled = getenv("CRIU_DSA_HOT_RESTORE");
+	const char *manifest = getenv("CRIU_DSA_HOT_MEMORY_MANIFEST");
+
+	return enabled && strcmp(enabled, "1") == 0 && manifest && manifest[0];
+}
+
+static void hot_read_close_ctx(struct hot_read_ctx *ctx)
+{
+	size_t i;
+
+	if (!ctx)
+		return;
+	for (i = 0; i < ctx->nr; i++) {
+		if (ctx->segs[i].fd >= 0)
+			close(ctx->segs[i].fd);
+	}
+	xfree(ctx->segs);
+	xfree(ctx);
+}
+
+static int hot_read_load_ctx(struct page_read *pr)
+{
+	const char *path = getenv("CRIU_DSA_HOT_MEMORY_MANIFEST");
+	FILE *fp;
+	struct hot_read_ctx *ctx;
+	char line[PATH_MAX + 128];
+	size_t cap = 0;
+
+	ctx = xzalloc(sizeof(*ctx));
+	if (!ctx)
+		return -1;
+
+	fp = fopen(path, "r");
+	if (!fp) {
+		pr_perror("hot page_read can't open manifest %s", path);
+		xfree(ctx);
+		return -1;
+	}
+
+	while (fgets(line, sizeof(line), fp)) {
+		struct hot_read_segment seg;
+		unsigned long long off;
+		int n;
+
+		memset(&seg, 0, sizeof(seg));
+		seg.fd = -1;
+		n = sscanf(line, "seg %lu %lx %lu %4095s %llu",
+			   &seg.img_id, &seg.vaddr, &seg.len, seg.file, &off);
+		if (n != 5 || seg.img_id != pr->img_id)
+			continue;
+		seg.off = (off_t)off;
+		seg.fd = open(seg.file, O_RDONLY | O_CLOEXEC);
+		if (seg.fd < 0) {
+			pr_perror("hot page_read can't open segment %s", seg.file);
+			fclose(fp);
+			hot_read_close_ctx(ctx);
+			return -1;
+		}
+
+		if (ctx->nr == cap) {
+			size_t new_cap = cap ? cap * 2 : 256;
+			void *new_segs = xrealloc(ctx->segs, new_cap * sizeof(ctx->segs[0]));
+
+			if (!new_segs) {
+				fclose(fp);
+				close(seg.fd);
+				hot_read_close_ctx(ctx);
+				return -1;
+			}
+			ctx->segs = new_segs;
+			cap = new_cap;
+		}
+		ctx->segs[ctx->nr++] = seg;
+	}
+
+	fclose(fp);
+	if (!ctx->nr) {
+		pr_err("hot page_read found no segments for img_id=%lu in %s\n",
+		       pr->img_id, path);
+		hot_read_close_ctx(ctx);
+		return -1;
+	}
+	pr->hot = ctx;
+	return 0;
+}
+
+static struct hot_read_segment *hot_read_find(struct hot_read_ctx *ctx,
+					      unsigned long img_id,
+					      unsigned long vaddr)
+{
+	size_t i;
+
+	for (i = 0; i < ctx->nr; i++) {
+		unsigned long start = ctx->segs[i].vaddr;
+		unsigned long end = start + ctx->segs[i].len;
+
+		if (ctx->segs[i].img_id == img_id && vaddr >= start && vaddr < end)
+			return &ctx->segs[i];
+	}
+	return NULL;
+}
 
 /*
  * One "job" for the preadv() syscall in pagemap.c
@@ -398,6 +519,55 @@ static int maybe_read_page_local(struct page_read *pr, unsigned long vaddr, unsi
 	return ret;
 }
 
+static int maybe_read_page_hot(struct page_read *pr, unsigned long vaddr, unsigned long nr, void *buf, unsigned flags)
+{
+	struct hot_read_ctx *ctx = pr->hot;
+	unsigned long len = nr * PAGE_SIZE;
+	unsigned long done = 0;
+
+	(void)flags;
+	if (!ctx) {
+		pr_err("hot page_read has no context\n");
+		return -1;
+	}
+
+	while (done < len) {
+		struct hot_read_segment *seg;
+		unsigned long addr = vaddr + done;
+		unsigned long chunk;
+		size_t curr = 0;
+
+		seg = hot_read_find(ctx, pr->img_id, addr);
+		if (!seg) {
+			pr_err("hot page_read missing img_id=%lu vaddr=%lx\n",
+			       pr->img_id, addr);
+			return -1;
+		}
+
+		chunk = seg->vaddr + seg->len - addr;
+		if (chunk > len - done)
+			chunk = len - done;
+
+		while (curr < chunk) {
+			ssize_t ret = pread(seg->fd, buf + done + curr,
+					    chunk - curr,
+					    seg->off + (addr - seg->vaddr) + curr);
+			if (ret < 1) {
+				pr_perror("hot page_read failed segment=%s ret=%zd",
+					  seg->file, ret);
+				return -1;
+			}
+			curr += ret;
+		}
+		done += chunk;
+	}
+
+	pr->pi_off += len;
+	if (pr->io_complete)
+		return pr->io_complete(pr, vaddr, nr);
+	return 0;
+}
+
 /*
  * We cannot use maybe_read_page_local() for streaming images as it uses
  * pread(), seeking in the file. Instead, we use this custom page reader.
@@ -479,7 +649,7 @@ static int read_pagemap_page(struct page_read *pr, unsigned long vaddr, unsigned
 	pr_info("pr%lu-%u Read %lx %lu pages\n", pr->img_id, pr->id, vaddr, nr);
 	pagemap_bound_check(pr->pe, vaddr, nr);
 
-	if (pagemap_in_parent(pr->pe)) {
+	if (pagemap_in_parent(pr->pe) && !pr->hot_restore) {
 		if (read_parent_page(pr, vaddr, nr, buf, flags) < 0)
 			return -1;
 	} else {
@@ -595,6 +765,12 @@ static int process_async_reads(struct page_read *pr)
 	return ret;
 }
 
+static int hot_read_sync(struct page_read *pr)
+{
+	(void)pr;
+	return 0;
+}
+
 static void close_page_read(struct page_read *pr)
 {
 	int ret;
@@ -618,6 +794,10 @@ static void close_page_read(struct page_read *pr)
 		close_image(pr->pmi);
 	if (pr->pi)
 		close_image(pr->pi);
+	if (pr->hot) {
+		hot_read_close_ctx(pr->hot);
+		pr->hot = NULL;
+	}
 
 	if (pr->pmes)
 		free_pagemaps(pr);
@@ -767,6 +947,7 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 	int flags, i_typ;
 	static unsigned ids = 1;
 	bool remote = pr_flags & PR_REMOTE;
+	bool hot_restore = hot_restore_enabled() && !(pr_flags & PR_REMOTE);
 
 	/*
 	 * Only the top-most page-read can be remote, all the
@@ -786,6 +967,7 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 		break;
 	case PR_SHMEM:
 		i_typ = CR_FD_SHMEM_PAGEMAP;
+		hot_restore = false;
 		break;
 	default:
 		BUG();
@@ -800,8 +982,13 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 	pr->bunch.iov_len = 0;
 	pr->bunch.iov_base = NULL;
 	pr->pmes = NULL;
+	pr->pi = NULL;
+	pr->pmi = NULL;
+	pr->hot = NULL;
+	pr->hot_restore = hot_restore;
 	pr->pieok = false;
 	pr->disable_dedup = false;
+	pr->img_id = img_id;
 
 	pr->pmi = open_image_at(dfd, i_typ, O_RSTR, img_id);
 	if (!pr->pmi)
@@ -812,18 +999,36 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 		return 0;
 	}
 
-	if (try_open_parent(dfd, img_id, pr, pr_flags)) {
+	if (!hot_restore && try_open_parent(dfd, img_id, pr, pr_flags)) {
 		close_image(pr->pmi);
 		return -1;
 	}
 
-	pr->pi = open_pages_image_at(dfd, flags, pr->pmi, &pr->pages_img_id);
-	if (!pr->pi) {
+	if (hot_restore) {
+		PagemapHead *h;
+
+		if (opts.auto_dedup)
+			pr_warn_once("hot page_read disables auto-dedup\n");
+		if (pb_read_one(pr->pmi, &h, PB_PAGEMAP_HEAD) < 0) {
+			close_page_read(pr);
+			return -1;
+		}
+		pr->pages_img_id = h->pages_id;
+		pagemap_head__free_unpacked(h, NULL);
+	} else {
+		pr->pi = open_pages_image_at(dfd, flags, pr->pmi, &pr->pages_img_id);
+		if (!pr->pi) {
+			close_page_read(pr);
+			return -1;
+		}
+	}
+
+	if (init_pagemaps(pr)) {
 		close_page_read(pr);
 		return -1;
 	}
 
-	if (init_pagemaps(pr)) {
+	if (hot_restore && hot_read_load_ctx(pr)) {
 		close_page_read(pr);
 		return -1;
 	}
@@ -832,14 +1037,16 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 	pr->advance = advance;
 	pr->close = close_page_read;
 	pr->skip_pages = skip_pagemap_pages;
-	pr->sync = process_async_reads;
+	pr->sync = hot_restore ? hot_read_sync : process_async_reads;
 	pr->seek_pagemap = seek_pagemap;
 	pr->reset = reset_pagemap;
 	pr->io_complete = NULL; /* set up by the client if needed */
 	pr->id = ids++;
-	pr->img_id = img_id;
 
-	if (remote)
+	if (hot_restore) {
+		pr->maybe_read_page = maybe_read_page_hot;
+		pr->pieok = false;
+	} else if (remote)
 		pr->maybe_read_page = maybe_read_page_remote;
 	else if (opts.stream)
 		pr->maybe_read_page = maybe_read_page_img_streamer;
@@ -849,7 +1056,7 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 			pr->pieok = true;
 	}
 
-	pr_debug("Opened %s page read %u (parent %u)\n", remote ? "remote" : "local", pr->id,
+	pr_debug("Opened %s page read %u (parent %u)\n", hot_restore ? "hot" : (remote ? "remote" : "local"), pr->id,
 		 pr->parent ? pr->parent->id : 0);
 
 	return 1;

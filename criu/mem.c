@@ -3349,6 +3349,8 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 		setup_open_page_xfer_us = dsa_wall_delta_us(setup_t0, setup_t1);
 		if (ret < 0)
 			goto out_pp;
+		if (page_xfer_hot_set_vmas(&xfer, vma_area_list))
+			goto out_xfer;
 
 		xfer.transfer_lazy = !mdc->lazy;
 	} else {

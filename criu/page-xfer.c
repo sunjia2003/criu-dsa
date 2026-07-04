@@ -16,6 +16,7 @@
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "page-xfer: "
@@ -35,6 +36,8 @@
 #include "rst_info.h"
 #include "stats.h"
 #include "tls.h"
+#include "vma.h"
+#include "kerndat.h"
 
 #define HOT_APPLY_SCRATCH_PAGES 32
 #define HOT_DSA_PORTAL_MAP_SIZE 0x1000UL
@@ -55,30 +58,50 @@ struct hot_apply_extent {
 	unsigned long len;
 	off_t append_offset;
 	bool has_append;
+	char seg_file[PATH_MAX];
+	off_t seg_off;
+	bool has_seg;
 };
 
 struct hot_apply_ctx {
 	bool enabled;
+	bool memstore;
 	bool finished;
 	int pipefd[2];
 	int append_fd;
 	int extent_fd;
+	int manifest_fd;
 	int fd_type;
 	unsigned long img_id;
 	u32 pages_id;
 	u32 current_pages_id;
 	const char *manifest_path;
+	const char *memory_manifest_path;
+	const char *memory_next_path;
 	const char *current_dir;
+	const char *hot_root;
 	unsigned long next_seq;
 	struct hot_apply_extent *entries;
 	size_t nr_entries;
 	size_t entries_cap;
+	struct hot_memstore_seg *old_memstore;
+	size_t nr_old_memstore;
+	struct hot_vma_segment *vma_segments;
+	size_t nr_vma_segments;
+	size_t vma_segments_cap;
 	size_t pending_index;
 	uint64_t append_bytes;
+	uint64_t memstore_bytes;
+	uint64_t memstore_segments;
 	uint64_t append_time_us;
 	uint64_t append_prepare_us;
 	uint64_t append_tee_us;
 	uint64_t append_splice_us;
+	uint64_t append_enqueue_wait_us;
+	uint64_t worker_wait_us;
+	uint64_t worker_join_us;
+	uint64_t worker_queue_max;
+	uint64_t worker_pipe_size;
 	uint64_t reorder_time_us;
 	uint64_t moved_pages;
 	uint64_t moved_ranges;
@@ -143,6 +166,14 @@ struct hot_page_source {
 	bool patch;
 };
 
+struct hot_vma_segment {
+	unsigned long start;
+	unsigned long end;
+	off_t off;
+	int fd;
+	char file[PATH_MAX];
+};
+
 static uint64_t hot_now_us(void)
 {
 	struct timespec ts;
@@ -155,9 +186,11 @@ static bool dsa_hot_apply_enabled(void)
 {
 	const char *enabled = getenv("CRIU_DSA_HOT_APPLY");
 	const char *current = getenv("CRIU_DSA_HOT_CURRENT_DIR");
+	const char *root = getenv("CRIU_DSA_HOT_ROOT");
 	const char *dsa = getenv("CRIU_DSA_DUMP");
 
-	return enabled && strcmp(enabled, "1") == 0 && current && current[0] &&
+	return enabled && strcmp(enabled, "1") == 0 &&
+	       ((current && current[0]) || (root && root[0])) &&
 	       dsa && strcmp(dsa, "1") == 0;
 }
 
@@ -683,11 +716,415 @@ static int write_full_fd(int fd, const void *buf, size_t len)
 	return 0;
 }
 
+struct hot_memstore_seg {
+	unsigned long img_id;
+	unsigned long vaddr;
+	unsigned long len;
+	off_t off;
+	char file[PATH_MAX];
+};
+
+static bool hot_mode_is_memstore(void)
+{
+	const char *mode = getenv("CRIU_DSA_HOT_MODE");
+
+	return mode && strcmp(mode, "memstore") == 0;
+}
+
+static int hot_memstore_load(const char *path, struct hot_memstore_seg **segs_out,
+			     size_t *nr_out)
+{
+	FILE *fp;
+	struct hot_memstore_seg *segs = NULL;
+	size_t nr = 0, cap = 0;
+	char line[PATH_MAX + 128];
+
+	*segs_out = NULL;
+	*nr_out = 0;
+	if (!path || !path[0])
+		return 0;
+
+	fp = fopen(path, "r");
+	if (!fp) {
+		if (errno == ENOENT)
+			return 0;
+		pr_perror("DSA hot memstore can't open old manifest %s", path);
+		return -1;
+	}
+
+	while (fgets(line, sizeof(line), fp)) {
+		struct hot_memstore_seg seg;
+		unsigned long long off;
+		int n;
+
+		memset(&seg, 0, sizeof(seg));
+		n = sscanf(line, "seg %lu %lx %lu %4095s %llu",
+			   &seg.img_id, &seg.vaddr, &seg.len, seg.file, &off);
+		if (n != 5)
+			continue;
+		seg.off = (off_t)off;
+
+		if (nr == cap) {
+			size_t new_cap = cap ? cap * 2 : 256;
+			void *new_segs = xrealloc(segs, new_cap * sizeof(segs[0]));
+
+			if (!new_segs) {
+				fclose(fp);
+				xfree(segs);
+				return -1;
+			}
+			segs = new_segs;
+			cap = new_cap;
+		}
+		segs[nr++] = seg;
+	}
+
+	fclose(fp);
+	*segs_out = segs;
+	*nr_out = nr;
+	return 0;
+}
+
+static int hot_memstore_emit_line_fd(int fd, unsigned long img_id,
+				     unsigned long vaddr, unsigned long len,
+				     const char *file, off_t off)
+{
+	char line[PATH_MAX + 128];
+	int n;
+
+	n = snprintf(line, sizeof(line), "seg %lu %lx %lu %s %llu\n",
+		     img_id, vaddr, len, file, (unsigned long long)off);
+	if (n < 0 || n >= (int)sizeof(line)) {
+		pr_err("DSA hot memstore manifest line overflow\n");
+		return -1;
+	}
+	if (write_full_fd(fd, line, n)) {
+		pr_perror("DSA hot memstore manifest append failed");
+		return -1;
+	}
+	return 0;
+}
+
 static int hot_apply_mkdir_root(const char *root)
 {
 	if (mkdir(root, 0755) && errno != EEXIST) {
 		pr_perror("DSA hot apply can't create %s", root);
 		return -1;
+	}
+
+	return 0;
+}
+
+static int hot_memstore_mkdir_image(struct hot_apply_ctx *ctx, char *dir,
+				    size_t dir_len)
+{
+	char memstore[PATH_MAX];
+
+	if (snprintf(memstore, sizeof(memstore), "%s/memstore", ctx->hot_root) >=
+	    (int)sizeof(memstore)) {
+		pr_err("DSA hot memstore path too long\n");
+		return -1;
+	}
+	if (hot_apply_mkdir_root(memstore))
+		return -1;
+	if (snprintf(dir, dir_len, "%s/image-%lu", memstore, ctx->img_id) >=
+	    (int)dir_len) {
+		pr_err("DSA hot memstore image path too long\n");
+		return -1;
+	}
+	return hot_apply_mkdir_root(dir);
+}
+
+static int hot_memstore_open_vma_segment(struct hot_apply_ctx *ctx,
+					 unsigned long start,
+					 unsigned long end,
+					 const char *reuse_file,
+					 off_t reuse_off,
+					 struct hot_vma_segment *seg)
+{
+	char dir[PATH_MAX];
+	char path[PATH_MAX];
+	unsigned long len = end - start;
+	int fd;
+
+	memset(seg, 0, sizeof(*seg));
+	seg->fd = -1;
+	seg->start = start;
+	seg->end = end;
+	seg->off = reuse_off;
+
+	if (reuse_file && reuse_file[0]) {
+		fd = open(reuse_file, O_RDWR | O_CLOEXEC);
+		if (fd < 0) {
+			pr_perror("DSA hot memstore can't reopen VMA segment %s", reuse_file);
+			return -1;
+		}
+		if (snprintf(seg->file, sizeof(seg->file), "%s", reuse_file) >=
+		    (int)sizeof(seg->file)) {
+			pr_err("DSA hot memstore reused VMA path too long\n");
+			close(fd);
+			return -1;
+		}
+		seg->fd = fd;
+		return 0;
+	}
+
+	if (hot_memstore_mkdir_image(ctx, dir, sizeof(dir)))
+		return -1;
+	if (snprintf(path, sizeof(path), "%s/vma-%lx-%lx.mem", dir, start, end) >=
+	    (int)sizeof(path)) {
+		pr_err("DSA hot memstore VMA segment path too long\n");
+		return -1;
+	}
+
+	fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
+	if (fd < 0) {
+		pr_perror("DSA hot memstore can't open VMA segment %s", path);
+		return -1;
+	}
+	if (ftruncate(fd, len)) {
+		pr_perror("DSA hot memstore can't size VMA segment %s", path);
+		close(fd);
+		return -1;
+	}
+
+	if (snprintf(seg->file, sizeof(seg->file), "%s", path) >=
+	    (int)sizeof(seg->file)) {
+		pr_err("DSA hot memstore VMA path too long\n");
+		close(fd);
+		return -1;
+	}
+	seg->fd = fd;
+	seg->off = 0;
+	return 0;
+}
+
+static int hot_memstore_prefill_vma_from_old(struct hot_apply_ctx *ctx,
+					     struct hot_vma_segment *seg);
+
+static int hot_memstore_register_segment(struct hot_apply_ctx *ctx,
+					 unsigned long start,
+					 unsigned long end,
+					 const char *reuse_file,
+					 off_t reuse_off,
+					 bool prefill_old)
+{
+	struct hot_vma_segment seg;
+	void *new_segments;
+
+	if (hot_memstore_open_vma_segment(ctx, start, end, reuse_file,
+					  reuse_off, &seg))
+		return -1;
+	if (prefill_old && hot_memstore_prefill_vma_from_old(ctx, &seg)) {
+		close(seg.fd);
+		return -1;
+	}
+
+	if (ctx->nr_vma_segments == ctx->vma_segments_cap) {
+		size_t new_cap = ctx->vma_segments_cap ? ctx->vma_segments_cap * 2 : 128;
+
+		new_segments = xrealloc(ctx->vma_segments,
+					new_cap * sizeof(ctx->vma_segments[0]));
+		if (!new_segments) {
+			close(seg.fd);
+			return -1;
+		}
+		ctx->vma_segments = new_segments;
+		ctx->vma_segments_cap = new_cap;
+	}
+	ctx->vma_segments[ctx->nr_vma_segments++] = seg;
+	return 0;
+}
+
+static struct hot_memstore_seg *hot_memstore_find_old_cover(struct hot_apply_ctx *ctx,
+							    unsigned long start,
+							    unsigned long end)
+{
+	size_t i;
+
+	for (i = 0; i < ctx->nr_old_memstore; i++) {
+		struct hot_memstore_seg *old = &ctx->old_memstore[i];
+		unsigned long old_end;
+
+		if (old->img_id != ctx->img_id)
+			continue;
+		old_end = old->vaddr + old->len;
+		if (old->vaddr <= start && old_end >= end)
+			return old;
+	}
+	return NULL;
+}
+
+static int copy_fd_range_loop(int src_fd, off_t src_off, int dst_fd,
+			      off_t dst_off, unsigned long len)
+{
+	char buf[PAGE_SIZE * 16];
+	unsigned long done = 0;
+
+	while (done < len) {
+		size_t chunk = len - done;
+		size_t curr = 0;
+
+		if (chunk > sizeof(buf))
+			chunk = sizeof(buf);
+		while (curr < chunk) {
+			size_t want = chunk - curr;
+			ssize_t ret;
+
+			if (want > sizeof(buf) - curr)
+				want = sizeof(buf) - curr;
+			ret = pread(src_fd, buf + curr, want,
+					    src_off + done + curr);
+
+			if (ret < 1) {
+				pr_perror("DSA hot memstore old segment read failed");
+				return -1;
+			}
+			curr += ret;
+		}
+
+		curr = 0;
+		while (curr < chunk) {
+			size_t want = chunk - curr;
+			ssize_t ret;
+
+			if (want > sizeof(buf) - curr)
+				want = sizeof(buf) - curr;
+			ret = pwrite(dst_fd, buf + curr, want,
+					     dst_off + done + curr);
+
+			if (ret < 1) {
+				pr_perror("DSA hot memstore VMA prefill write failed");
+				return -1;
+			}
+			curr += ret;
+		}
+		done += chunk;
+	}
+
+	return 0;
+}
+
+static int hot_memstore_prefill_vma_from_old(struct hot_apply_ctx *ctx,
+					     struct hot_vma_segment *seg)
+{
+	size_t i;
+
+	for (i = 0; i < ctx->nr_old_memstore; i++) {
+		struct hot_memstore_seg *old = &ctx->old_memstore[i];
+		unsigned long old_end;
+		unsigned long begin, end, len;
+		int old_fd;
+		int ret;
+
+		if (old->img_id != ctx->img_id)
+			continue;
+		old_end = old->vaddr + old->len;
+		if (old_end <= seg->start || old->vaddr >= seg->end)
+			continue;
+
+		begin = old->vaddr > seg->start ? old->vaddr : seg->start;
+		end = old_end < seg->end ? old_end : seg->end;
+		len = end - begin;
+		if (!len)
+			continue;
+
+		old_fd = open(old->file, O_RDONLY | O_CLOEXEC);
+		if (old_fd < 0) {
+			pr_perror("DSA hot memstore can't open old segment %s", old->file);
+			return -1;
+		}
+		ret = copy_fd_range_loop(old_fd, old->off + (begin - old->vaddr),
+					 seg->fd, seg->off + (begin - seg->start),
+					 len);
+		close(old_fd);
+		if (ret)
+			return -1;
+	}
+
+	return 0;
+}
+
+static struct hot_vma_segment *hot_memstore_find_vma_segment(struct hot_apply_ctx *ctx,
+							     unsigned long vaddr,
+							     unsigned long len)
+{
+	size_t i;
+	unsigned long end = vaddr + len;
+
+	for (i = 0; i < ctx->nr_vma_segments; i++) {
+		struct hot_vma_segment *seg = &ctx->vma_segments[i];
+
+		if (vaddr >= seg->start && end <= seg->end)
+			return seg;
+	}
+	return NULL;
+}
+
+static int splice_exact_at(int in, int out, off_t off, unsigned long len);
+
+static bool hot_memstore_should_track_vma(struct vma_area *vma)
+{
+	VmaEntry *e = vma->e;
+
+	if (vma_area_is(vma, VMA_AREA_GUARD))
+		return false;
+	if (vma_entry_is(e, VMA_AREA_VSYSCALL))
+		return false;
+	if (e->flags & MAP_HUGETLB)
+		return false;
+	if (e->start >= kdat.task_size || e->end > kdat.task_size)
+		return false;
+	return true;
+}
+
+static int hot_memstore_splice_to_segments(struct hot_apply_ctx *ctx, int pipefd,
+					   unsigned long vaddr,
+					   unsigned long len)
+{
+	unsigned long done = 0;
+
+	while (done < len) {
+		unsigned long cur = vaddr + done;
+		unsigned long chunk;
+		struct hot_vma_segment *seg;
+
+		seg = hot_memstore_find_vma_segment(ctx, cur, PAGE_SIZE);
+		if (!seg) {
+			pr_err("DSA hot memstore can't find VMA segment img_id=%lu vaddr=%lx len=%lu range=%lx-%lx\n",
+			       ctx->img_id, cur, len - done, vaddr, vaddr + len);
+			return -1;
+		}
+
+		chunk = seg->end - cur;
+		if (chunk > len - done)
+			chunk = len - done;
+		if (splice_exact_at(pipefd, seg->fd,
+				    seg->off + (cur - seg->start), chunk))
+			return -1;
+		done += chunk;
+	}
+
+	return 0;
+}
+
+static int splice_exact_at(int in, int out, off_t off, unsigned long len)
+{
+	unsigned long curr = 0;
+
+	while (curr < len) {
+		loff_t pos = off + curr;
+		ssize_t ret = splice(in, NULL, out, &pos, len - curr, SPLICE_F_MOVE);
+
+		if (ret == -1) {
+			pr_perror("Unable to splice pages data at offset");
+			return -1;
+		}
+		if (ret == 0) {
+			pr_err("A pipe was closed unexpectedly\n");
+			return -1;
+		}
+		curr += ret;
 	}
 
 	return 0;
@@ -773,7 +1210,7 @@ static int hot_apply_add_entry(struct hot_apply_ctx *ctx, struct iovec *iov, u32
 	e->flags = flags;
 	e->fd_type = ctx->fd_type;
 	e->img_id = ctx->img_id;
-	e->pages_id = ctx->current_pages_id;
+	e->pages_id = ctx->memstore ? ctx->pages_id : ctx->current_pages_id;
 	e->vaddr = (unsigned long)iov->iov_base;
 	e->len = iov->iov_len;
 	if (idx)
@@ -1657,6 +2094,7 @@ out:
 static void hot_apply_abort(struct page_xfer *xfer)
 {
 	struct hot_apply_ctx *ctx = xfer->hot_apply;
+	size_t i;
 
 	if (!ctx)
 		return;
@@ -1675,10 +2113,59 @@ static void hot_apply_abort(struct page_xfer *xfer)
 		close(ctx->append_fd);
 	if (ctx->extent_fd >= 0)
 		close(ctx->extent_fd);
+	if (ctx->manifest_fd >= 0)
+		close(ctx->manifest_fd);
+	for (i = 0; i < ctx->nr_vma_segments; i++) {
+		if (ctx->vma_segments[i].fd >= 0)
+			close(ctx->vma_segments[i].fd);
+	}
 
+	xfree(ctx->old_memstore);
+	xfree(ctx->vma_segments);
 	xfree(ctx->entries);
 	xfree(ctx);
 	xfer->hot_apply = NULL;
+}
+
+static int hot_memstore_finish(struct hot_apply_ctx *ctx)
+{
+	size_t i;
+	int ret = -1;
+	uint64_t producer_time_us;
+	uint64_t total_hot_work_us;
+
+	if (ctx->manifest_fd < 0) {
+		pr_err("DSA hot memstore manifest fd is not open\n");
+		goto out;
+	}
+	if (!ctx->nr_vma_segments) {
+		pr_err("DSA hot memstore has no VMA segments for img_id=%lu\n",
+		       ctx->img_id);
+		goto out;
+	}
+
+	for (i = 0; i < ctx->nr_vma_segments; i++) {
+		struct hot_vma_segment *seg = &ctx->vma_segments[i];
+
+		if (hot_memstore_emit_line_fd(ctx->manifest_fd, ctx->img_id,
+					      seg->start, seg->end - seg->start,
+					      seg->file, seg->off))
+			goto out;
+	}
+
+	ctx->memstore_segments = ctx->nr_vma_segments;
+	producer_time_us = ctx->append_time_us;
+	total_hot_work_us = ctx->append_time_us;
+	pr_info("DSA hot memstore updated img_id=%lu entries=%zu bytes=%" PRIu64 " vma_segments=%" PRIu64 " append_time_us=%" PRIu64 " producer_time_us=%" PRIu64 " tee_us=%" PRIu64 " write_us=%" PRIu64 " enqueue_wait_us=%" PRIu64 " worker_wait_us=%" PRIu64 " worker_join_us=%" PRIu64 " queue_max=%" PRIu64 " pipe_size=%" PRIu64 "\n",
+		ctx->img_id, ctx->nr_entries, ctx->memstore_bytes,
+		ctx->memstore_segments, total_hot_work_us, producer_time_us,
+		ctx->append_tee_us, ctx->append_splice_us, ctx->append_enqueue_wait_us,
+		ctx->worker_wait_us, ctx->worker_join_us,
+		ctx->worker_queue_max, ctx->worker_pipe_size);
+	ret = 0;
+
+out:
+	return ret;
 }
 
 static int hot_apply_finish(struct page_xfer *xfer)
@@ -1699,7 +2186,10 @@ static int hot_apply_finish(struct page_xfer *xfer)
 		close(ctx->pipefd[0]);
 		ctx->pipefd[0] = -1;
 	}
-	if (ret == 0 && hot_apply_reorder_current(ctx))
+	if (ctx->memstore) {
+		if (ret == 0 && hot_memstore_finish(ctx))
+			ret = -1;
+	} else if (ret == 0 && hot_apply_reorder_current(ctx))
 		ret = -1;
 	if (ctx->append_fd >= 0) {
 		if (close(ctx->append_fd)) {
@@ -1715,12 +2205,15 @@ static int hot_apply_finish(struct page_xfer *xfer)
 		}
 		ctx->extent_fd = -1;
 	}
-	/*
-	 * This implementation only appends dirty/new page bytes and records
-	 * descriptors. The current full image is not ready for restore until
-	 * the post-write reorder/pagemap rewrite phase runs.
-	 */
-	if (hot_apply_write_manifest(ctx->manifest_path, ret ? "failed" : "append_pending"))
+	if (ctx->manifest_fd >= 0) {
+		if (close(ctx->manifest_fd)) {
+			pr_perror("DSA hot memstore manifest close failed");
+			ret = -1;
+		}
+		ctx->manifest_fd = -1;
+	}
+	if (!ctx->memstore &&
+	    hot_apply_write_manifest(ctx->manifest_path, ret ? "failed" : "append_pending"))
 		ret = -1;
 
 	xfree(ctx->entries);
@@ -1732,7 +2225,10 @@ static int hot_apply_init_xfer(struct page_xfer *xfer, int fd_type,
 			       unsigned long img_id, u32 pages_id)
 {
 	const char *root = getenv("CRIU_DSA_HOT_CURRENT_DIR");
+	const char *hot_root = getenv("CRIU_DSA_HOT_ROOT");
 	const char *manifest = getenv("CRIU_DSA_HOT_MANIFEST");
+	const char *memory_manifest = getenv("CRIU_DSA_HOT_MEMORY_MANIFEST");
+	const char *memory_next = getenv("CRIU_DSA_HOT_MEMORY_NEXT");
 	struct hot_apply_ctx *ctx;
 	char name[128];
 	char path[PATH_MAX];
@@ -1749,24 +2245,61 @@ static int hot_apply_init_xfer(struct page_xfer *xfer, int fd_type,
 	ctx->pipefd[1] = -1;
 	ctx->append_fd = -1;
 	ctx->extent_fd = -1;
+	ctx->manifest_fd = -1;
 	ctx->fd_type = fd_type;
 	ctx->img_id = img_id;
 	ctx->pages_id = pages_id;
 	ctx->current_dir = root;
+	ctx->hot_root = hot_root && hot_root[0] ? hot_root : root;
 	ctx->manifest_path = manifest;
+	ctx->memory_manifest_path = memory_manifest;
+	ctx->memory_next_path = memory_next;
+	ctx->memstore = hot_mode_is_memstore();
 	ctx->pending_index = (size_t)-1;
 
-	if (hot_apply_mkdir_root(root))
-		goto err;
-	if (hot_apply_write_manifest(ctx->manifest_path, "updating"))
-		goto err;
-	if (hot_apply_read_current_pages_id(ctx, root))
-		goto err;
+	if (ctx->memstore && fd_type != CR_FD_PAGEMAP) {
+		pr_info("DSA hot memstore skips non-task pagemap fd_type=%d img_id=%lu\n",
+			fd_type, img_id);
+		xfree(ctx);
+		return 0;
+	}
 
+	if (!ctx->hot_root || !ctx->hot_root[0]) {
+		pr_err("DSA hot apply has no hot root/current dir\n");
+		goto err;
+	}
+	if (hot_apply_mkdir_root(ctx->hot_root))
+		goto err;
 	if (pipe2(ctx->pipefd, O_CLOEXEC)) {
 		pr_perror("DSA hot apply can't create pipe");
 		goto err;
 	}
+
+	if (ctx->memstore) {
+		if (!ctx->memory_next_path || !ctx->memory_next_path[0]) {
+			pr_err("DSA hot memstore requires CRIU_DSA_HOT_MEMORY_NEXT\n");
+			goto err;
+		}
+		ctx->manifest_fd = open(ctx->memory_next_path,
+					O_CREAT | O_APPEND | O_WRONLY | O_CLOEXEC,
+					0644);
+		if (ctx->manifest_fd < 0) {
+			pr_perror("DSA hot memstore can't open next manifest %s",
+				  ctx->memory_next_path);
+			goto err;
+		}
+		xfer->hot_apply = ctx;
+		pr_info("DSA hot memstore enabled fd_type=%d img_id=%lu pages_id=%u root=%s next=%s old=%s\n",
+			fd_type, img_id, pages_id, ctx->hot_root,
+			ctx->memory_next_path,
+			ctx->memory_manifest_path ? ctx->memory_manifest_path : "");
+		return 0;
+	}
+
+	if (hot_apply_write_manifest(ctx->manifest_path, "updating"))
+		goto err;
+	if (hot_apply_read_current_pages_id(ctx, root))
+		goto err;
 
 	snprintf(name, sizeof(name), "pages-%u.img", ctx->current_pages_id);
 	ctx->append_fd = hot_apply_open_file(root, path, sizeof(path), name,
@@ -1791,6 +2324,47 @@ err:
 	xfer->hot_apply = ctx;
 	hot_apply_abort(xfer);
 	return -1;
+}
+
+int page_xfer_hot_set_vmas(struct page_xfer *xfer, struct vm_area_list *vmas)
+{
+	struct hot_apply_ctx *ctx = xfer->hot_apply;
+	struct vma_area *vma;
+
+	if (!ctx || !ctx->memstore)
+		return 0;
+	if (ctx->fd_type != CR_FD_PAGEMAP)
+		return 0;
+	if (hot_memstore_load(ctx->memory_manifest_path,
+			      &ctx->old_memstore,
+			      &ctx->nr_old_memstore))
+		return -1;
+
+	list_for_each_entry(vma, &vmas->h, list) {
+		struct hot_memstore_seg *old;
+		unsigned long start, end;
+		const char *reuse_file = NULL;
+		off_t reuse_off = 0;
+
+		if (!hot_memstore_should_track_vma(vma))
+			continue;
+
+		start = vma->e->start;
+		end = vma->e->end;
+		old = hot_memstore_find_old_cover(ctx, start, end);
+		if (old) {
+			reuse_file = old->file;
+			reuse_off = old->off + (start - old->vaddr);
+		}
+
+		if (hot_memstore_register_segment(ctx, start, end,
+						  reuse_file, reuse_off, !old))
+			return -1;
+	}
+
+	pr_info("DSA hot memstore VMA index ready img_id=%lu segments=%zu old_segments=%zu\n",
+		ctx->img_id, ctx->nr_vma_segments, ctx->nr_old_memstore);
+	return 0;
 }
 
 static int hot_apply_set_pending(struct page_xfer *xfer, struct iovec *iov, u32 flags)
@@ -1822,7 +2396,7 @@ static int hot_apply_set_pending(struct page_xfer *xfer, struct iovec *iov, u32 
 	ctx->pending.flags = flags;
 	ctx->pending.fd_type = ctx->fd_type;
 	ctx->pending.img_id = ctx->img_id;
-	ctx->pending.pages_id = ctx->current_pages_id;
+	ctx->pending.pages_id = ctx->memstore ? ctx->pages_id : ctx->current_pages_id;
 	ctx->pending.vaddr = (unsigned long)iov->iov_base;
 	ctx->pending.len = iov->iov_len;
 	ctx->pending_index = idx;
@@ -1864,6 +2438,44 @@ static int hot_apply_log_pending(struct hot_apply_ctx *ctx, unsigned long len,
 	}
 	if (write_full_fd(ctx->extent_fd, line, n)) {
 		pr_perror("DSA hot apply extent write failed");
+		return -1;
+	}
+
+	return 0;
+}
+
+static int hot_memstore_log_pending(struct hot_apply_ctx *ctx, unsigned long len,
+				    struct hot_apply_extent **entry_out)
+{
+	struct hot_apply_extent *e = &ctx->pending;
+	char line[PATH_MAX + 256];
+	int n;
+
+	*entry_out = NULL;
+	if (!e->valid || e->len != len) {
+		pr_err("DSA hot memstore pending extent mismatch valid=%d pending=%lu write=%lu\n",
+		       e->valid, e->len, len);
+		return -1;
+	}
+
+	e->seq = ctx->next_seq++;
+	if (ctx->pending_index >= ctx->nr_entries) {
+		pr_err("DSA hot memstore pending index is invalid\n");
+		return -1;
+	}
+	ctx->entries[ctx->pending_index].seq = e->seq;
+	*entry_out = &ctx->entries[ctx->pending_index];
+
+	n = snprintf(line, sizeof(line),
+		     "seq=%lu fd_type=%d img_id=%lu pages_id=%u vaddr=%" PRIx64 " len=%lu flags=%" PRIx32 " backend=memstore\n",
+		     e->seq, e->fd_type, e->img_id, e->pages_id,
+		     (uint64_t)e->vaddr, e->len, e->flags);
+	if (n < 0 || n >= (int)sizeof(line)) {
+		pr_err("DSA hot memstore extent line overflow\n");
+		return -1;
+	}
+	if (ctx->extent_fd >= 0 && write_full_fd(ctx->extent_fd, line, n)) {
+		pr_perror("DSA hot memstore extent write failed");
 		return -1;
 	}
 
@@ -2119,11 +2731,16 @@ static int write_pages_loc(struct page_xfer *xfer, int p, unsigned long len)
 	unsigned long curr = 0;
 	off_t append_offset;
 	uint64_t append_prepare_start_us;
+	struct hot_apply_extent *pending_entry = NULL;
 
 	if (!ctx)
 		return splice_exact(p, img_raw_fd(xfer->pi), len);
 
 	append_prepare_start_us = hot_now_us();
+	if (ctx->memstore) {
+		if (hot_memstore_log_pending(ctx, len, &pending_entry))
+			return -1;
+	} else {
 	append_offset = lseek(ctx->append_fd, 0, SEEK_END);
 	if (append_offset == (off_t)-1) {
 		pr_perror("DSA hot apply can't seek append file");
@@ -2132,6 +2749,7 @@ static int write_pages_loc(struct page_xfer *xfer, int p, unsigned long len)
 
 	if (hot_apply_log_pending(ctx, len, append_offset))
 		return -1;
+	}
 	ctx->append_prepare_us += hot_now_us() - append_prepare_start_us;
 
 	while (curr < len) {
@@ -2157,12 +2775,19 @@ static int write_pages_loc(struct page_xfer *xfer, int p, unsigned long len)
 			return -1;
 
 		append_start_us = hot_now_us();
-		if (splice_exact(ctx->pipefd[0], ctx->append_fd, ret))
+		if (ctx->memstore) {
+			if (hot_memstore_splice_to_segments(ctx, ctx->pipefd[0],
+							    pending_entry->vaddr + curr,
+							    ret))
+				return -1;
+		} else if (splice_exact(ctx->pipefd[0], ctx->append_fd, ret))
 			return -1;
 		append_delta_us = hot_now_us() - append_start_us;
 		ctx->append_splice_us += append_delta_us;
 		ctx->append_time_us += append_delta_us;
 		ctx->append_bytes += ret;
+		if (ctx->memstore)
+			ctx->memstore_bytes += ret;
 
 		curr += ret;
 	}

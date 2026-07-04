@@ -57,6 +57,7 @@ struct page_read {
 
 	/* Whether or not pages can be read in PIE code */
 	bool pieok;
+	bool hot_restore;
 
 	/* Whether or not disable image deduplication*/
 	bool disable_dedup;
@@ -64,6 +65,7 @@ struct page_read {
 	/* Private data of reader */
 	struct cr_img *pmi;
 	struct cr_img *pi;
+	void *hot;
 	u32 pages_img_id;
 
 	PagemapEntry *pe;	  /* current pagemap we are on */
