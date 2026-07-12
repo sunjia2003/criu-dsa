@@ -17,6 +17,13 @@
 #include <linux/memfd.h>
 #include <sys/stat.h>
 
+static uint64_t restore_now_us(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000ULL + ts.tv_nsec / 1000ULL;
+}
 
 #ifndef MFD_HUGE_1GB
 #define MFD_HUGE_1GB	(30 << MFD_HUGE_SHIFT)
@@ -1078,6 +1085,11 @@ struct dsa_dump_ctx {
 	size_t shared_map_size;
 	int wq_count;
 	char wq_paths[DSA_DUMP_MAX_WQ][64];
+	bool fine_grained;
+	struct dsa_fg_old_segment *fg_old_segments;
+	int *fg_old_fds;
+	u32 fg_old_seg_count;
+	u32 fg_record_stride;
 	struct {
 		bool ready;
 		int pipe_fd;
@@ -1089,6 +1101,155 @@ struct dsa_dump_ctx {
 
 static void dsa_replay_ctx_init(struct dsa_dump_ctx *ctx);
 static int dsa_replay_to_pipe(struct dsa_dump_ctx *ctx);
+
+struct dsa_fg_old_seg_bf {
+	struct dsa_fg_old_segment meta;
+	int fd;
+	char file[PATH_MAX];
+};
+
+struct dsa_fg_before_freeze {
+	bool enabled;
+	bool ready;
+	struct dsa_fg_old_seg_bf *segs;
+	size_t nr;
+	size_t cap;
+	u64 parse_us;
+	u64 open_us;
+};
+
+static struct dsa_fg_before_freeze dsa_fg_bf;
+
+static bool dsa_fine_grained_enabled(void)
+{
+	const char *enabled = getenv("CRIU_DSA_FINE_GRAINED");
+
+	return enabled && (!strcmp(enabled, "1") || !strcasecmp(enabled, "true") ||
+			   !strcasecmp(enabled, "yes") || !strcasecmp(enabled, "on"));
+}
+
+static void dsa_fg_bf_reset(void)
+{
+	size_t i;
+
+	for (i = 0; i < dsa_fg_bf.nr; i++) {
+		if (dsa_fg_bf.segs[i].fd >= 0)
+			close(dsa_fg_bf.segs[i].fd);
+	}
+	xfree(dsa_fg_bf.segs);
+	memset(&dsa_fg_bf, 0, sizeof(dsa_fg_bf));
+}
+
+static int dsa_fg_bf_add_seg(unsigned long img_id, unsigned long vaddr,
+			     unsigned long len, const char *file,
+			     unsigned long long file_off)
+{
+	struct dsa_fg_old_seg_bf *seg;
+	struct stat st;
+	int fd;
+
+	if (dsa_fg_bf.nr == dsa_fg_bf.cap) {
+		size_t new_cap = dsa_fg_bf.cap ? dsa_fg_bf.cap * 2 : 128;
+		void *new_segs = xrealloc(dsa_fg_bf.segs,
+					  new_cap * sizeof(dsa_fg_bf.segs[0]));
+
+		if (!new_segs)
+			return -1;
+		dsa_fg_bf.segs = new_segs;
+		dsa_fg_bf.cap = new_cap;
+	}
+
+	fd = open(file, O_RDONLY | O_CLOEXEC);
+	if (fd < 0) {
+		pr_perror("DSA fine-grained can't open old segment %s", file);
+		return -1;
+	}
+	if (fstat(fd, &st)) {
+		pr_perror("DSA fine-grained can't stat old segment %s", file);
+		close(fd);
+		return -1;
+	}
+	if ((unsigned long long)st.st_size < file_off + len) {
+		pr_err("DSA fine-grained old segment too small file=%s size=%llu need=%llu\n",
+		       file, (unsigned long long)st.st_size, file_off + len);
+		close(fd);
+		return -1;
+	}
+
+	seg = &dsa_fg_bf.segs[dsa_fg_bf.nr];
+	memset(seg, 0, sizeof(*seg));
+	seg->fd = fd;
+	seg->meta.img_id = img_id;
+	seg->meta.vaddr = vaddr;
+	seg->meta.len = len;
+	seg->meta.file_off = file_off;
+	seg->meta.fd_index = dsa_fg_bf.nr;
+	if (snprintf(seg->file, sizeof(seg->file), "%s", file) >=
+	    (int)sizeof(seg->file)) {
+		pr_err("DSA fine-grained old segment path too long\n");
+		close(fd);
+		return -1;
+	}
+	dsa_fg_bf.nr++;
+	return 0;
+}
+
+static int dsa_fg_prepare_before_freeze(void)
+{
+	const char *manifest = getenv("CRIU_DSA_HOT_MEMORY_MANIFEST");
+	FILE *fp;
+	char line[PATH_MAX + 128];
+	u64 start_us;
+	u64 open_start_us;
+
+	dsa_fg_bf_reset();
+	dsa_fg_bf.enabled = dsa_fine_grained_enabled();
+	if (!dsa_dump_enabled() || !dsa_fg_bf.enabled)
+		return 0;
+	if (!manifest || !manifest[0]) {
+		pr_info("DSA fine-grained enabled without old hot memory manifest; first dump will use full records\n");
+		dsa_fg_bf.ready = true;
+		return 0;
+	}
+
+	start_us = dsa_wall_now_us();
+	fp = fopen(manifest, "r");
+	if (!fp) {
+		if (errno == ENOENT) {
+			pr_info("DSA fine-grained old manifest missing; first dump will use full records: %s\n",
+				manifest);
+			dsa_fg_bf.ready = true;
+			return 0;
+		}
+		pr_perror("DSA fine-grained can't open old manifest %s", manifest);
+		return -1;
+	}
+
+	while (fgets(line, sizeof(line), fp)) {
+		unsigned long img_id, vaddr, len;
+		unsigned long long off;
+		char file[PATH_MAX];
+		int n;
+
+		n = sscanf(line, "seg %lu %lx %lu %4095s %llu",
+			   &img_id, &vaddr, &len, file, &off);
+		if (n != 5)
+			continue;
+		open_start_us = dsa_wall_now_us();
+		if (dsa_fg_bf_add_seg(img_id, vaddr, len, file, off)) {
+			fclose(fp);
+			return -1;
+		}
+		dsa_fg_bf.open_us += dsa_wall_delta_us(open_start_us, dsa_wall_now_us());
+	}
+	fclose(fp);
+	dsa_fg_bf.parse_us = dsa_wall_delta_us(start_us, dsa_wall_now_us());
+	dsa_fg_bf.ready = true;
+	pr_info("DSA fine-grained prepare before freeze: old_segments=%zu parse_us=%llu open_us=%llu manifest=%s\n",
+		dsa_fg_bf.nr, (unsigned long long)dsa_fg_bf.parse_us,
+		(unsigned long long)dsa_fg_bf.open_us, manifest);
+	return 0;
+}
 
 struct dsa_shared_mem_before_freeze {
 	int fd;
@@ -1135,6 +1296,7 @@ void dsa_shared_mem_cleanup_after_dump(void)
 	if (dsa_shared_mem_bf.fd >= 0)
 		close(dsa_shared_mem_bf.fd);
 
+	dsa_fg_bf_reset();
 	dsa_shared_mem_bf_reset();
 }
 
@@ -1214,6 +1376,9 @@ int dsa_shared_mem_prepare_before_freeze(void)
 		(unsigned long long)dsa_shared_mem_bf.mmap_us,
 		(unsigned long long)dsa_shared_mem_bf.total_us);
 
+	if (dsa_fg_prepare_before_freeze())
+		goto err;
+
 	return 0;
 
 err:
@@ -1222,6 +1387,7 @@ err:
 	if (fd >= 0)
 		close(fd);
 
+	dsa_fg_bf_reset();
 	dsa_shared_mem_bf_reset();
 	return -1;
 }
@@ -1252,6 +1418,7 @@ static int dsa_take_shared_mem_before_freeze(struct dsa_dump_ctx *ctx, pid_t tar
 static int dsa_dump_ctx_init(struct dsa_dump_ctx *ctx, pid_t target_pid)
 {
 	int ret;
+	size_t i;
 
 	if (!ctx)
 		return -1;
@@ -1277,9 +1444,46 @@ static int dsa_dump_ctx_init(struct dsa_dump_ctx *ctx, pid_t target_pid)
 		pr_err("DSA shared buffer alignment is invalid\n");
 		return -1;
 	}
+	ctx->fine_grained = dsa_fg_bf.enabled && dsa_fg_bf.ready;
+	ctx->fg_record_stride = round_up(sizeof(struct parasite_dsa_fg_result), 64U);
+	if (ctx->fine_grained && dsa_fg_bf.nr) {
+		ctx->fg_old_segments = xmalloc(dsa_fg_bf.nr * sizeof(ctx->fg_old_segments[0]));
+		ctx->fg_old_fds = xmalloc(dsa_fg_bf.nr * sizeof(ctx->fg_old_fds[0]));
+		if (!ctx->fg_old_segments || !ctx->fg_old_fds) {
+			xfree(ctx->fg_old_segments);
+			xfree(ctx->fg_old_fds);
+			ctx->fg_old_segments = NULL;
+			ctx->fg_old_fds = NULL;
+			return -1;
+		}
+		ctx->fg_old_seg_count = dsa_fg_bf.nr;
+		for (i = 0; i < dsa_fg_bf.nr; i++)
+			ctx->fg_old_fds[i] = -1;
+		for (i = 0; i < dsa_fg_bf.nr; i++) {
+			ctx->fg_old_segments[i] = dsa_fg_bf.segs[i].meta;
+			ctx->fg_old_fds[i] = dup(dsa_fg_bf.segs[i].fd);
+			if (ctx->fg_old_fds[i] < 0) {
+				pr_perror("DSA fine-grained can't dup old segment fd");
+				while (i > 0) {
+					i--;
+					if (ctx->fg_old_fds[i] >= 0)
+						close(ctx->fg_old_fds[i]);
+				}
+				xfree(ctx->fg_old_segments);
+				xfree(ctx->fg_old_fds);
+				ctx->fg_old_segments = NULL;
+				ctx->fg_old_fds = NULL;
+				ctx->fg_old_seg_count = 0;
+				return -1;
+			}
+		}
+	}
 	pr_info("DSA_SHARED_MEM_MODE: mode=%s pid=%d shared_buf_size=%zu degrade_count=%u\n",
 		ctx->shared_hugetlb ? "hugetlb" : "normal_memfd", target_pid,
 		ctx->shared_buf_size, ctx->shared_degrade_cnt);
+	if (ctx->fine_grained)
+		pr_info("DSA_FINE_GRAINED_MODE: old_segments=%u record_stride=%u\n",
+			ctx->fg_old_seg_count, ctx->fg_record_stride);
 
 	ctx->shared_fds_sent = false;
 	dsa_replay_ctx_init(ctx);
@@ -1290,6 +1494,7 @@ static int dsa_dump_ctx_init(struct dsa_dump_ctx *ctx, pid_t target_pid)
 static int dsa_dump_ctx_fini(struct dsa_dump_ctx *ctx)
 {
 	int ret = 0;
+	u32 i;
 
 	if (!ctx)
 		return 0;
@@ -1302,6 +1507,16 @@ static int dsa_dump_ctx_fini(struct dsa_dump_ctx *ctx)
 	ctx->shared_buf = MAP_FAILED;
 	ctx->shared_map_size = 0;
 	ctx->shared_from_before_freeze = false;
+	for (i = 0; i < ctx->fg_old_seg_count; i++) {
+		if (ctx->fg_old_fds && ctx->fg_old_fds[i] >= 0)
+			close(ctx->fg_old_fds[i]);
+	}
+	xfree(ctx->fg_old_fds);
+	xfree(ctx->fg_old_segments);
+	ctx->fg_old_fds = NULL;
+	ctx->fg_old_segments = NULL;
+	ctx->fg_old_seg_count = 0;
+	ctx->fine_grained = false;
 
 	return ret;
 }
@@ -1641,6 +1856,12 @@ struct dsa_desc_scan_ctx {
 	u32 desc_limit;
 	u32 payload_base;
 	u32 payload_head;
+	u32 fg_result_meta_base;
+	u32 fg_result_meta_head;
+	u32 fg_result_meta_limit;
+	u32 fg_result_data_base;
+	u32 fg_result_data_head;
+	u32 fg_result_data_limit;
 	struct dsa_dump_descriptor descs[DSA_STREAM_SLOT_DESC_CAP];
 	u32 current_slot;
 	u32 produced_slots;
@@ -1651,6 +1872,13 @@ struct dsa_desc_scan_ctx {
 	u64 finish_wait_us;
 	u64 stream_bytes;
 	u64 stream_descs;
+	bool fine_grained;
+	u32 fg_record_stride;
+	struct dsa_fg_descriptor fg_descs[DSA_STREAM_SLOT_DESC_CAP];
+	u64 fg_pages;
+	u64 fg_patch_pages;
+	u64 fg_full_pages;
+	u64 fg_patch_bytes;
 	bool scan_profile;
 	u64 scan_pages;
 	u64 scan_dump_pages;
@@ -1663,6 +1891,7 @@ struct dsa_desc_scan_ctx {
 	u64 page_pipe_us;
 	u64 page_pipe_hole_us;
 	u64 page_pipe_page_us;
+	u64 fg_find_old_segment_us;
 	u64 raw_flush_us;
 	u64 raw_cdf_us;
 	u64 desc_append_us;
@@ -1711,6 +1940,7 @@ static inline void dsa_stream_cpu_relax(void)
 
 #define DSA_STREAM_SLOT_PAYLOAD_TARGET (2U * 1024U * 1024U)
 #define DSA_STREAM_DESC_REGION_BYTES (64U * 1024U * 1024U)
+#define DSA_STREAM_FG_META_REGION_BYTES (32U * 1024U * 1024U)
 
 static void dsa_stream_restore_parasite_args(struct dsa_desc_scan_ctx *sc)
 {
@@ -1730,7 +1960,9 @@ static void *dsa_stream_rpc_thread(void *arg)
 
 	sc->rpc_ret = parasite_dsa_dump_pages_seized(sc->ctl, &sc->rpc_args,
 						       sc->dsa_ctx->shared_fd, NULL,
-						       sc->dsa_ctx->wq_count);
+						       sc->dsa_ctx->wq_count,
+						       sc->dsa_ctx->fg_old_fds,
+						       sc->dsa_ctx->fg_old_seg_count);
 	__atomic_store_n(&sc->rpc_done, true, __ATOMIC_RELEASE);
 	return NULL;
 }
@@ -1739,8 +1971,13 @@ static int dsa_stream_layout_init(struct dsa_desc_scan_ctx *sc)
 {
 	u8 *shared_u8 = sc->dsa_ctx->shared_buf;
 	u32 slots_off;
+	u32 old_seg_off = 0;
+	u32 old_seg_bytes = 0;
 	u32 desc_area_off;
 	u32 payload_base;
+	u32 fg_meta_base = 0;
+	u32 fg_meta_limit = 0;
+	u32 fg_data_base = 0;
 	u32 desc_area_bytes;
 	u32 i;
 	unsigned int j;
@@ -1755,6 +1992,12 @@ static int dsa_stream_layout_init(struct dsa_desc_scan_ctx *sc)
 	desc_area_off = round_up(slots_off +
 				 DSA_STREAM_SLOT_COUNT * sizeof(struct parasite_dsa_stream_slot),
 				 64U);
+	if (sc->dsa_ctx->fine_grained) {
+		old_seg_off = desc_area_off;
+		old_seg_bytes = sc->dsa_ctx->fg_old_seg_count *
+			sizeof(struct dsa_fg_old_segment);
+		desc_area_off = round_up(old_seg_off + old_seg_bytes, 64U);
+	}
 	desc_area_bytes = DSA_STREAM_DESC_REGION_BYTES;
 	payload_base = round_up(desc_area_off + desc_area_bytes,
 			       DSA_SHARED_DATA_ALIGN);
@@ -1763,6 +2006,18 @@ static int dsa_stream_layout_init(struct dsa_desc_scan_ctx *sc)
 		pr_err("DSA strict: streaming metadata does not fit shared buffer payload_base=%u shared=%zu\n",
 		       payload_base, sc->dsa_ctx->shared_buf_size);
 		return -1;
+	}
+	if (sc->dsa_ctx->fine_grained) {
+		fg_meta_base = payload_base;
+		fg_meta_limit = fg_meta_base + DSA_STREAM_FG_META_REGION_BYTES;
+		fg_data_base = round_up(fg_meta_limit, DSA_SHARED_DATA_ALIGN);
+		if (fg_meta_limit < fg_meta_base ||
+		    fg_data_base >= sc->dsa_ctx->shared_buf_size) {
+			pr_err("DSA fine-grained: streaming result arena does not fit meta_base=%u meta_limit=%u data_base=%u shared=%zu\n",
+			       fg_meta_base, fg_meta_limit, fg_data_base,
+			       sc->dsa_ctx->shared_buf_size);
+			return -1;
+		}
 	}
 
 	memset(shared_u8, 0, desc_area_off);
@@ -1773,6 +2028,12 @@ static int dsa_stream_layout_init(struct dsa_desc_scan_ctx *sc)
 	sc->desc_limit = payload_base;
 	sc->payload_base = payload_base;
 	sc->payload_head = payload_base;
+	sc->fg_result_meta_base = fg_meta_base;
+	sc->fg_result_meta_head = fg_meta_base;
+	sc->fg_result_meta_limit = fg_meta_limit;
+	sc->fg_result_data_base = fg_data_base;
+	sc->fg_result_data_head = fg_data_base;
+	sc->fg_result_data_limit = sc->dsa_ctx->shared_buf_size;
 	sc->current_slot = 0;
 	sc->produced_slots = 0;
 	sc->desc_count = 0;
@@ -1782,6 +2043,19 @@ static int dsa_stream_layout_init(struct dsa_desc_scan_ctx *sc)
 	sc->stream_hdr->base.magic = PARASITE_DSA_SHM_HDR_MAGIC;
 	sc->stream_hdr->base.version = PARASITE_DSA_SHM_HDR_VERSION;
 	sc->stream_hdr->base.flags = PARASITE_DSA_SHM_F_STREAM;
+	if (sc->dsa_ctx->fine_grained) {
+		sc->stream_hdr->base.flags |= PARASITE_DSA_SHM_F_FINE_GRAINED;
+		sc->stream_hdr->base.fg_old_seg_off = old_seg_off;
+		sc->stream_hdr->base.fg_old_seg_count =
+			sc->dsa_ctx->fg_old_seg_count;
+		sc->stream_hdr->base.fg_record_stride =
+			sc->dsa_ctx->fg_record_stride;
+		sc->fine_grained = true;
+		sc->fg_record_stride = sc->dsa_ctx->fg_record_stride;
+		if (old_seg_bytes)
+			memcpy(shared_u8 + old_seg_off, sc->dsa_ctx->fg_old_segments,
+			       old_seg_bytes);
+	}
 	sc->stream_hdr->base.data_off = payload_base;
 	sc->stream_hdr->slot_count = DSA_STREAM_SLOT_COUNT;
 	sc->stream_hdr->slot_desc_cap = DSA_STREAM_SLOT_DESC_CAP;
@@ -1790,6 +2064,16 @@ static int dsa_stream_layout_init(struct dsa_desc_scan_ctx *sc)
 	sc->stream_hdr->payload_base = payload_base;
 	sc->stream_hdr->payload_limit = sc->dsa_ctx->shared_buf_size;
 	dsa_shared_store_u32(&sc->stream_hdr->payload_head, payload_base);
+	if (sc->dsa_ctx->fine_grained) {
+		sc->stream_hdr->fg_result_meta_base = fg_meta_base;
+		sc->stream_hdr->fg_result_meta_head = fg_meta_base;
+		sc->stream_hdr->fg_result_meta_limit = fg_meta_limit;
+		sc->stream_hdr->fg_result_data_base = fg_data_base;
+		sc->stream_hdr->fg_result_data_limit =
+			sc->dsa_ctx->shared_buf_size;
+		dsa_shared_store_u32(&sc->stream_hdr->fg_result_data_head,
+				     fg_data_base);
+	}
 
 	for (i = 0; i < DSA_STREAM_SLOT_COUNT; i++)
 		dsa_shared_store_u32(&sc->stream_slots[i].state, DSA_STREAM_SLOT_EMPTY);
@@ -1807,6 +2091,8 @@ static int dsa_stream_layout_init(struct dsa_desc_scan_ctx *sc)
 	sc->rpc_args.use_shared_buf_fd = !sc->dsa_ctx->shared_fds_sent;
 	sc->rpc_args.use_wq_fd = 0;
 	sc->rpc_args.wq_policy = DSA_WQ_POLICY_LPT;
+	sc->rpc_args.fg_enabled = sc->dsa_ctx->fine_grained ? 1 : 0;
+	sc->rpc_args.fg_old_seg_count = sc->dsa_ctx->fg_old_seg_count;
 
 	for (j = 0; j < (unsigned int)sc->dsa_ctx->wq_count; j++) {
 		size_t path_len;
@@ -1892,6 +2178,8 @@ static int dsa_stream_join_rpc(struct dsa_desc_scan_ctx *sc)
 		sc->rpc_args.poll_us = sc->stream_hdr->result_poll_us;
 		sc->rpc_args.submit_enqcmd = sc->stream_hdr->result_submit_enqcmd;
 		sc->rpc_args.submit_write = sc->stream_hdr->result_submit_write;
+		sc->rpc_args.fg_compare_ops = sc->stream_hdr->result_fg_compare_ops;
+		sc->rpc_args.fg_copy_ops = sc->stream_hdr->result_fg_copy_ops;
 	}
 	dsa_stream_restore_parasite_args(sc);
 
@@ -1911,6 +2199,13 @@ static struct dsa_dump_descriptor *dsa_stream_slot_desc(struct dsa_desc_scan_ctx
 {
 	(void)slot_idx;
 	return sc->descs;
+}
+
+static struct dsa_fg_descriptor *dsa_stream_slot_fg_desc(struct dsa_desc_scan_ctx *sc,
+						 u32 slot_idx)
+{
+	(void)slot_idx;
+	return sc->fg_descs;
 }
 
 #define DSA_STREAM_WAIT_SLOT_TIMEOUT_US (5000000ULL)
@@ -2021,7 +2316,7 @@ static void dsa_desc_scan_raw_append(struct dsa_desc_scan_ctx *sc,
 static int dsa_stream_flush_slot(struct dsa_desc_scan_ctx *sc)
 {
 	struct parasite_dsa_stream_slot *slot;
-	struct dsa_dump_descriptor *slot_desc;
+	struct dsa_dump_descriptor *slot_desc = NULL;
 	u32 slot_idx;
 	u32 desc_off;
 	u32 desc_sum = 0;
@@ -2041,27 +2336,44 @@ static int dsa_stream_flush_slot(struct dsa_desc_scan_ctx *sc)
 
 	slot = &sc->stream_slots[slot_idx];
 	desc_off = sc->desc_head;
-	slot_desc = dsa_stream_slot_desc(sc, slot_idx);
 	if (sc->scan_profile)
 		t0 = dsa_wall_now_us();
-	for (i = 0; i < sc->desc_count; i++)
-		desc_sum += slot_desc[i].copy_len;
+	if (sc->fine_grained) {
+		struct dsa_fg_descriptor *fg_desc;
+
+		fg_desc = dsa_stream_slot_fg_desc(sc, slot_idx);
+		for (i = 0; i < sc->desc_count; i++)
+			desc_sum += fg_desc[i].page_count * fg_desc[i].record_stride;
+	} else {
+		slot_desc = dsa_stream_slot_desc(sc, slot_idx);
+		for (i = 0; i < sc->desc_count; i++)
+			desc_sum += slot_desc[i].copy_len;
+	}
 	if (sc->scan_profile) {
 		t1 = dsa_wall_now_us();
 		sc->flush_desc_sum_us += dsa_wall_delta_us(t0, t1);
 	}
-	if (desc_off + sc->desc_count * sizeof(struct dsa_dump_descriptor) > sc->desc_limit) {
+	if (desc_off + sc->desc_count *
+	    (sc->fine_grained ? sizeof(struct dsa_fg_descriptor) :
+	     sizeof(struct dsa_dump_descriptor)) > sc->desc_limit) {
 		pr_err("DSA strict: streaming descriptor region exhausted used=%u append=%zu limit=%u\n",
 		       desc_off - sc->desc_area_off,
-		       (size_t)sc->desc_count * sizeof(struct dsa_dump_descriptor),
+		       (size_t)sc->desc_count *
+		       (sc->fine_grained ? sizeof(struct dsa_fg_descriptor) :
+			sizeof(struct dsa_dump_descriptor)),
 		       sc->desc_limit - sc->desc_area_off);
 		dsa_shared_store_u32(&sc->stream_hdr->error, (u32)-ENOSPC);
 		return -1;
 	}
 	if (sc->scan_profile)
 		t0 = dsa_wall_now_us();
-	memcpy((u8 *)sc->dsa_ctx->shared_buf + desc_off, slot_desc,
-	       sc->desc_count * sizeof(struct dsa_dump_descriptor));
+	if (sc->fine_grained)
+		memcpy((u8 *)sc->dsa_ctx->shared_buf + desc_off,
+		       dsa_stream_slot_fg_desc(sc, slot_idx),
+		       sc->desc_count * sizeof(struct dsa_fg_descriptor));
+	else
+		memcpy((u8 *)sc->dsa_ctx->shared_buf + desc_off, slot_desc,
+		       sc->desc_count * sizeof(struct dsa_dump_descriptor));
 	if (sc->scan_profile) {
 		t1 = dsa_wall_now_us();
 		sc->flush_desc_memcpy_us += dsa_wall_delta_us(t0, t1);
@@ -2083,7 +2395,9 @@ static int dsa_stream_flush_slot(struct dsa_desc_scan_ctx *sc)
 
 	__atomic_thread_fence(__ATOMIC_RELEASE);
 	dsa_shared_store_u32(&slot->state, DSA_STREAM_SLOT_READY);
-	sc->desc_head = desc_off + sc->desc_count * sizeof(struct dsa_dump_descriptor);
+	sc->desc_head = desc_off + sc->desc_count *
+		(sc->fine_grained ? sizeof(struct dsa_fg_descriptor) :
+		 sizeof(struct dsa_dump_descriptor));
 	sc->produced_slots++;
 	dsa_shared_store_u32(&sc->stream_hdr->producer_seq, sc->produced_slots);
 	sc->current_slot = sc->produced_slots % DSA_STREAM_SLOT_COUNT;
@@ -2167,30 +2481,144 @@ static int dsa_desc_scan_batch_append(struct dsa_desc_scan_ctx *sc,
 	return 0;
 }
 
+static u32 dsa_fg_find_old_segment(struct dsa_desc_scan_ctx *sc,
+				   unsigned long vaddr)
+{
+	u32 i;
+
+	if (!sc->dsa_ctx || !sc->dsa_ctx->fg_old_segments)
+		return UINT32_MAX;
+
+	for (i = 0; i < sc->dsa_ctx->fg_old_seg_count; i++) {
+		struct dsa_fg_old_segment *seg = &sc->dsa_ctx->fg_old_segments[i];
+
+		if (vaddr >= seg->vaddr && vaddr + PAGE_SIZE <= seg->vaddr + seg->len)
+			return i;
+	}
+
+	return UINT32_MAX;
+}
+
+static int dsa_fg_desc_scan_batch_append(struct dsa_desc_scan_ctx *sc,
+					 u64 src_addr, u32 old_seg_idx,
+					 u32 page_count)
+{
+	struct dsa_fg_descriptor *slot_desc;
+	u32 meta_len;
+	u64 t0 = 0;
+	u64 t1;
+
+	meta_len = page_count * sc->fg_record_stride;
+	if (meta_len > sc->fg_result_meta_limit - sc->fg_result_meta_head) {
+		pr_err("DSA fine-grained: streaming result metadata exhausted used=%u append=%u limit=%u\n",
+		       sc->fg_result_meta_head - sc->fg_result_meta_base, meta_len,
+		       sc->fg_result_meta_limit - sc->fg_result_meta_base);
+		dsa_shared_store_u32(&sc->stream_hdr->error, (u32)-ENOSPC);
+		return -1;
+	}
+
+	if (sc->desc_count == DSA_STREAM_SLOT_DESC_CAP ||
+	    (sc->desc_count &&
+	     sc->slot_payload_bytes + meta_len > DSA_STREAM_SLOT_PAYLOAD_TARGET)) {
+		if (dsa_stream_flush_slot(sc))
+			return -1;
+	}
+
+	if (sc->scan_profile)
+		t0 = dsa_wall_now_us();
+	slot_desc = dsa_stream_slot_fg_desc(sc, sc->current_slot);
+
+	if (sc->desc_count > 0) {
+		struct dsa_fg_descriptor *prev = &slot_desc[sc->desc_count - 1];
+		u64 expected = prev->src_addr + (u64)prev->page_count * PAGE_SIZE;
+
+		if (prev->old_seg_idx == old_seg_idx &&
+		    prev->record_stride == sc->fg_record_stride &&
+		    src_addr == expected &&
+		    prev->page_count <= UINT32_MAX - page_count) {
+			prev->page_count += page_count;
+		} else {
+			slot_desc[sc->desc_count].src_addr = src_addr;
+			slot_desc[sc->desc_count].old_seg_idx = old_seg_idx;
+			slot_desc[sc->desc_count].page_count = page_count;
+			slot_desc[sc->desc_count].record_off = sc->fg_result_meta_head;
+			slot_desc[sc->desc_count].record_stride = sc->fg_record_stride;
+			sc->desc_count++;
+			sc->stream_descs++;
+		}
+
+		sc->desc_seq_total++;
+		if (src_addr < prev->src_addr)
+			sc->desc_seq_out_of_order++;
+		else if (src_addr != expected)
+			sc->desc_seq_discont++;
+	} else {
+		slot_desc[sc->desc_count].src_addr = src_addr;
+		slot_desc[sc->desc_count].old_seg_idx = old_seg_idx;
+		slot_desc[sc->desc_count].page_count = page_count;
+		slot_desc[sc->desc_count].record_off = sc->fg_result_meta_head;
+		slot_desc[sc->desc_count].record_stride = sc->fg_record_stride;
+		sc->desc_count++;
+		sc->stream_descs++;
+	}
+
+	sc->fg_result_meta_head += meta_len;
+	sc->slot_payload_bytes += meta_len;
+	sc->stream_bytes += meta_len;
+	sc->fg_pages += page_count;
+	sc->stream_hdr->fg_result_meta_head = sc->fg_result_meta_head;
+	if (sc->scan_profile) {
+		t1 = dsa_wall_now_us();
+		sc->desc_append_us += dsa_wall_delta_us(t0, t1);
+	}
+	return 0;
+}
+
 static int dsa_stream_finish(struct dsa_desc_scan_ctx *sc)
 {
 	if (dsa_stream_flush_slot(sc))
 		return -1;
 
-	sc->stream_hdr->base.data_bytes = sc->payload_head - sc->payload_base;
+	if (sc->fine_grained)
+		sc->stream_hdr->base.data_bytes =
+			sc->fg_result_meta_head - sc->fg_result_meta_base;
+	else
+		sc->stream_hdr->base.data_bytes = sc->payload_head - sc->payload_base;
 	dsa_shared_store_u32(&sc->stream_hdr->finish, 1);
 
 	if (dsa_stream_join_rpc(sc))
 		return -1;
 
-	if (sc->rpc_args.total_copied != sc->stream_bytes ||
-	    sc->rpc_args.new_buf_offset != sc->payload_head) {
-		pr_err("DSA streaming copied size mismatch: expected copied=%llu off=%u got copied=%u off=%u\n",
-		       (unsigned long long)sc->stream_bytes, sc->payload_head,
-		       sc->rpc_args.total_copied, sc->rpc_args.new_buf_offset);
-		return -1;
+	if (sc->fine_grained) {
+		sc->fg_result_data_head =
+			dsa_shared_load_u32(&sc->stream_hdr->fg_result_data_head);
+		if (sc->fg_result_data_head < sc->fg_result_data_base ||
+		    sc->fg_result_data_head > sc->fg_result_data_limit) {
+			pr_err("DSA fine-grained: invalid result data head=%u base=%u limit=%u\n",
+			       sc->fg_result_data_head, sc->fg_result_data_base,
+			       sc->fg_result_data_limit);
+			return -1;
+		}
+		sc->stream_bytes = (sc->fg_result_meta_head -
+				    sc->fg_result_meta_base) +
+			(sc->fg_result_data_head - sc->fg_result_data_base);
+	} else {
+		if (sc->rpc_args.total_copied != sc->stream_bytes ||
+		    sc->rpc_args.new_buf_offset != sc->payload_head) {
+			pr_err("DSA streaming copied size mismatch: expected copied=%llu off=%u got copied=%u off=%u\n",
+			       (unsigned long long)sc->stream_bytes, sc->payload_head,
+			       sc->rpc_args.total_copied, sc->rpc_args.new_buf_offset);
+			return -1;
+		}
 	}
 
-	sc->dsa_ctx->replay.ready = true;
-	sc->dsa_ctx->replay.pipe_fd = sc->dsa_pipe_fd;
-	sc->dsa_ctx->replay.data_off = sc->payload_base;
-	sc->dsa_ctx->replay.data_bytes = sc->payload_head - sc->payload_base;
-	sc->dsa_ctx->replay.batch_id = 1;
+	if (!sc->fine_grained) {
+		sc->dsa_ctx->replay.ready = true;
+		sc->dsa_ctx->replay.pipe_fd = sc->dsa_pipe_fd;
+		sc->dsa_ctx->replay.data_off = sc->payload_base;
+		sc->dsa_ctx->replay.data_bytes = sc->payload_head - sc->payload_base;
+		sc->dsa_ctx->replay.batch_id = 1;
+	}
 
 	if (sc->scan_profile)
 		pr_info("DSA_SHARED_MAP_TIMING: recv_fd_us=%llu mmap_us=%llu munmap_us=%llu close_us=%llu setup_shared_us=%llu\n",
@@ -2200,7 +2628,7 @@ static int dsa_stream_finish(struct dsa_desc_scan_ctx *sc)
 			(unsigned long long)sc->rpc_args.cleanup_close_us,
 			(unsigned long long)sc->rpc_args.setup_shared_us);
 	if (sc->scan_profile)
-		pr_info("DSA_SCAN_PROFILE: mode=streaming payload_bytes=%llu desc_count=%llu stream_flush_count=%u producer_wait_slot_us=%llu stream_finish_wait_us=%llu parasite_prefault_us=%llu parasite_submit_us=%llu parasite_poll_us=%llu parasite_completed_count=%u parasite_submit_enqcmd=%u parasite_submit_write=%u\n",
+		pr_info("DSA_SCAN_PROFILE: mode=streaming payload_bytes=%llu desc_count=%llu stream_flush_count=%u producer_wait_slot_us=%llu stream_finish_wait_us=%llu parasite_prefault_us=%llu parasite_submit_us=%llu parasite_poll_us=%llu parasite_completed_count=%u parasite_submit_enqcmd=%u parasite_submit_write=%u parasite_fg_compare_ops=%u parasite_fg_copy_ops=%u\n",
 			(unsigned long long)sc->stream_bytes,
 			(unsigned long long)sc->stream_descs,
 			sc->produced_slots,
@@ -2211,18 +2639,21 @@ static int dsa_stream_finish(struct dsa_desc_scan_ctx *sc)
 			(unsigned long long)sc->rpc_args.poll_us,
 			sc->rpc_args.completed_count,
 			sc->rpc_args.submit_enqcmd,
-			sc->rpc_args.submit_write);
+			sc->rpc_args.submit_write,
+			sc->rpc_args.fg_compare_ops,
+			sc->rpc_args.fg_copy_ops);
 	if (sc->scan_profile)
 		{
 			u64 flush_nonwait_us = sc->flush_slot_us >= sc->producer_wait_slot_us ?
 				sc->flush_slot_us - sc->producer_wait_slot_us : 0;
 			u64 scan_accounted_us = sc->should_dump_us + sc->lazy_stack_check_us +
-				sc->parent_coverage_us + sc->page_pipe_us + sc->raw_flush_us +
+				sc->parent_coverage_us + sc->page_pipe_us +
+				sc->fg_find_old_segment_us + sc->raw_flush_us +
 				sc->desc_append_us + flush_nonwait_us;
 			u64 scan_misc_us = sc->scan_wall_us >= scan_accounted_us ?
 				sc->scan_wall_us - scan_accounted_us : 0;
 
-			pr_info("DSA_SCAN_HOST_PROFILE: mode=streaming scan_pages=%llu dump_pages=%llu hole_pages=%llu lazy_pages=%llu scan_wall_us=%llu should_dump_us=%llu lazy_stack_check_us=%llu parent_coverage_us=%llu page_pipe_us=%llu page_pipe_hole_us=%llu page_pipe_page_us=%llu raw_flush_us=%llu raw_cdf_us=%llu desc_append_us=%llu flush_slot_us=%llu flush_nonwait_us=%llu flush_desc_sum_us=%llu flush_desc_memcpy_us=%llu flush_publish_us=%llu host_nonwait_us=%llu scan_misc_us=%llu\n",
+			pr_info("DSA_SCAN_HOST_PROFILE: mode=streaming scan_pages=%llu dump_pages=%llu hole_pages=%llu lazy_pages=%llu scan_wall_us=%llu should_dump_us=%llu lazy_stack_check_us=%llu parent_coverage_us=%llu page_pipe_us=%llu page_pipe_hole_us=%llu page_pipe_page_us=%llu fg_find_old_segment_us=%llu raw_flush_us=%llu raw_cdf_us=%llu desc_append_us=%llu flush_slot_us=%llu flush_nonwait_us=%llu flush_desc_sum_us=%llu flush_desc_memcpy_us=%llu flush_publish_us=%llu host_nonwait_us=%llu scan_misc_us=%llu\n",
 				(unsigned long long)sc->scan_pages,
 				(unsigned long long)sc->scan_dump_pages,
 				(unsigned long long)sc->scan_hole_pages,
@@ -2234,6 +2665,7 @@ static int dsa_stream_finish(struct dsa_desc_scan_ctx *sc)
 				(unsigned long long)sc->page_pipe_us,
 				(unsigned long long)sc->page_pipe_hole_us,
 				(unsigned long long)sc->page_pipe_page_us,
+				(unsigned long long)sc->fg_find_old_segment_us,
 				(unsigned long long)sc->raw_flush_us,
 				(unsigned long long)sc->raw_cdf_us,
 				(unsigned long long)sc->desc_append_us,
@@ -2248,7 +2680,6 @@ static int dsa_stream_finish(struct dsa_desc_scan_ctx *sc)
 
 	return 0;
 }
-
 
 #ifdef CRIU_DSA_ENABLE_LEGACY_SINGLE_RPC
 static bool dsa_legacy_single_rpc_enabled(void)
@@ -2395,7 +2826,9 @@ static int dsa_legacy_single_rpc_finish(struct dsa_desc_scan_ctx *sc)
 
 	ret = parasite_dsa_dump_pages_seized(sc->ctl, &sc->rpc_args,
 					     sc->dsa_ctx->shared_fd, NULL,
-					     sc->dsa_ctx->wq_count);
+					     sc->dsa_ctx->wq_count,
+					     sc->dsa_ctx->fg_old_fds,
+					     sc->dsa_ctx->fg_old_seg_count);
 	sc->dsa_ctx->shared_fds_sent = true;
 	dsa_stream_restore_parasite_args(sc);
 	if (ret || sc->rpc_args.op_ret) {
@@ -2659,6 +3092,8 @@ static int start_deferred_dsa_replay(struct mem_dump_async *async)
 		       async->pid);
 		return -1;
 	}
+	if (!async->dsa_ctx_deferred->replay.ready)
+		return 0;
 
 	if (pthread_create(&async->dsa_replay_tid, NULL,
 			   mem_dump_async_dsa_replay_thread, async)) {
@@ -2702,18 +3137,28 @@ static int defer_mem_dump_async_xfer(struct pstree_item *item,
 
 	dmpi(item)->mem_async = async;
 
-	if (start_deferred_mem_dump_async_xfer(async)) {
-		dmpi(item)->mem_async = NULL;
-		xfree(async);
-		return -1;
-	}
-	if (start_deferred_dsa_replay(async)) {
-		dsa_abort_replay_pipe(async->pp, dsa_ctx->replay.pipe_fd);
-		if (async->thread_started)
-			pthread_join(async->tid, NULL);
-		dmpi(item)->mem_async = NULL;
-		xfree(async);
-		return -1;
+	/*
+	 * Classic live DSA needs the xfer thread and replay pipe to run
+	 * together: xfer consumes the pipe while replay feeds it.  Fine-grained
+	 * mode has no replay pipe; the parasite already left compact records in
+	 * the shared arena.  In that case keep only the async descriptor here and
+	 * start xfer from parasite_dump_pages_seized_wait(), after the task has
+	 * been unfrozen.
+	 */
+	if (dsa_ctx && dsa_ctx->replay.ready) {
+		if (start_deferred_mem_dump_async_xfer(async)) {
+			dmpi(item)->mem_async = NULL;
+			xfree(async);
+			return -1;
+		}
+		if (start_deferred_dsa_replay(async)) {
+			dsa_abort_replay_pipe(async->pp, dsa_ctx->replay.pipe_fd);
+			if (async->thread_started)
+				pthread_join(async->tid, NULL);
+			dmpi(item)->mem_async = NULL;
+			xfree(async);
+			return -1;
+		}
 	}
 
 	return 0;
@@ -3013,8 +3458,8 @@ static int generate_iovs_dsa_desc_scan(struct pstree_item *item,
 		if (sc->scan_profile) {
 			t1 = dsa_wall_now_us();
 			sc->should_dump_us += dsa_wall_delta_us(t0, t1);
-			sc->scan_pages++;
 		}
+		sc->scan_pages++;
 
 		if (!dump_all_pages && page_info.next != vaddr) {
 			if (sc->scan_profile)
@@ -3033,18 +3478,21 @@ static int generate_iovs_dsa_desc_scan(struct pstree_item *item,
 		}
 
 		{
+			bool parent_has_page = false;
 			bool in_parent = false;
 
-			if (has_parent && page_in_parent(page_info.softdirty)) {
+			if (has_parent) {
 				if (sc->scan_profile)
 					t0 = dsa_wall_now_us();
-				in_parent = dsa_parent_coverage_contains_range(&dsa_parent_coverage_prev,
-								     vaddr, PAGE_SIZE);
+				parent_has_page = dsa_parent_coverage_contains_range(&dsa_parent_coverage_prev,
+										     vaddr, PAGE_SIZE);
 				if (sc->scan_profile) {
 					t1 = dsa_wall_now_us();
 					sc->parent_coverage_us += dsa_wall_delta_us(t0, t1);
 				}
 			}
+			in_parent = has_parent && page_in_parent(page_info.softdirty) &&
+				parent_has_page;
 
 			if (in_parent) {
 				if (sc->scan_profile)
@@ -3078,9 +3526,28 @@ static int generate_iovs_dsa_desc_scan(struct pstree_item *item,
 						dsa_desc_scan_raw_append(sc,
 							(u64)(unsigned long)vaddr,
 							PAGE_SIZE);
-					ret = dsa_desc_scan_batch_append(sc,
-						(u64)(unsigned long)vaddr,
-						PAGE_SIZE);
+					if (sc->fine_grained) {
+						u32 old_seg_idx = UINT32_MAX;
+
+						if (parent_has_page) {
+							if (sc->scan_profile)
+								t0 = dsa_wall_now_us();
+							old_seg_idx = dsa_fg_find_old_segment(sc, vaddr);
+							if (sc->scan_profile) {
+								t1 = dsa_wall_now_us();
+								sc->fg_find_old_segment_us +=
+									dsa_wall_delta_us(t0, t1);
+							}
+						}
+						ret = dsa_fg_desc_scan_batch_append(sc,
+							(u64)(unsigned long)vaddr,
+							old_seg_idx,
+							1);
+					} else {
+						ret = dsa_desc_scan_batch_append(sc,
+							(u64)(unsigned long)vaddr,
+							PAGE_SIZE);
+					}
 				}
 				if (ppb_flags & PPB_LAZY && opts.lazy_pages)
 					st = 1;
@@ -3093,14 +3560,12 @@ static int generate_iovs_dsa_desc_scan(struct pstree_item *item,
 			break;
 
 		pages[st]++;
-		if (sc->scan_profile) {
-			if (st == 0)
-				sc->scan_hole_pages++;
-			else if (st == 1)
-				sc->scan_lazy_pages++;
-			else
-				sc->scan_dump_pages++;
-		}
+		if (st == 0)
+			sc->scan_hole_pages++;
+		else if (st == 1)
+			sc->scan_lazy_pages++;
+		else
+			sc->scan_dump_pages++;
 	}
 
 	*pvaddr = vaddr;
@@ -3207,6 +3672,15 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	u64 setup_detect_pid_reuse_us = 0;
 	u64 setup_t0;
 	u64 setup_t1;
+	u64 detail_t0;
+	u64 scan_build_start_us = 0;
+	u64 scan_build_us = 0;
+	u64 dsa_rpc_start_us = 0;
+	u64 dsa_rpc_total_us = 0;
+	u64 dsa_stream_finish_us = 0;
+	u64 fg_sidecar_write_us = 0;
+	u64 fg_apply_records_us = 0;
+	u64 fg_enable_us = 0;
 
 	pr_info("\n");
 	pr_info("Dumping pages (type: %d pid: %d)\n", CR_FD_PAGES, item->pid->real);
@@ -3408,8 +3882,8 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	}
 
 	memdump_timeline_switch(timeline, MEMDUMP_PHASE_SCAN_BUILD);
-	if (dsa_desc_scan_active && dsa_sc.scan_profile)
-		dsa_sc.scan_wall_us = dsa_wall_now_us();
+	if (dsa_desc_scan_active)
+		scan_build_start_us = dsa_wall_now_us();
 	list_for_each_entry(vma_area, &vma_area_list->h, list) {
 		if (vma_area_is(vma_area, VMA_AREA_GUARD))
 			continue;
@@ -3431,20 +3905,64 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	if (dsa_desc_scan_active) {
 		if (dsa_sc.scan_profile)
 			dsa_desc_scan_raw_flush(&dsa_sc);
-		if (dsa_sc.scan_profile)
-			dsa_sc.scan_wall_us = dsa_wall_delta_us(dsa_sc.scan_wall_us, dsa_wall_now_us());
+		scan_build_us = dsa_wall_delta_us(scan_build_start_us, dsa_wall_now_us());
+		dsa_sc.scan_wall_us = scan_build_us;
 	}
 
 	if (dsa_desc_scan_active && dsa_desc_scan_ready) {
 		memdump_timeline_switch(timeline, MEMDUMP_PHASE_DSA_RPC);
+		dsa_rpc_start_us = dsa_wall_now_us();
 #ifdef CRIU_DSA_ENABLE_LEGACY_SINGLE_RPC
-		if (dsa_sc.legacy_single_rpc)
+		if (dsa_sc.legacy_single_rpc) {
+			detail_t0 = dsa_wall_now_us();
 			ret = dsa_legacy_single_rpc_finish(&dsa_sc);
-		else
+			dsa_stream_finish_us = dsa_wall_delta_us(detail_t0, dsa_wall_now_us());
+		} else
 #endif
+		{
+			detail_t0 = dsa_wall_now_us();
 			ret = dsa_stream_finish(&dsa_sc);
+			dsa_stream_finish_us = dsa_wall_delta_us(detail_t0, dsa_wall_now_us());
+		}
 		if (ret < 0)
 			goto out_xfer;
+		if (dsa_sc.fine_grained) {
+			xfer.dsa_fine_grained = true;
+			xfer.dsa_fg_shared = dsa_sc.dsa_ctx->shared_buf;
+			xfer.dsa_fg_desc_area_off = dsa_sc.desc_area_off;
+			xfer.dsa_fg_desc_head = dsa_sc.desc_head;
+			xfer.dsa_fg_materialized = false;
+		}
+		dsa_rpc_total_us = dsa_wall_delta_us(dsa_rpc_start_us, dsa_wall_now_us());
+		pr_info("DSA_MEMDUMP_DETAIL: mode=streaming fine_grained=%u scan_build_us=%llu scan_pages=%llu dump_pages=%llu hole_pages=%llu lazy_pages=%llu stream_finish_us=%llu fg_sidecar_write_us=%llu fg_apply_records_us=%llu fg_enable_us=%llu dsa_rpc_total_us=%llu stream_payload_bytes=%llu stream_desc_count=%llu stream_flush_count=%u producer_wait_slot_us=%llu stream_finish_wait_us=%llu parasite_prefault_us=%llu parasite_submit_us=%llu parasite_poll_us=%llu parasite_completed_count=%u parasite_submit_enqcmd=%u parasite_submit_write=%u parasite_fg_compare_ops=%u parasite_fg_copy_ops=%u fg_pages=%llu fg_patch_pages=%llu fg_full_pages=%llu fg_patch_bytes=%llu\n",
+			dsa_sc.fine_grained ? 1 : 0,
+			(unsigned long long)scan_build_us,
+			(unsigned long long)dsa_sc.scan_pages,
+			(unsigned long long)dsa_sc.scan_dump_pages,
+			(unsigned long long)dsa_sc.scan_hole_pages,
+			(unsigned long long)dsa_sc.scan_lazy_pages,
+			(unsigned long long)dsa_stream_finish_us,
+			(unsigned long long)fg_sidecar_write_us,
+			(unsigned long long)fg_apply_records_us,
+			(unsigned long long)fg_enable_us,
+			(unsigned long long)dsa_rpc_total_us,
+			(unsigned long long)dsa_sc.stream_bytes,
+			(unsigned long long)dsa_sc.stream_descs,
+			dsa_sc.produced_slots,
+			(unsigned long long)dsa_sc.producer_wait_slot_us,
+			(unsigned long long)dsa_sc.finish_wait_us,
+			(unsigned long long)dsa_sc.rpc_args.prefault_us,
+			(unsigned long long)dsa_sc.rpc_args.submit_us,
+			(unsigned long long)dsa_sc.rpc_args.poll_us,
+			dsa_sc.rpc_args.completed_count,
+			dsa_sc.rpc_args.submit_enqcmd,
+			dsa_sc.rpc_args.submit_write,
+			dsa_sc.rpc_args.fg_compare_ops,
+			dsa_sc.rpc_args.fg_copy_ops,
+			(unsigned long long)dsa_sc.fg_pages,
+			(unsigned long long)dsa_sc.fg_patch_pages,
+			(unsigned long long)dsa_sc.fg_full_pages,
+			(unsigned long long)dsa_sc.fg_patch_bytes);
 		if (dsa_sc.scan_profile)
 			pr_info("DSA_DESC_SEQ: total=%llu out_of_order=%llu discontinuity=%llu\n",
 				(unsigned long long)dsa_sc.desc_seq_total,
@@ -3477,10 +3995,26 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 					goto out_xfer;
 				}
 			}
-			ret = defer_mem_dump_async_xfer(item, pp, &xfer, dsa_ctx);
-			if (!ret) {
-				async_started = true;
-				dsa_ctx_deferred = true;
+			if (dsa_sc.fine_grained) {
+				/*
+				 * Fine-grained mode has already materialized page
+				 * bytes into the compact shared result arena.  The
+				 * page-xfer pass writes pagemap entries, pages-fg
+				 * sidecars and hot memstore updates from that stable
+				 * arena, so it can be deferred like live DSA memwrite
+				 * without a replay pipe.
+				 */
+				ret = defer_mem_dump_async_xfer(item, pp, &xfer, dsa_ctx);
+				if (!ret) {
+					async_started = true;
+					dsa_ctx_deferred = true;
+				}
+			} else {
+				ret = defer_mem_dump_async_xfer(item, pp, &xfer, dsa_ctx);
+				if (!ret) {
+					async_started = true;
+					dsa_ctx_deferred = true;
+				}
 			}
 		} else {
 			memdump_timeline_switch(timeline, MEMDUMP_PHASE_IMAGE_WRITE);
@@ -4292,16 +4826,25 @@ int prepare_mappings(struct pstree_item *t)
 	void *addr;
 	struct vm_area_list *vmas;
 	struct page_read pr;
+	uint64_t total_start_us = restore_now_us();
+	uint64_t stage_start_us;
+	uint64_t reserve_us = 0;
+	uint64_t open_page_read_us = 0;
+	uint64_t maybe_disable_thp_us = 0;
+	uint64_t premap_us = 0;
+	uint64_t restore_content_us = 0;
 
 	void *old_premmapped_addr = NULL;
-	unsigned long old_premmapped_len;
+	unsigned long old_premmapped_len = 0;
 
 	vmas = &rsti(t)->vmas;
 	if (vmas->nr == 0) /* Zombie */
 		goto out;
 
 	/* Reserve a place for mapping private vma-s one by one */
+	stage_start_us = restore_now_us();
 	addr = mmap(NULL, vmas->rst_priv_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
+	reserve_us = restore_now_us() - stage_start_us;
 	if (addr == MAP_FAILED) {
 		ret = -1;
 		pr_perror("Unable to reserve memory (%lu bytes)", vmas->rst_priv_size);
@@ -4313,22 +4856,34 @@ int prepare_mappings(struct pstree_item *t)
 	rsti(t)->premmapped_addr = addr;
 	rsti(t)->premmapped_len = vmas->rst_priv_size;
 
+	stage_start_us = restore_now_us();
 	ret = open_page_read(vpid(t), &pr, PR_TASK);
-	if (ret <= 0)
-		return -1;
+	open_page_read_us = restore_now_us() - stage_start_us;
+	if (ret <= 0) {
+		ret = -1;
+		goto out;
+	}
 
-	if (maybe_disable_thp(t, &pr))
-		return -1;
+	stage_start_us = restore_now_us();
+	if (maybe_disable_thp(t, &pr)) {
+		ret = -1;
+		goto out;
+	}
+	maybe_disable_thp_us = restore_now_us() - stage_start_us;
 
 	pr.advance(&pr); /* shift to the 1st iovec */
 
+	stage_start_us = restore_now_us();
 	ret = premap_priv_vmas(t, vmas, &addr, &pr);
+	premap_us = restore_now_us() - stage_start_us;
 	if (ret < 0)
 		goto out;
 
 	pr.reset(&pr);
 
+	stage_start_us = restore_now_us();
 	ret = restore_priv_vma_content(t, &pr);
+	restore_content_us = restore_now_us() - stage_start_us;
 	if (ret < 0)
 		goto out;
 
@@ -4355,6 +4910,10 @@ int prepare_mappings(struct pstree_item *t)
 	}
 
 out:
+	pr_info("RESTORE_MAPPING_TIMING pid=%d ret=%d rst_priv_size=%lu reserve_us=%" PRIu64 " open_page_read_us=%" PRIu64 " maybe_disable_thp_us=%" PRIu64 " premap_us=%" PRIu64 " restore_content_us=%" PRIu64 " total_us=%" PRIu64 "\n",
+		vpid(t), ret, vmas ? vmas->rst_priv_size : 0,
+		reserve_us, open_page_read_us, maybe_disable_thp_us,
+		premap_us, restore_content_us, restore_now_us() - total_start_us);
 	return ret;
 }
 

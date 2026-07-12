@@ -66,7 +66,45 @@ struct page_read {
 	struct cr_img *pmi;
 	struct cr_img *pi;
 	void *hot;
+	int fg_idx_fd;
+	int fg_dat_fd;
 	u32 pages_img_id;
+
+	uint64_t timing_open_total_us;
+	uint64_t timing_manifest_parse_us;
+	uint64_t timing_segment_open_us;
+	uint64_t timing_init_pagemaps_us;
+	uint64_t timing_hot_find_us;
+	uint64_t timing_hot_pread_us;
+	uint64_t timing_disk_pread_us;
+	uint64_t timing_fg_read_us;
+	uint64_t timing_parent_read_us;
+	uint64_t timing_async_sync_us;
+	uint64_t timing_parent_seek_us;
+	uint64_t timing_parent_child_incl_us;
+	uint64_t timing_fg_meta_us;
+	uint64_t timing_fg_full_data_us;
+	uint64_t timing_fg_patch_parent_incl_us;
+	uint64_t timing_fg_patch_data_us;
+	uint64_t timing_fg_patch_apply_us;
+	uint64_t hot_find_calls;
+	uint64_t hot_find_steps;
+	uint64_t hot_find_steps_max;
+	uint64_t hot_pread_calls;
+	uint64_t hot_cross_segment_reads;
+	uint64_t disk_pread_calls;
+	uint64_t parent_read_calls;
+	uint64_t parent_read_pages;
+	uint64_t fg_pages_read;
+	uint64_t fg_full_pages_read;
+	uint64_t fg_patch_pages_read;
+	uint64_t fg_patch_bytes_read;
+	uint64_t pages_read;
+	uint64_t bytes_read;
+	uint64_t async_enqueued_bytes;
+	uint64_t async_enqueued_iovs;
+	uint64_t segment_count;
+	uint64_t manifest_bytes;
 
 	PagemapEntry *pe;	  /* current pagemap we are on */
 	struct page_read *parent; /* parent pagemap (if ->in_parent pagemap is met in image,
@@ -135,6 +173,27 @@ static inline bool page_read_has_parent(struct page_read *pr)
 #define PE_PARENT  (1 << 0) /* pages are in parent snapshot */
 #define PE_LAZY	   (1 << 1) /* pages can be lazily restored */
 #define PE_PRESENT (1 << 2) /* pages are present in pages*img */
+#define PE_DSA_FG  (1 << 3) /* pages are present in DSA fine-grained sidecar */
+
+#ifndef DSA_FG_PAGE_PATCH
+#define DSA_FG_PAGE_PATCH 1
+#endif
+#ifndef DSA_FG_PAGE_FULL
+#define DSA_FG_PAGE_FULL  2
+#endif
+
+struct dsa_fg_page_meta {
+	u64 vaddr;
+	u64 data_off;
+	u32 data_len;
+	u16 patch_count;
+	u16 flags;
+} __attribute__((packed));
+
+struct dsa_fg_patch_entry {
+	u16 off;
+	u16 len;
+} __attribute__((packed));
 
 static inline bool pagemap_in_parent(PagemapEntry *pe)
 {
@@ -149,6 +208,11 @@ static inline bool pagemap_lazy(PagemapEntry *pe)
 static inline bool pagemap_present(PagemapEntry *pe)
 {
 	return !!(pe->flags & PE_PRESENT);
+}
+
+static inline bool pagemap_dsa_fg(PagemapEntry *pe)
+{
+	return !!(pe->flags & PE_DSA_FG);
 }
 
 #endif /* __CR_PAGE_READ_H__ */

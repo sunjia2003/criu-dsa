@@ -33,6 +33,7 @@ struct page_xfer {
 	 */
 	unsigned long offset;
 	bool transfer_lazy;
+	bool dsa_fine_grained;
 
 	/* private data for every page-xfer engine */
 	union {
@@ -49,7 +50,15 @@ struct page_xfer {
 
 	struct page_read *parent;
 	struct hot_apply_ctx *hot_apply;
+	u32 pages_id;
+
+	const void *dsa_fg_shared;
+	u32 dsa_fg_desc_area_off;
+	u32 dsa_fg_desc_head;
+	bool dsa_fg_materialized;
 };
+
+extern int page_xfer_dsa_fg_enable(struct page_xfer *xfer);
 
 extern int open_page_xfer(struct page_xfer *xfer, int fd_type, unsigned long id);
 extern int open_page_xfer_no_parent(struct page_xfer *xfer, int fd_type, unsigned long id);
@@ -63,6 +72,10 @@ extern int connect_to_page_server_to_recv(int epfd);
 extern int disconnect_from_page_server(void);
 
 extern int check_parent_page_xfer(int fd_type, unsigned long id);
+
+extern int page_xfer_dsa_fg_apply_records(struct page_xfer *xfer,
+					  const void *shared,
+					  u32 desc_area_off, u32 desc_head);
 
 /*
  * The post-copy migration makes it necessary to receive pages from

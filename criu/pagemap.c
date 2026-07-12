@@ -7,6 +7,8 @@
 #include <errno.h>
 #include <string.h>
 #include <stdlib.h>
+#include <time.h>
+#include <inttypes.h>
 
 #include "types.h"
 #include "image.h"
@@ -28,6 +30,14 @@
 #endif
 
 #define MAX_BUNCH_SIZE 256
+
+static uint64_t page_read_now_us(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000ULL + ts.tv_nsec / 1000ULL;
+}
 
 struct hot_read_segment {
 	unsigned long img_id;
@@ -72,31 +82,43 @@ static int hot_read_load_ctx(struct page_read *pr)
 	struct hot_read_ctx *ctx;
 	char line[PATH_MAX + 128];
 	size_t cap = 0;
+	uint64_t parse_us = 0;
+	uint64_t open_us = 0;
+	uint64_t start_us;
 
 	ctx = xzalloc(sizeof(*ctx));
 	if (!ctx)
 		return -1;
 
+	start_us = page_read_now_us();
 	fp = fopen(path, "r");
 	if (!fp) {
 		pr_perror("hot page_read can't open manifest %s", path);
 		xfree(ctx);
 		return -1;
 	}
+	parse_us += page_read_now_us() - start_us;
 
 	while (fgets(line, sizeof(line), fp)) {
 		struct hot_read_segment seg;
 		unsigned long long off;
 		int n;
+		uint64_t line_start_us;
+		uint64_t open_start_us;
 
 		memset(&seg, 0, sizeof(seg));
 		seg.fd = -1;
+		pr->manifest_bytes += strlen(line);
+		line_start_us = page_read_now_us();
 		n = sscanf(line, "seg %lu %lx %lu %4095s %llu",
 			   &seg.img_id, &seg.vaddr, &seg.len, seg.file, &off);
+		parse_us += page_read_now_us() - line_start_us;
 		if (n != 5 || seg.img_id != pr->img_id)
 			continue;
 		seg.off = (off_t)off;
+		open_start_us = page_read_now_us();
 		seg.fd = open(seg.file, O_RDONLY | O_CLOEXEC);
+		open_us += page_read_now_us() - open_start_us;
 		if (seg.fd < 0) {
 			pr_perror("hot page_read can't open segment %s", seg.file);
 			fclose(fp);
@@ -121,6 +143,9 @@ static int hot_read_load_ctx(struct page_read *pr)
 	}
 
 	fclose(fp);
+	pr->timing_manifest_parse_us += parse_us;
+	pr->timing_segment_open_us += open_us;
+	pr->segment_count = ctx->nr;
 	if (!ctx->nr) {
 		pr_err("hot page_read found no segments for img_id=%lu in %s\n",
 		       pr->img_id, path);
@@ -131,20 +156,102 @@ static int hot_read_load_ctx(struct page_read *pr)
 	return 0;
 }
 
-static struct hot_read_segment *hot_read_find(struct hot_read_ctx *ctx,
+static struct hot_read_segment *hot_read_find(struct page_read *pr,
 					      unsigned long img_id,
 					      unsigned long vaddr)
 {
+	struct hot_read_ctx *ctx = pr->hot;
 	size_t i;
+	uint64_t start_us = page_read_now_us();
 
+	pr->hot_find_calls++;
 	for (i = 0; i < ctx->nr; i++) {
 		unsigned long start = ctx->segs[i].vaddr;
 		unsigned long end = start + ctx->segs[i].len;
 
-		if (ctx->segs[i].img_id == img_id && vaddr >= start && vaddr < end)
+		if (ctx->segs[i].img_id == img_id && vaddr >= start && vaddr < end) {
+			uint64_t steps = i + 1;
+
+			pr->hot_find_steps += steps;
+			if (steps > pr->hot_find_steps_max)
+				pr->hot_find_steps_max = steps;
+			pr->timing_hot_find_us += page_read_now_us() - start_us;
 			return &ctx->segs[i];
+		}
 	}
+	pr->hot_find_steps += ctx->nr;
+	if (ctx->nr > pr->hot_find_steps_max)
+		pr->hot_find_steps_max = ctx->nr;
+	pr->timing_hot_find_us += page_read_now_us() - start_us;
 	return NULL;
+}
+
+static int read_full_fd(int fd, void *buf, size_t len)
+{
+	size_t done = 0;
+
+	while (done < len) {
+		ssize_t ret = read(fd, buf + done, len - done);
+
+		if (ret < 0) {
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+		if (!ret)
+			return -1;
+		done += ret;
+	}
+	return 0;
+}
+
+static int pread_full_fd(int fd, void *buf, size_t len, off_t off)
+{
+	size_t done = 0;
+
+	while (done < len) {
+		ssize_t ret = pread(fd, buf + done, len - done, off + done);
+
+		if (ret < 0) {
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+		if (!ret)
+			return -1;
+		done += ret;
+	}
+	return 0;
+}
+
+static int open_fg_sidecar_at(int dfd, struct page_read *pr)
+{
+	char path[64];
+
+	if (pr->fg_idx_fd >= 0)
+		return 0;
+
+	snprintf(path, sizeof(path), "pages-fg-%u.idx", pr->pages_img_id);
+	pr->fg_idx_fd = openat(dfd, path, O_RDONLY | O_CLOEXEC);
+	if (pr->fg_idx_fd < 0) {
+		if (errno == ENOENT)
+			return 0;
+		pr_perror("Can't open DSA fine-grained index %s", path);
+		return -1;
+	}
+
+	snprintf(path, sizeof(path), "pages-fg-%u.dat", pr->pages_img_id);
+	pr->fg_dat_fd = openat(dfd, path, O_RDONLY | O_CLOEXEC);
+	if (pr->fg_dat_fd < 0) {
+		pr_perror("Can't open DSA fine-grained data %s", path);
+		close(pr->fg_idx_fd);
+		pr->fg_idx_fd = -1;
+		return -1;
+	}
+
+	pr_info("Opened DSA fine-grained pages sidecar pages_id=%u\n",
+		pr->pages_img_id);
+	return 0;
 }
 
 /*
@@ -259,8 +366,14 @@ static void skip_pagemap_pages(struct page_read *pr, unsigned long len)
 	if (!len)
 		return;
 
-	if (pagemap_present(pr->pe))
+	if (pagemap_dsa_fg(pr->pe) && !pr->hot_restore) {
+		off_t off = (len / PAGE_SIZE) * sizeof(struct dsa_fg_page_meta);
+
+		if (pr->fg_idx_fd >= 0 && lseek(pr->fg_idx_fd, off, SEEK_CUR) == (off_t)-1)
+			pr_perror("Can't skip DSA fine-grained metadata");
+	} else if (pagemap_present(pr->pe)) {
 		pr->pi_off += len;
+	}
 	pr->cvaddr += len;
 }
 
@@ -300,6 +413,7 @@ static inline void pagemap_bound_check(PagemapEntry *pe, unsigned long vaddr, un
 static int read_parent_page(struct page_read *pr, unsigned long vaddr, unsigned long int nr, void *buf, unsigned flags)
 {
 	struct page_read *ppr = pr->parent;
+	uint64_t start_us = page_read_now_us();
 	int ret;
 
 	if (!ppr) {
@@ -317,9 +431,13 @@ static int read_parent_page(struct page_read *pr, unsigned long vaddr, unsigned 
 
 	do {
 		unsigned long int p_nr;
+		uint64_t seek_start_us;
+		uint64_t child_start_us;
 
 		pr_debug("\tpr%lu-%u Read from parent\n", pr->img_id, pr->id);
+		seek_start_us = page_read_now_us();
 		ret = ppr->seek_pagemap(ppr, vaddr);
+		pr->timing_parent_seek_us += page_read_now_us() - seek_start_us;
 		if (ret <= 0) {
 			pr_err("Missing %lx in parent pagemap\n", vaddr);
 			return -1;
@@ -331,11 +449,15 @@ static int read_parent_page(struct page_read *pr, unsigned long vaddr, unsigned 
 		 * read as much as we can.
 		 */
 		p_nr = ppr->pe->nr_pages - (vaddr - ppr->pe->vaddr) / PAGE_SIZE;
-		pr_info("\tparent has %lu pages in\n", p_nr);
+		pr_debug("\tparent has %lu pages in\n", p_nr);
 		if (p_nr > nr)
 			p_nr = nr;
 
+		pr->parent_read_calls++;
+		pr->parent_read_pages += p_nr;
+		child_start_us = page_read_now_us();
 		ret = ppr->read_pages(ppr, vaddr, p_nr, buf, flags);
+		pr->timing_parent_child_incl_us += page_read_now_us() - child_start_us;
 		if (ret == -1)
 			return ret;
 
@@ -349,6 +471,7 @@ static int read_parent_page(struct page_read *pr, unsigned long vaddr, unsigned 
 		buf += p_nr * PAGE_SIZE;
 	} while (nr);
 
+	pr->timing_parent_read_us += page_read_now_us() - start_us;
 	return 0;
 }
 
@@ -372,7 +495,11 @@ static int read_local_page(struct page_read *pr, unsigned long vaddr, unsigned l
 
 	pr_debug("\tpr%lu-%u Read page from self %lx/%" PRIx64 "\n", pr->img_id, pr->id, pr->cvaddr, pr->pi_off);
 	while (1) {
+		uint64_t start_us = page_read_now_us();
+
 		ret = pread(fd, buf + curr, len - curr, pr->pi_off + curr);
+		pr->timing_disk_pread_us += page_read_now_us() - start_us;
+		pr->disk_pread_calls++;
 		if (ret < 1) {
 			pr_perror("Can't read mapping page %zd", ret);
 			return -1;
@@ -388,6 +515,137 @@ static int read_local_page(struct page_read *pr, unsigned long vaddr, unsigned l
 			return -1;
 	}
 
+	return 0;
+}
+
+static int read_fg_page_one(struct page_read *pr, unsigned long vaddr, void *buf,
+			    unsigned flags)
+{
+	struct dsa_fg_page_meta meta;
+	void *data = NULL;
+	size_t entries_len;
+	size_t bytes_off;
+	uint64_t start_us = page_read_now_us();
+	uint64_t part_start_us;
+	u16 i;
+	int ret = -1;
+
+	if (pr->fg_idx_fd < 0 || pr->fg_dat_fd < 0) {
+		pr_err("DSA fine-grained page requested without sidecar pages_id=%u\n",
+		       pr->pages_img_id);
+		return -1;
+	}
+
+	part_start_us = page_read_now_us();
+	if (read_full_fd(pr->fg_idx_fd, &meta, sizeof(meta))) {
+		pr_perror("Can't read DSA fine-grained page metadata");
+		return -1;
+	}
+	pr->timing_fg_meta_us += page_read_now_us() - part_start_us;
+	if (meta.vaddr != vaddr) {
+		pr_err("DSA fine-grained metadata out of order want=%lx have=%" PRIx64 "\n",
+		       vaddr, meta.vaddr);
+		return -1;
+	}
+
+	if (meta.flags == DSA_FG_PAGE_FULL) {
+		if (meta.data_len != PAGE_SIZE || meta.patch_count) {
+			pr_err("Invalid DSA fine-grained full record vaddr=%lx len=%u patches=%u\n",
+			       vaddr, meta.data_len, meta.patch_count);
+			return -1;
+		}
+		part_start_us = page_read_now_us();
+		if (pread_full_fd(pr->fg_dat_fd, buf, PAGE_SIZE, meta.data_off)) {
+			pr_perror("Can't read DSA fine-grained full page");
+			return -1;
+		}
+		pr->timing_fg_full_data_us += page_read_now_us() - part_start_us;
+		pr->fg_pages_read++;
+		pr->fg_full_pages_read++;
+		pr->fg_patch_bytes_read += PAGE_SIZE;
+		pr->timing_fg_read_us += page_read_now_us() - start_us;
+		return 0;
+	}
+
+	if (meta.flags != DSA_FG_PAGE_PATCH) {
+		pr_err("Unknown DSA fine-grained record flags=%u vaddr=%lx\n",
+		       meta.flags, vaddr);
+		return -1;
+	}
+
+	if (!pr->parent) {
+		pr_err("DSA fine-grained patch page has no parent vaddr=%lx\n", vaddr);
+		return -1;
+	}
+	part_start_us = page_read_now_us();
+	if (read_parent_page(pr, vaddr, 1, buf, flags & ~(PR_ASYNC | PR_ASAP)) < 0)
+		return -1;
+	pr->timing_fg_patch_parent_incl_us += page_read_now_us() - part_start_us;
+
+	entries_len = (size_t)meta.patch_count * sizeof(struct dsa_fg_patch_entry);
+	if (entries_len > meta.data_len) {
+		pr_err("Invalid DSA fine-grained patch record vaddr=%lx entries=%zu len=%u\n",
+		       vaddr, entries_len, meta.data_len);
+		return -1;
+	}
+	if (!meta.data_len)
+		return 0;
+
+	data = xmalloc(meta.data_len);
+	if (!data)
+		return -1;
+	part_start_us = page_read_now_us();
+	if (pread_full_fd(pr->fg_dat_fd, data, meta.data_len, meta.data_off)) {
+		pr_perror("Can't read DSA fine-grained patch data");
+		goto out;
+	}
+	pr->timing_fg_patch_data_us += page_read_now_us() - part_start_us;
+
+	bytes_off = entries_len;
+	part_start_us = page_read_now_us();
+	for (i = 0; i < meta.patch_count; i++) {
+		struct dsa_fg_patch_entry *patch = data;
+		u16 off = patch[i].off;
+		u16 len = patch[i].len;
+
+		if ((unsigned int)off + len > PAGE_SIZE ||
+		    bytes_off + len > meta.data_len) {
+			pr_err("Invalid DSA fine-grained patch entry vaddr=%lx off=%u len=%u\n",
+			       vaddr, off, len);
+			goto out;
+		}
+		memcpy((char *)buf + off, (char *)data + bytes_off, len);
+		bytes_off += len;
+	}
+	pr->timing_fg_patch_apply_us += page_read_now_us() - part_start_us;
+	if (bytes_off != meta.data_len) {
+		pr_err("DSA fine-grained patch trailing data vaddr=%lx used=%zu len=%u\n",
+		       vaddr, bytes_off, meta.data_len);
+		goto out;
+	}
+
+	ret = 0;
+	pr->fg_pages_read++;
+	pr->fg_patch_pages_read++;
+	pr->fg_patch_bytes_read += meta.data_len;
+out:
+	xfree(data);
+	pr->timing_fg_read_us += page_read_now_us() - start_us;
+	return ret;
+}
+
+static int read_fg_pages(struct page_read *pr, unsigned long vaddr,
+			 unsigned long nr, void *buf, unsigned flags)
+{
+	unsigned long i;
+
+	for (i = 0; i < nr; i++) {
+		if (read_fg_page_one(pr, vaddr + i * PAGE_SIZE,
+				     (char *)buf + i * PAGE_SIZE, flags))
+			return -1;
+	}
+	if (pr->io_complete)
+		return pr->io_complete(pr, vaddr, nr);
 	return 0;
 }
 
@@ -430,7 +688,7 @@ int pagemap_render_iovec(struct list_head *from, struct task_restore_args *ta)
 	list_for_each_entry(piov, from, l) {
 		struct restore_vma_io *rio;
 
-		pr_info("`- render %d iovs (%p:%zd...)\n", piov->nr, piov->to[0].iov_base, piov->to[0].iov_len);
+		pr_debug("`- render %d iovs (%p:%zd...)\n", piov->nr, piov->to[0].iov_base, piov->to[0].iov_len);
 		rio = rst_mem_alloc(RIO_SIZE(piov->nr), RM_PRIVATE);
 		if (!rio)
 			return -1;
@@ -506,15 +764,23 @@ static int maybe_read_page_local(struct page_read *pr, unsigned long vaddr, unsi
 	 * for us for urgent async read, just do the regular
 	 * cached read.
 	 */
-	if ((flags & (PR_ASYNC | PR_ASAP)) == PR_ASYNC)
+	if ((flags & (PR_ASYNC | PR_ASAP)) == PR_ASYNC) {
 		ret = pagemap_enqueue_iovec(pr, buf, len, &pr->async);
-	else {
+		if (ret == 0) {
+			pr->async_enqueued_bytes += len;
+			pr->async_enqueued_iovs++;
+		}
+	} else {
 		ret = read_local_page(pr, vaddr, len, buf);
 		if (ret == 0 && pr->io_complete)
 			ret = pr->io_complete(pr, vaddr, nr);
 	}
 
 	pr->pi_off += len;
+	if (ret == 0) {
+		pr->pages_read += nr;
+		pr->bytes_read += len;
+	}
 
 	return ret;
 }
@@ -537,7 +803,7 @@ static int maybe_read_page_hot(struct page_read *pr, unsigned long vaddr, unsign
 		unsigned long chunk;
 		size_t curr = 0;
 
-		seg = hot_read_find(ctx, pr->img_id, addr);
+		seg = hot_read_find(pr, pr->img_id, addr);
 		if (!seg) {
 			pr_err("hot page_read missing img_id=%lu vaddr=%lx\n",
 			       pr->img_id, addr);
@@ -549,9 +815,12 @@ static int maybe_read_page_hot(struct page_read *pr, unsigned long vaddr, unsign
 			chunk = len - done;
 
 		while (curr < chunk) {
+			uint64_t start_us = page_read_now_us();
 			ssize_t ret = pread(seg->fd, buf + done + curr,
 					    chunk - curr,
 					    seg->off + (addr - seg->vaddr) + curr);
+			pr->timing_hot_pread_us += page_read_now_us() - start_us;
+			pr->hot_pread_calls++;
 			if (ret < 1) {
 				pr_perror("hot page_read failed segment=%s ret=%zd",
 					  seg->file, ret);
@@ -560,9 +829,13 @@ static int maybe_read_page_hot(struct page_read *pr, unsigned long vaddr, unsign
 			curr += ret;
 		}
 		done += chunk;
+		if (done < len)
+			pr->hot_cross_segment_reads++;
 	}
 
 	pr->pi_off += len;
+	pr->pages_read += nr;
+	pr->bytes_read += len;
 	if (pr->io_complete)
 		return pr->io_complete(pr, vaddr, nr);
 	return 0;
@@ -646,10 +919,13 @@ static int maybe_read_page_remote(struct page_read *pr, unsigned long vaddr, uns
 
 static int read_pagemap_page(struct page_read *pr, unsigned long vaddr, unsigned long nr, void *buf, unsigned flags)
 {
-	pr_info("pr%lu-%u Read %lx %lu pages\n", pr->img_id, pr->id, vaddr, nr);
+	pr_debug("pr%lu-%u Read %lx %lu pages\n", pr->img_id, pr->id, vaddr, nr);
 	pagemap_bound_check(pr->pe, vaddr, nr);
 
-	if (pagemap_in_parent(pr->pe) && !pr->hot_restore) {
+	if (pagemap_dsa_fg(pr->pe) && !pr->hot_restore) {
+		if (read_fg_pages(pr, vaddr, nr, buf, flags) < 0)
+			return -1;
+	} else if (pagemap_in_parent(pr->pe) && !pr->hot_restore) {
 		if (read_parent_page(pr, vaddr, nr, buf, flags) < 0)
 			return -1;
 	} else {
@@ -701,6 +977,7 @@ static int process_async_reads(struct page_read *pr)
 {
 	int fd, ret = 0;
 	struct page_read_iov *piov, *n;
+	uint64_t sync_start_us = page_read_now_us();
 
 	fd = img_raw_fd(pr->pi);
 	list_for_each_entry_safe(piov, n, &pr->async, l) {
@@ -710,7 +987,12 @@ static int process_async_reads(struct page_read *pr)
 		pr_debug("Read piov iovs %d, from %ju, len %ju, first %p:%zu\n", piov->nr, piov->from,
 			 piov->end - piov->from, piov->to->iov_base, piov->to->iov_len);
 	more:
+		{
+			uint64_t start_us = page_read_now_us();
 		ret = preadv(fd, piov->to, piov->nr, piov->from);
+			pr->timing_disk_pread_us += page_read_now_us() - start_us;
+			pr->disk_pread_calls++;
+		}
 		if (fault_injected(FI_PARTIAL_PAGES)) {
 			/*
 			 * We might have read everything, but for debug
@@ -762,6 +1044,7 @@ static int process_async_reads(struct page_read *pr)
 	if (pr->parent)
 		ret = process_async_reads(pr->parent);
 
+	pr->timing_async_sync_us += page_read_now_us() - sync_start_us;
 	return ret;
 }
 
@@ -774,6 +1057,7 @@ static int hot_read_sync(struct page_read *pr)
 static void close_page_read(struct page_read *pr)
 {
 	int ret;
+	uint64_t exclusive_total_us;
 
 	BUG_ON(!list_empty(&pr->async));
 
@@ -794,10 +1078,48 @@ static void close_page_read(struct page_read *pr)
 		close_image(pr->pmi);
 	if (pr->pi)
 		close_image(pr->pi);
+	if (pr->fg_idx_fd >= 0) {
+		close(pr->fg_idx_fd);
+		pr->fg_idx_fd = -1;
+	}
+	if (pr->fg_dat_fd >= 0) {
+		close(pr->fg_dat_fd);
+		pr->fg_dat_fd = -1;
+	}
 	if (pr->hot) {
 		hot_read_close_ctx(pr->hot);
 		pr->hot = NULL;
 	}
+
+	pr_info("PAGE_READ_TIMING img_id=%lu pages_id=%u hot=%u pages=%" PRIu64 " bytes=%" PRIu64 " open_total_us=%" PRIu64 " manifest_parse_us=%" PRIu64 " segment_open_us=%" PRIu64 " init_pagemaps_us=%" PRIu64 " segment_count=%" PRIu64 " manifest_bytes=%" PRIu64 " hot_find_us=%" PRIu64 " hot_find_calls=%" PRIu64 " hot_find_steps=%" PRIu64 " hot_find_steps_max=%" PRIu64 " hot_pread_us=%" PRIu64 " hot_pread_calls=%" PRIu64 " hot_cross_segment_reads=%" PRIu64 " disk_pread_us=%" PRIu64 " disk_pread_calls=%" PRIu64 " fg_read_us=%" PRIu64 " fg_pages=%" PRIu64 " fg_full_pages=%" PRIu64 " fg_patch_pages=%" PRIu64 " fg_patch_bytes=%" PRIu64 " parent_read_us=%" PRIu64 " async_sync_us=%" PRIu64 " async_enqueued_bytes=%" PRIu64 " async_enqueued_iovs=%" PRIu64 "\n",
+		pr->img_id, pr->pages_img_id, pr->hot_restore ? 1 : 0,
+		pr->pages_read, pr->bytes_read, pr->timing_open_total_us,
+		pr->timing_manifest_parse_us, pr->timing_segment_open_us,
+		pr->timing_init_pagemaps_us, pr->segment_count, pr->manifest_bytes,
+		pr->timing_hot_find_us, pr->hot_find_calls, pr->hot_find_steps,
+		pr->hot_find_steps_max, pr->timing_hot_pread_us, pr->hot_pread_calls,
+		pr->hot_cross_segment_reads, pr->timing_disk_pread_us,
+		pr->disk_pread_calls, pr->timing_fg_read_us, pr->fg_pages_read,
+		pr->fg_full_pages_read, pr->fg_patch_pages_read,
+		pr->fg_patch_bytes_read, pr->timing_parent_read_us,
+		pr->timing_async_sync_us, pr->async_enqueued_bytes,
+		pr->async_enqueued_iovs);
+
+	exclusive_total_us = pr->timing_hot_find_us + pr->timing_hot_pread_us +
+		pr->timing_disk_pread_us + pr->timing_fg_meta_us +
+		pr->timing_fg_full_data_us + pr->timing_fg_patch_data_us +
+		pr->timing_fg_patch_apply_us + pr->timing_parent_seek_us +
+		pr->timing_async_sync_us;
+	pr_info("PAGE_READ_EXCLUSIVE_TIMING img_id=%lu pages_id=%u hot=%u pages=%" PRIu64 " bytes=%" PRIu64 " exclusive_total_us=%" PRIu64 " parent_calls=%" PRIu64 " parent_pages=%" PRIu64 " parent_seek_us=%" PRIu64 " parent_child_incl_us=%" PRIu64 " fg_meta_us=%" PRIu64 " fg_full_data_us=%" PRIu64 " fg_patch_parent_incl_us=%" PRIu64 " fg_patch_data_us=%" PRIu64 " fg_patch_apply_us=%" PRIu64 " hot_find_us=%" PRIu64 " hot_pread_us=%" PRIu64 " disk_pread_us=%" PRIu64 " async_sync_us=%" PRIu64 "\n",
+		pr->img_id, pr->pages_img_id, pr->hot_restore ? 1 : 0,
+		pr->pages_read, pr->bytes_read, exclusive_total_us,
+		pr->parent_read_calls, pr->parent_read_pages,
+		pr->timing_parent_seek_us, pr->timing_parent_child_incl_us,
+		pr->timing_fg_meta_us, pr->timing_fg_full_data_us,
+		pr->timing_fg_patch_parent_incl_us, pr->timing_fg_patch_data_us,
+		pr->timing_fg_patch_apply_us, pr->timing_hot_find_us,
+		pr->timing_hot_pread_us, pr->timing_disk_pread_us,
+		pr->timing_async_sync_us);
 
 	if (pr->pmes)
 		free_pagemaps(pr);
@@ -809,6 +1131,8 @@ static void reset_pagemap(struct page_read *pr)
 	pr->pi_off = 0;
 	pr->curr_pme = -1;
 	pr->pe = NULL;
+	if (pr->fg_idx_fd >= 0 && lseek(pr->fg_idx_fd, 0, SEEK_SET) == (off_t)-1)
+		pr_perror("Can't reset DSA fine-grained metadata");
 
 	/* FIXME: take care of bunch */
 
@@ -948,6 +1272,8 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 	static unsigned ids = 1;
 	bool remote = pr_flags & PR_REMOTE;
 	bool hot_restore = hot_restore_enabled() && !(pr_flags & PR_REMOTE);
+	uint64_t open_start_us = page_read_now_us();
+	uint64_t init_start_us;
 
 	/*
 	 * Only the top-most page-read can be remote, all the
@@ -985,7 +1311,44 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 	pr->pi = NULL;
 	pr->pmi = NULL;
 	pr->hot = NULL;
+	pr->fg_idx_fd = -1;
+	pr->fg_dat_fd = -1;
 	pr->hot_restore = hot_restore;
+	pr->timing_open_total_us = 0;
+	pr->timing_manifest_parse_us = 0;
+	pr->timing_segment_open_us = 0;
+	pr->timing_init_pagemaps_us = 0;
+	pr->timing_hot_find_us = 0;
+	pr->timing_hot_pread_us = 0;
+	pr->timing_disk_pread_us = 0;
+	pr->timing_fg_read_us = 0;
+	pr->timing_parent_read_us = 0;
+	pr->timing_async_sync_us = 0;
+	pr->timing_parent_seek_us = 0;
+	pr->timing_parent_child_incl_us = 0;
+	pr->timing_fg_meta_us = 0;
+	pr->timing_fg_full_data_us = 0;
+	pr->timing_fg_patch_parent_incl_us = 0;
+	pr->timing_fg_patch_data_us = 0;
+	pr->timing_fg_patch_apply_us = 0;
+	pr->hot_find_calls = 0;
+	pr->hot_find_steps = 0;
+	pr->hot_find_steps_max = 0;
+	pr->hot_pread_calls = 0;
+	pr->hot_cross_segment_reads = 0;
+	pr->disk_pread_calls = 0;
+	pr->parent_read_calls = 0;
+	pr->parent_read_pages = 0;
+	pr->fg_pages_read = 0;
+	pr->fg_full_pages_read = 0;
+	pr->fg_patch_pages_read = 0;
+	pr->fg_patch_bytes_read = 0;
+	pr->pages_read = 0;
+	pr->bytes_read = 0;
+	pr->async_enqueued_bytes = 0;
+	pr->async_enqueued_iovs = 0;
+	pr->segment_count = 0;
+	pr->manifest_bytes = 0;
 	pr->pieok = false;
 	pr->disable_dedup = false;
 	pr->img_id = img_id;
@@ -1021,12 +1384,18 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 			close_page_read(pr);
 			return -1;
 		}
+		if (open_fg_sidecar_at(dfd, pr)) {
+			close_page_read(pr);
+			return -1;
+		}
 	}
 
+	init_start_us = page_read_now_us();
 	if (init_pagemaps(pr)) {
 		close_page_read(pr);
 		return -1;
 	}
+	pr->timing_init_pagemaps_us += page_read_now_us() - init_start_us;
 
 	if (hot_restore && hot_read_load_ctx(pr)) {
 		close_page_read(pr);
@@ -1052,12 +1421,13 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 		pr->maybe_read_page = maybe_read_page_img_streamer;
 	else {
 		pr->maybe_read_page = maybe_read_page_local;
-		if (!pr->parent && !opts.lazy_pages)
+		if (!pr->parent && !opts.lazy_pages && pr->fg_idx_fd < 0)
 			pr->pieok = true;
 	}
 
 	pr_debug("Opened %s page read %u (parent %u)\n", hot_restore ? "hot" : (remote ? "remote" : "local"), pr->id,
 		 pr->parent ? pr->parent->id : 0);
+	pr->timing_open_total_us += page_read_now_us() - open_start_us;
 
 	return 1;
 }

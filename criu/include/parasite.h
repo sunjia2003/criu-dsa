@@ -266,8 +266,27 @@ struct parasite_dump_cgroup_args {
 #ifdef CRIU_DSA_ENABLE_LEGACY_SINGLE_RPC
 #define PARASITE_DSA_SHM_F_SINGLE_RPC 0x2U
 #endif
+#define PARASITE_DSA_SHM_F_FINE_GRAINED 0x4U
 #define DSA_STREAM_SLOT_COUNT        8U
 #define DSA_STREAM_SLOT_DESC_CAP     DSA_DUMP_BATCH_SIZE
+#ifndef DSA_FG_PATCH_SIZE
+#define DSA_FG_PATCH_SIZE            128U
+#endif
+#ifndef DSA_FG_MAX_PATCHES
+#define DSA_FG_MAX_PATCHES           8U
+#endif
+#ifndef DSA_FG_MAX_BYTES
+#define DSA_FG_MAX_BYTES             1024U
+#endif
+#ifndef DSA_FG_MAX_OLD_SEGMENTS
+#define DSA_FG_MAX_OLD_SEGMENTS      256U
+#endif
+#ifndef DSA_FG_PAGE_PATCH
+#define DSA_FG_PAGE_PATCH            1U
+#endif
+#ifndef DSA_FG_PAGE_FULL
+#define DSA_FG_PAGE_FULL             2U
+#endif
 
 enum dsa_stream_slot_state {
 	DSA_STREAM_SLOT_EMPTY = 0,
@@ -288,6 +307,50 @@ struct dsa_dump_descriptor {
 	u32 reserved0;
 };
 
+struct dsa_fg_old_segment {
+	u64 img_id;
+	u64 vaddr;
+	u64 len;
+	u64 file_off;
+	u32 fd_index;
+	u32 flags;
+};
+
+struct dsa_fg_descriptor {
+	u64 src_addr;		/* Source address in target process */
+	u32 old_seg_idx;	/* Index in dsa_fg_old_segment table */
+	u32 page_count;		/* Number of contiguous pages in this descriptor */
+	u32 record_off;		/* Result metadata area in shared buffer */
+	u32 record_stride;	/* Bytes reserved for each page metadata record */
+};
+
+struct parasite_dsa_fg_patch_entry {
+	u16 off;
+	u16 len;
+};
+
+struct parasite_dsa_fg_record {
+	u64 vaddr;
+	u32 data_len;
+	u16 patch_count;
+	u16 flags;
+};
+
+struct parasite_dsa_fg_result_entry {
+	u16 off;
+	u16 len;
+	u32 data_off;		/* Offset in the shared result-data arena */
+};
+
+struct parasite_dsa_fg_result {
+	u64 vaddr;
+	u32 data_off;		/* Full-page data offset for DSA_FG_PAGE_FULL */
+	u32 data_len;
+	u16 patch_count;
+	u16 flags;
+	struct parasite_dsa_fg_result_entry entries[DSA_FG_MAX_PATCHES];
+};
+
 struct parasite_dsa_shm_hdr {
 	u32 magic;
 	u32 version;
@@ -296,6 +359,9 @@ struct parasite_dsa_shm_hdr {
 	u32 desc_count;
 	u32 data_off;
 	u32 data_bytes;
+	u32 fg_old_seg_off;
+	u32 fg_old_seg_count;
+	u32 fg_record_stride;
 	u32 reserved;
 };
 
@@ -324,6 +390,12 @@ struct parasite_dsa_stream_hdr {
 	u32 payload_base;
 	volatile u32 payload_head;
 	u32 payload_limit;
+	u32 fg_result_meta_base;
+	u32 fg_result_meta_head;
+	u32 fg_result_meta_limit;
+	u32 fg_result_data_base;
+	volatile u32 fg_result_data_head;
+	u32 fg_result_data_limit;
 	u32 reserved;
 	s32 result_op_ret;
 	u32 result_total_copied;
@@ -341,6 +413,8 @@ struct parasite_dsa_stream_hdr {
 	u64 result_poll_us;
 	u32 result_submit_enqcmd;
 	u32 result_submit_write;
+	u32 result_fg_compare_ops;
+	u32 result_fg_copy_ops;
 };
 
 struct parasite_dsa_dump_pages_args {
@@ -356,6 +430,8 @@ struct parasite_dsa_dump_pages_args {
 	u32 use_wq_fd;		/* Use FD instead of path */
 	u32 batch_id;		/* Monotonic batch id from host */
 	u32 wq_policy;		/* enum dsa_wq_policy, default LPT */
+	u32 fg_enabled;		/* Fine-grained DSA compare/copy mode */
+	u32 fg_old_seg_count;	/* Number of old segment FDs sent over RPC */
 	char wq_paths[DSA_DUMP_MAX_WQ][64];  /* WQ paths or empty if using FD */
 
 	/* Output from PARASITE */
@@ -367,6 +443,8 @@ struct parasite_dsa_dump_pages_args {
 	u32 new_buf_offset;	/* New buffer write offset after this batch */
 	u32 submit_enqcmd;	/* Number of descriptors submitted via enqcmd */
 	u32 submit_write;	/* Number of descriptors submitted via write() */
+	u32 fg_compare_ops;	/* Number of fine-grained compare ops */
+	u32 fg_copy_ops;	/* Number of fine-grained memmove ops */
 	u32 map_populate_fallbacks;	/* MAP_POPULATE -> MAP_SHARED fallbacks */
 	u64 prefault_us;	/* Total time spent in source prefault for this batch */
 	u64 submit_us;	/* Total time spent in DSA submit for this batch */
