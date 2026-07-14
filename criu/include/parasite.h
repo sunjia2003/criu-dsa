@@ -287,6 +287,9 @@ struct parasite_dump_cgroup_args {
 #ifndef DSA_FG_PAGE_FULL
 #define DSA_FG_PAGE_FULL             2U
 #endif
+#ifndef DSA_FG_PAGE_PARENT
+#define DSA_FG_PAGE_PARENT           3U
+#endif
 
 enum dsa_stream_slot_state {
 	DSA_STREAM_SLOT_EMPTY = 0,

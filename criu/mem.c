@@ -16,6 +16,8 @@
 #include <pthread.h>
 #include <linux/memfd.h>
 #include <sys/stat.h>
+#include <sys/vfs.h>
+#include <linux/magic.h>
 
 static uint64_t restore_now_us(void)
 {
@@ -1086,6 +1088,7 @@ struct dsa_dump_ctx {
 	int wq_count;
 	char wq_paths[DSA_DUMP_MAX_WQ][64];
 	bool fine_grained;
+	bool raw_fg_capture;
 	struct dsa_fg_old_segment *fg_old_segments;
 	int *fg_old_fds;
 	u32 fg_old_seg_count;
@@ -1102,20 +1105,9 @@ struct dsa_dump_ctx {
 static void dsa_replay_ctx_init(struct dsa_dump_ctx *ctx);
 static int dsa_replay_to_pipe(struct dsa_dump_ctx *ctx);
 
-struct dsa_fg_old_seg_bf {
-	struct dsa_fg_old_segment meta;
-	int fd;
-	char file[PATH_MAX];
-};
-
 struct dsa_fg_before_freeze {
 	bool enabled;
 	bool ready;
-	struct dsa_fg_old_seg_bf *segs;
-	size_t nr;
-	size_t cap;
-	u64 parse_us;
-	u64 open_us;
 };
 
 static struct dsa_fg_before_freeze dsa_fg_bf;
@@ -1130,132 +1122,28 @@ static bool dsa_fine_grained_enabled(void)
 
 static void dsa_fg_bf_reset(void)
 {
-	size_t i;
-
-	for (i = 0; i < dsa_fg_bf.nr; i++) {
-		if (dsa_fg_bf.segs[i].fd >= 0)
-			close(dsa_fg_bf.segs[i].fd);
-	}
-	xfree(dsa_fg_bf.segs);
 	memset(&dsa_fg_bf, 0, sizeof(dsa_fg_bf));
-}
-
-static int dsa_fg_bf_add_seg(unsigned long img_id, unsigned long vaddr,
-			     unsigned long len, const char *file,
-			     unsigned long long file_off)
-{
-	struct dsa_fg_old_seg_bf *seg;
-	struct stat st;
-	int fd;
-
-	if (dsa_fg_bf.nr == dsa_fg_bf.cap) {
-		size_t new_cap = dsa_fg_bf.cap ? dsa_fg_bf.cap * 2 : 128;
-		void *new_segs = xrealloc(dsa_fg_bf.segs,
-					  new_cap * sizeof(dsa_fg_bf.segs[0]));
-
-		if (!new_segs)
-			return -1;
-		dsa_fg_bf.segs = new_segs;
-		dsa_fg_bf.cap = new_cap;
-	}
-
-	fd = open(file, O_RDONLY | O_CLOEXEC);
-	if (fd < 0) {
-		pr_perror("DSA fine-grained can't open old segment %s", file);
-		return -1;
-	}
-	if (fstat(fd, &st)) {
-		pr_perror("DSA fine-grained can't stat old segment %s", file);
-		close(fd);
-		return -1;
-	}
-	if ((unsigned long long)st.st_size < file_off + len) {
-		pr_err("DSA fine-grained old segment too small file=%s size=%llu need=%llu\n",
-		       file, (unsigned long long)st.st_size, file_off + len);
-		close(fd);
-		return -1;
-	}
-
-	seg = &dsa_fg_bf.segs[dsa_fg_bf.nr];
-	memset(seg, 0, sizeof(*seg));
-	seg->fd = fd;
-	seg->meta.img_id = img_id;
-	seg->meta.vaddr = vaddr;
-	seg->meta.len = len;
-	seg->meta.file_off = file_off;
-	seg->meta.fd_index = dsa_fg_bf.nr;
-	if (snprintf(seg->file, sizeof(seg->file), "%s", file) >=
-	    (int)sizeof(seg->file)) {
-		pr_err("DSA fine-grained old segment path too long\n");
-		close(fd);
-		return -1;
-	}
-	dsa_fg_bf.nr++;
-	return 0;
 }
 
 static int dsa_fg_prepare_before_freeze(void)
 {
-	const char *manifest = getenv("CRIU_DSA_HOT_MEMORY_MANIFEST");
-	FILE *fp;
-	char line[PATH_MAX + 128];
-	u64 start_us;
-	u64 open_start_us;
-
 	dsa_fg_bf_reset();
 	dsa_fg_bf.enabled = dsa_fine_grained_enabled();
-	if (!dsa_dump_enabled() || !dsa_fg_bf.enabled)
-		return 0;
-	if (!manifest || !manifest[0]) {
-		pr_info("DSA fine-grained enabled without old hot memory manifest; first dump will use full records\n");
-		dsa_fg_bf.ready = true;
-		return 0;
-	}
-
-	start_us = dsa_wall_now_us();
-	fp = fopen(manifest, "r");
-	if (!fp) {
-		if (errno == ENOENT) {
-			pr_info("DSA fine-grained old manifest missing; first dump will use full records: %s\n",
-				manifest);
-			dsa_fg_bf.ready = true;
-			return 0;
-		}
-		pr_perror("DSA fine-grained can't open old manifest %s", manifest);
-		return -1;
-	}
-
-	while (fgets(line, sizeof(line), fp)) {
-		unsigned long img_id, vaddr, len;
-		unsigned long long off;
-		char file[PATH_MAX];
-		int n;
-
-		n = sscanf(line, "seg %lu %lx %lu %4095s %llu",
-			   &img_id, &vaddr, &len, file, &off);
-		if (n != 5)
-			continue;
-		open_start_us = dsa_wall_now_us();
-		if (dsa_fg_bf_add_seg(img_id, vaddr, len, file, off)) {
-			fclose(fp);
-			return -1;
-		}
-		dsa_fg_bf.open_us += dsa_wall_delta_us(open_start_us, dsa_wall_now_us());
-	}
-	fclose(fp);
-	dsa_fg_bf.parse_us = dsa_wall_delta_us(start_us, dsa_wall_now_us());
-	dsa_fg_bf.ready = true;
-	pr_info("DSA fine-grained prepare before freeze: old_segments=%zu parse_us=%llu open_us=%llu manifest=%s\n",
-		dsa_fg_bf.nr, (unsigned long long)dsa_fg_bf.parse_us,
-		(unsigned long long)dsa_fg_bf.open_us, manifest);
+	dsa_fg_bf.ready = dsa_dump_enabled() && dsa_fg_bf.enabled;
+	if (dsa_fg_bf.ready)
+		pr_info("DSA fine-grained prepare before freeze: raw capture only\n");
 	return 0;
 }
 
 struct dsa_shared_mem_before_freeze {
 	int fd;
+	int owner_lock_fd;
+	int lease_lock_fd;
 	void *buf;
 	size_t alloc_size;
 	size_t size;
+	bool external_arena;
+	u64 arena_epoch;
 	bool ready;
 	u64 total_us;
 	u64 create_us;
@@ -1265,9 +1153,13 @@ struct dsa_shared_mem_before_freeze {
 
 static struct dsa_shared_mem_before_freeze dsa_shared_mem_bf = {
 	.fd = -1,
+	.owner_lock_fd = -1,
+	.lease_lock_fd = -1,
 	.buf = MAP_FAILED,
 	.alloc_size = 0,
 	.size = 0,
+	.external_arena = false,
+	.arena_epoch = 0,
 	.ready = false,
 	.total_us = 0,
 	.create_us = 0,
@@ -1278,9 +1170,13 @@ static struct dsa_shared_mem_before_freeze dsa_shared_mem_bf = {
 static void dsa_shared_mem_bf_reset(void)
 {
 	dsa_shared_mem_bf.fd = -1;
+	dsa_shared_mem_bf.owner_lock_fd = -1;
+	dsa_shared_mem_bf.lease_lock_fd = -1;
 	dsa_shared_mem_bf.buf = MAP_FAILED;
 	dsa_shared_mem_bf.alloc_size = 0;
 	dsa_shared_mem_bf.size = 0;
+	dsa_shared_mem_bf.external_arena = false;
+	dsa_shared_mem_bf.arena_epoch = 0;
 	dsa_shared_mem_bf.ready = false;
 	dsa_shared_mem_bf.total_us = 0;
 	dsa_shared_mem_bf.create_us = 0;
@@ -1290,19 +1186,229 @@ static void dsa_shared_mem_bf_reset(void)
 
 void dsa_shared_mem_cleanup_after_dump(void)
 {
+	/* If an earlier frozen step failed before page_xfer took ownership, release
+	 * the immutable parent/WQ view prepared for this arena lease. */
+	page_xfer_hot_cleanup_before_freeze();
+
 	if (dsa_shared_mem_bf.buf != MAP_FAILED)
 		munmap(dsa_shared_mem_bf.buf, dsa_shared_mem_bf.alloc_size);
 
 	if (dsa_shared_mem_bf.fd >= 0)
 		close(dsa_shared_mem_bf.fd);
+	if (dsa_shared_mem_bf.owner_lock_fd >= 0)
+		close(dsa_shared_mem_bf.owner_lock_fd);
+	if (dsa_shared_mem_bf.lease_lock_fd >= 0)
+		close(dsa_shared_mem_bf.lease_lock_fd);
 
 	dsa_fg_bf_reset();
 	dsa_shared_mem_bf_reset();
 }
 
+static bool dsa_env_enabled(const char *name)
+{
+	const char *value = getenv(name);
+
+	return value && (!strcmp(value, "1") || !strcasecmp(value, "true") ||
+			 !strcasecmp(value, "yes") || !strcasecmp(value, "on"));
+}
+
+static int dsa_dup_inherited_fd(const char *value, const char *label, int *original_fd)
+{
+	char *end = NULL;
+	long inherited_fd;
+	int fd = -1;
+
+	if (!value || !value[0]) {
+		pr_err("DSA arena %s FD is missing\n", label);
+		return -1;
+	}
+	errno = 0;
+	inherited_fd = strtol(value, &end, 10);
+	if (errno || end == value || *end || inherited_fd < 3 || inherited_fd > INT_MAX) {
+		pr_err("DSA arena %s FD is invalid: %s\n", label, value);
+		return -1;
+	}
+	fd = fcntl((int)inherited_fd, F_DUPFD_CLOEXEC, 3);
+	if (fd < 0) {
+		pr_perror("DSA arena %s FD dup failed", label);
+		return -1;
+	}
+	if (original_fd)
+		*original_fd = (int)inherited_fd;
+	return fd;
+}
+
+static int dsa_validate_arena_lock_fd(int fd, const char *label)
+{
+	struct stat st;
+
+	if (fstat(fd, &st) || !S_ISREG(st.st_mode)) {
+		pr_err("DSA arena %s FD is not a regular lock file\n", label);
+		return -1;
+	}
+	return 0;
+}
+
+static int dsa_shared_mem_take_external_arena(size_t alloc_size, size_t usable_size)
+{
+	const char *fd_env = getenv("CRIU_DSA_ARENA_FD");
+	const char *owner_lock_env = getenv("CRIU_DSA_ARENA_OWNER_FD");
+	const char *lease_lock_env = getenv("CRIU_DSA_ARENA_LOCK_FD");
+	const char *backend_env = getenv("CRIU_DSA_ARENA_BACKEND");
+	const char *id_env = getenv("CRIU_DSA_ARENA_ID");
+	const char *task_env = getenv("CRIU_DSA_ARENA_TASK");
+	const char *generation_env = getenv("CRIU_DSA_ARENA_GENERATION");
+	const char *size_env = getenv("CRIU_DSA_ARENA_SIZE");
+	const char *epoch_env = getenv("CRIU_DSA_ARENA_EPOCH");
+	char *end = NULL;
+	unsigned long long declared_size;
+	unsigned long long epoch = 0;
+	unsigned long generation;
+	struct stat st;
+	struct statfs sfs;
+	char expected_id[96];
+	const char *inode_id;
+	int inherited_arena_fd = -1;
+	int inherited_owner_fd = -1;
+	int inherited_lease_fd = -1;
+	int fd;
+	int owner_lock_fd = -1;
+	int lease_lock_fd = -1;
+	int seals;
+	void *buf = MAP_FAILED;
+
+	if (!fd_env || !fd_env[0])
+		return 0;
+	if (!backend_env || strcmp(backend_env, "daemon_memfd")) {
+		pr_err("DSA arena backend is not daemon_memfd\n");
+		return -1;
+	}
+	if (!task_env || !task_env[0] || !generation_env || !generation_env[0]) {
+		pr_err("DSA arena task or generation identity is missing\n");
+		return -1;
+	}
+	errno = 0;
+	generation = strtoul(generation_env, &end, 10);
+	if (errno || end == generation_env || *end || !generation) {
+		pr_err("DSA arena generation is invalid: %s\n", generation_env);
+		return -1;
+	}
+
+	if (!size_env || !size_env[0]) {
+		pr_err("DSA arena size is missing\n");
+		return -1;
+	}
+	errno = 0;
+	declared_size = strtoull(size_env, &end, 10);
+	if (errno || end == size_env || *end || declared_size != alloc_size) {
+		pr_err("DSA arena size mismatch declared=%s expected=%zu\n",
+		       size_env, alloc_size);
+		return -1;
+	}
+	if (epoch_env && epoch_env[0]) {
+		errno = 0;
+		epoch = strtoull(epoch_env, &end, 10);
+		if (errno || end == epoch_env || *end || !epoch) {
+			pr_err("DSA arena epoch is invalid: %s\n", epoch_env);
+			return -1;
+		}
+	}
+
+	fd = dsa_dup_inherited_fd(fd_env, "data", &inherited_arena_fd);
+	if (fd < 0)
+		return -1;
+	owner_lock_fd = dsa_dup_inherited_fd(owner_lock_env, "owner lock", &inherited_owner_fd);
+	if (owner_lock_fd < 0)
+		goto err;
+	lease_lock_fd = dsa_dup_inherited_fd(lease_lock_env, "lease lock", &inherited_lease_fd);
+	if (lease_lock_fd < 0)
+		goto err;
+	if (inherited_arena_fd == inherited_owner_fd || inherited_arena_fd == inherited_lease_fd ||
+	    inherited_owner_fd == inherited_lease_fd) {
+		pr_err("DSA arena inherited FDs must be distinct\n");
+		goto err;
+	}
+	if (dsa_validate_arena_lock_fd(owner_lock_fd, "owner lock") ||
+	    dsa_validate_arena_lock_fd(lease_lock_fd, "lease lock"))
+		goto err;
+
+	if (fstat(fd, &st) || !S_ISREG(st.st_mode) ||
+	    (unsigned long long)st.st_size != declared_size) {
+		pr_err("DSA arena FD has invalid file type or size\n");
+		goto err;
+	}
+	snprintf(expected_id, sizeof(expected_id), "%llu:%llu",
+		 (unsigned long long)st.st_dev, (unsigned long long)st.st_ino);
+	inode_id = id_env ? strrchr(id_env, '/') : NULL;
+	if (!inode_id || inode_id == id_env || strcmp(inode_id + 1, expected_id)) {
+		pr_err("DSA arena identity mismatch expected=%s got=%s\n", expected_id,
+		       id_env ? id_env : "(missing)");
+		goto err;
+	}
+	if (fstatfs(fd, &sfs) || (unsigned long)sfs.f_type != HUGETLBFS_MAGIC ||
+	    (size_t)sfs.f_bsize != DSA_HUGEPAGE_1GB_SIZE) {
+		pr_err("DSA arena FD is not backed by 1GiB hugetlbfs\n");
+		goto err;
+	}
+	seals = fcntl(fd, F_GET_SEALS);
+	if (seals < 0 || (seals & (F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL)) !=
+	    (F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL)) {
+		pr_err("DSA arena FD seals are incomplete\n");
+		goto err;
+	}
+
+	buf = mmap(NULL, alloc_size, PROT_READ | PROT_WRITE,
+		   MAP_SHARED | MAP_POPULATE, fd, 0);
+	if (buf == MAP_FAILED) {
+		pr_perror("DSA arena mmap failed");
+		goto err;
+	}
+	if (((unsigned long)buf & (DSA_SHARED_DATA_ALIGN - 1)) != 0) {
+		pr_err("DSA arena shared buffer alignment is invalid\n");
+		munmap(buf, alloc_size);
+		buf = MAP_FAILED;
+		goto err;
+	}
+	/* CRIU now owns CLOEXEC duplicates; inherited descriptors only carried them through exec. */
+	close(inherited_arena_fd);
+	close(inherited_owner_fd);
+	close(inherited_lease_fd);
+
+	dsa_shared_mem_bf.fd = fd;
+	dsa_shared_mem_bf.owner_lock_fd = owner_lock_fd;
+	dsa_shared_mem_bf.lease_lock_fd = lease_lock_fd;
+	dsa_shared_mem_bf.buf = buf;
+	dsa_shared_mem_bf.alloc_size = alloc_size;
+	dsa_shared_mem_bf.size = usable_size;
+	dsa_shared_mem_bf.external_arena = true;
+	dsa_shared_mem_bf.arena_epoch = epoch;
+	dsa_shared_mem_bf.ready = true;
+	pr_info("DSA_SHARED_MEM_PREPARE: mode=daemon_memfd task=%s generation=%lu fd=%d size=%zu usable=%zu epoch=%llu id=%s\n",
+		task_env, generation, fd, alloc_size, usable_size, (unsigned long long)epoch, id_env);
+	return 1;
+
+err:
+	if (buf != MAP_FAILED)
+		munmap(buf, alloc_size);
+	if (fd >= 0)
+		close(fd);
+	if (owner_lock_fd >= 0)
+		close(owner_lock_fd);
+	if (lease_lock_fd >= 0)
+		close(lease_lock_fd);
+	if (inherited_arena_fd >= 0)
+		close(inherited_arena_fd);
+	if (inherited_owner_fd >= 0)
+		close(inherited_owner_fd);
+	if (inherited_lease_fd >= 0)
+		close(inherited_lease_fd);
+	return -1;
+}
+
 int dsa_shared_mem_prepare_before_freeze(void)
 {
 	int htlb_flags;
+	int external_ret;
 	int fd = -1;
 	void *buf = MAP_FAILED;
 	size_t alloc_size = (size_t)DSA_HUGEPAGE_1GB_PAGES * (size_t)DSA_HUGEPAGE_1GB_SIZE;
@@ -1320,6 +1426,21 @@ int dsa_shared_mem_prepare_before_freeze(void)
 
 	if (dsa_shared_mem_bf.fd >= 0 || dsa_shared_mem_bf.buf != MAP_FAILED)
 		dsa_shared_mem_cleanup_after_dump();
+
+	external_ret = dsa_shared_mem_take_external_arena(alloc_size, usable_size);
+	if (external_ret < 0)
+		return -1;
+	if (external_ret > 0) {
+		if (dsa_fg_prepare_before_freeze()) {
+			dsa_shared_mem_cleanup_after_dump();
+			return -1;
+		}
+		return 0;
+	}
+	if (dsa_env_enabled("CRIU_DSA_REQUIRE_ARENA")) {
+		pr_err("DSA fine-grained mode requires CRIU_DSA_ARENA_FD\n");
+		return -1;
+	}
 
 	htlb_flags = MFD_CLOEXEC | MFD_HUGETLB | MFD_HUGE_1GB;
 
@@ -1418,7 +1539,6 @@ static int dsa_take_shared_mem_before_freeze(struct dsa_dump_ctx *ctx, pid_t tar
 static int dsa_dump_ctx_init(struct dsa_dump_ctx *ctx, pid_t target_pid)
 {
 	int ret;
-	size_t i;
 
 	if (!ctx)
 		return -1;
@@ -1444,46 +1564,19 @@ static int dsa_dump_ctx_init(struct dsa_dump_ctx *ctx, pid_t target_pid)
 		pr_err("DSA shared buffer alignment is invalid\n");
 		return -1;
 	}
-	ctx->fine_grained = dsa_fg_bf.enabled && dsa_fg_bf.ready;
-	ctx->fg_record_stride = round_up(sizeof(struct parasite_dsa_fg_result), 64U);
-	if (ctx->fine_grained && dsa_fg_bf.nr) {
-		ctx->fg_old_segments = xmalloc(dsa_fg_bf.nr * sizeof(ctx->fg_old_segments[0]));
-		ctx->fg_old_fds = xmalloc(dsa_fg_bf.nr * sizeof(ctx->fg_old_fds[0]));
-		if (!ctx->fg_old_segments || !ctx->fg_old_fds) {
-			xfree(ctx->fg_old_segments);
-			xfree(ctx->fg_old_fds);
-			ctx->fg_old_segments = NULL;
-			ctx->fg_old_fds = NULL;
-			return -1;
-		}
-		ctx->fg_old_seg_count = dsa_fg_bf.nr;
-		for (i = 0; i < dsa_fg_bf.nr; i++)
-			ctx->fg_old_fds[i] = -1;
-		for (i = 0; i < dsa_fg_bf.nr; i++) {
-			ctx->fg_old_segments[i] = dsa_fg_bf.segs[i].meta;
-			ctx->fg_old_fds[i] = dup(dsa_fg_bf.segs[i].fd);
-			if (ctx->fg_old_fds[i] < 0) {
-				pr_perror("DSA fine-grained can't dup old segment fd");
-				while (i > 0) {
-					i--;
-					if (ctx->fg_old_fds[i] >= 0)
-						close(ctx->fg_old_fds[i]);
-				}
-				xfree(ctx->fg_old_segments);
-				xfree(ctx->fg_old_fds);
-				ctx->fg_old_segments = NULL;
-				ctx->fg_old_fds = NULL;
-				ctx->fg_old_seg_count = 0;
-				return -1;
-			}
-		}
-	}
+	/*
+	 * Fine-grained checkpoints capture the same raw, full-page snapshot as
+	 * the normal DSA dump.  The page-level compare/encoding step is deferred
+	 * to page-xfer after the task has been unfrozen, so the parasite must not
+	 * enter its legacy compare/copy mode here.
+	 */
+	ctx->raw_fg_capture = dsa_fine_grained_enabled();
+	ctx->fine_grained = false;
 	pr_info("DSA_SHARED_MEM_MODE: mode=%s pid=%d shared_buf_size=%zu degrade_count=%u\n",
 		ctx->shared_hugetlb ? "hugetlb" : "normal_memfd", target_pid,
 		ctx->shared_buf_size, ctx->shared_degrade_cnt);
-	if (ctx->fine_grained)
-		pr_info("DSA_FINE_GRAINED_MODE: old_segments=%u record_stride=%u\n",
-			ctx->fg_old_seg_count, ctx->fg_record_stride);
+	if (ctx->raw_fg_capture)
+		pr_info("DSA_FINE_GRAINED_MODE: raw_capture=1 encode=post_thaw\n");
 
 	ctx->shared_fds_sent = false;
 	dsa_replay_ctx_init(ctx);
@@ -1517,6 +1610,7 @@ static int dsa_dump_ctx_fini(struct dsa_dump_ctx *ctx)
 	ctx->fg_old_segments = NULL;
 	ctx->fg_old_seg_count = 0;
 	ctx->fine_grained = false;
+	ctx->raw_fg_capture = false;
 
 	return ret;
 }
@@ -2612,7 +2706,7 @@ static int dsa_stream_finish(struct dsa_desc_scan_ctx *sc)
 		}
 	}
 
-	if (!sc->fine_grained) {
+	if (!sc->fine_grained && !sc->dsa_ctx->raw_fg_capture) {
 		sc->dsa_ctx->replay.ready = true;
 		sc->dsa_ctx->replay.pipe_fd = sc->dsa_pipe_fd;
 		sc->dsa_ctx->replay.data_off = sc->payload_base;
@@ -3140,10 +3234,10 @@ static int defer_mem_dump_async_xfer(struct pstree_item *item,
 	/*
 	 * Classic live DSA needs the xfer thread and replay pipe to run
 	 * together: xfer consumes the pipe while replay feeds it.  Fine-grained
-	 * mode has no replay pipe; the parasite already left compact records in
-	 * the shared arena.  In that case keep only the async descriptor here and
-	 * start xfer from parasite_dump_pages_seized_wait(), after the task has
-	 * been unfrozen.
+	 * mode has no replay pipe; normal DSA MEMMOVE already left a stable raw
+	 * snapshot in the shared arena.  In that case keep only the async
+	 * descriptor here and start xfer from parasite_dump_pages_seized_wait(),
+	 * after the task has been unfrozen.
 	 */
 	if (dsa_ctx && dsa_ctx->replay.ready) {
 		if (start_deferred_mem_dump_async_xfer(async)) {
@@ -3926,16 +4020,20 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 		}
 		if (ret < 0)
 			goto out_xfer;
-		if (dsa_sc.fine_grained) {
+		if (dsa_ctx->raw_fg_capture) {
 			xfer.dsa_fine_grained = true;
+			xfer.dsa_fg_raw_capture = true;
 			xfer.dsa_fg_shared = dsa_sc.dsa_ctx->shared_buf;
 			xfer.dsa_fg_desc_area_off = dsa_sc.desc_area_off;
 			xfer.dsa_fg_desc_head = dsa_sc.desc_head;
+			xfer.dsa_fg_raw_payload_base = dsa_sc.payload_base;
+			xfer.dsa_fg_raw_payload_head = dsa_sc.payload_head;
 			xfer.dsa_fg_materialized = false;
 		}
 		dsa_rpc_total_us = dsa_wall_delta_us(dsa_rpc_start_us, dsa_wall_now_us());
-		pr_info("DSA_MEMDUMP_DETAIL: mode=streaming fine_grained=%u scan_build_us=%llu scan_pages=%llu dump_pages=%llu hole_pages=%llu lazy_pages=%llu stream_finish_us=%llu fg_sidecar_write_us=%llu fg_apply_records_us=%llu fg_enable_us=%llu dsa_rpc_total_us=%llu stream_payload_bytes=%llu stream_desc_count=%llu stream_flush_count=%u producer_wait_slot_us=%llu stream_finish_wait_us=%llu parasite_prefault_us=%llu parasite_submit_us=%llu parasite_poll_us=%llu parasite_completed_count=%u parasite_submit_enqcmd=%u parasite_submit_write=%u parasite_fg_compare_ops=%u parasite_fg_copy_ops=%u fg_pages=%llu fg_patch_pages=%llu fg_full_pages=%llu fg_patch_bytes=%llu\n",
-			dsa_sc.fine_grained ? 1 : 0,
+		if (dsa_sc.scan_profile)
+			pr_info("DSA_MEMDUMP_DETAIL: mode=streaming fine_grained=%u scan_build_us=%llu scan_pages=%llu dump_pages=%llu hole_pages=%llu lazy_pages=%llu stream_finish_us=%llu fg_sidecar_write_us=%llu fg_apply_records_us=%llu fg_enable_us=%llu dsa_rpc_total_us=%llu stream_payload_bytes=%llu stream_desc_count=%llu stream_flush_count=%u producer_wait_slot_us=%llu stream_finish_wait_us=%llu parasite_prefault_us=%llu parasite_submit_us=%llu parasite_poll_us=%llu parasite_completed_count=%u parasite_submit_enqcmd=%u parasite_submit_write=%u parasite_fg_compare_ops=%u parasite_fg_copy_ops=%u fg_pages=%llu fg_patch_pages=%llu fg_full_pages=%llu fg_patch_bytes=%llu\n",
+		dsa_ctx->raw_fg_capture ? 1 : 0,
 			(unsigned long long)scan_build_us,
 			(unsigned long long)dsa_sc.scan_pages,
 			(unsigned long long)dsa_sc.scan_dump_pages,

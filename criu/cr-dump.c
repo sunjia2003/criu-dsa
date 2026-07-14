@@ -2773,6 +2773,8 @@ int cr_dump_tasks(pid_t pid)
 		goto err;
 	if (dsa_parent_coverage_prepare_before_freeze(pid))
 		goto err;
+	if (page_xfer_hot_prepare_before_freeze(pid))
+		goto err;
 
 	if (opts.workspace_snapshot) {
 		if (ws_snapshot_ctx_init(&dump_ws_snapshot, pid,

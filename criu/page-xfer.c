@@ -8,6 +8,7 @@
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <sys/uio.h>
 #include <dirent.h>
 #include <linux/idxd.h>
 #include <time.h>
@@ -44,10 +45,24 @@
 #define HOT_APPLY_SCRATCH_PAGES 32
 #define HOT_DSA_PORTAL_MAP_SIZE 0x1000UL
 #define HOT_DSA_MAX_WQ 16
+#define HOT_DSA_COMPARE_INFLIGHT 16
 #define HOT_DSA_MAX_ENQ_RETRY 1000000U
 #define HOT_DSA_MAX_POLL_RETRY 1000000U
 
 static int page_server_sk = -1;
+
+static bool dsa_debug_enabled(void)
+{
+	static int enabled = -1;
+	const char *value = getenv("CRIU_DSA_DEBUG");
+
+	if (enabled >= 0)
+		return enabled;
+
+	enabled = value && (!strcmp(value, "1") || !strcasecmp(value, "true") ||
+				    !strcasecmp(value, "yes"));
+	return enabled;
+}
 
 struct hot_apply_extent {
 	bool valid;
@@ -65,10 +80,17 @@ struct hot_apply_extent {
 	bool has_seg;
 };
 
+/* Built while frozen; opening/mapping backing files is deferred until thaw. */
+struct hot_vma_plan {
+	unsigned long start;
+	unsigned long end;
+};
+
 struct hot_apply_ctx {
 	bool enabled;
 	bool memstore;
 	bool fine_grained;
+	bool profile;
 	bool finished;
 	int pipefd[2];
 	int append_fd;
@@ -76,6 +98,7 @@ struct hot_apply_ctx {
 	int manifest_fd;
 	int fg_idx_fd;
 	int fg_dat_fd;
+	off_t fg_dat_off;
 	int fd_type;
 	unsigned long img_id;
 	u32 pages_id;
@@ -91,9 +114,18 @@ struct hot_apply_ctx {
 	size_t entries_cap;
 	struct hot_memstore_seg *old_memstore;
 	size_t nr_old_memstore;
+	size_t old_memstore_cursor;
 	struct hot_vma_segment *vma_segments;
 	size_t nr_vma_segments;
 	size_t vma_segments_cap;
+	size_t vma_segment_cursor;
+	struct hot_vma_plan *vma_plans;
+	size_t nr_vma_plans;
+	size_t vma_plans_cap;
+	bool vmas_materialized;
+	bool post_thaw_ready;
+	bool pre_freeze_ready;
+	bool parent_view_loaded;
 	size_t pending_index;
 	uint64_t append_bytes;
 	uint64_t memstore_bytes;
@@ -154,8 +186,16 @@ struct hot_apply_ctx {
 	void *dsa_portals[HOT_DSA_MAX_WQ];
 	unsigned long dsa_portal_offset[HOT_DSA_MAX_WQ];
 	unsigned int dsa_next_wq;
+	u32 dsa_max_transfer_size;
 	struct hot_apply_extent pending;
 };
+
+/* There is exactly one DSA checkpoint in a daemon arena lease.  The context is
+ * built before collect_pstree and transferred to its page_xfer after pages_id
+ * becomes known; it never contains target-VMA-dependent output state. */
+static struct hot_apply_ctx *hot_apply_prepared;
+
+static void hot_apply_abort(struct page_xfer *xfer);
 
 struct hot_old_range {
 	unsigned long vaddr;
@@ -189,6 +229,8 @@ static uint64_t hot_now_us(void)
 {
 	struct timespec ts;
 
+	if (!dsa_debug_enabled())
+		return 0;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return (uint64_t)ts.tv_sec * 1000000ULL + ts.tv_nsec / 1000ULL;
 }
@@ -329,6 +371,86 @@ static int hot_dsa_collect_workqueues(char paths[HOT_DSA_MAX_WQ][64])
 	return nr;
 }
 
+static int hot_dsa_wq_max_transfer(const char *path, u32 *max_xfer)
+{
+	const char *name = strrchr(path, '/');
+	char sysfs[PATH_MAX];
+	char value[64];
+	char device[64];
+	char *end = NULL;
+	unsigned long long parsed;
+	const char *suffix;
+	size_t suffix_len;
+
+	if (!name || !name[1] || !max_xfer)
+		return -1;
+	name++;
+	if (snprintf(sysfs, sizeof(sysfs),
+		     "/sys/bus/dsa/devices/%s/max_transfer_size", name) >=
+	    (int)sizeof(sysfs) || hot_read_small_file(sysfs, value, sizeof(value))) {
+		/* WQ attributes are inherited from the device on older accel-config
+		 * layouts.  This is the same WQ capability, not an alternate path. */
+		if (strncmp(name, "wq", 2))
+			return -1;
+		suffix = name + 2;
+		suffix_len = strcspn(suffix, ".");
+		if (!suffix_len || suffix_len >= sizeof(device) - 4)
+			return -1;
+		if (snprintf(device, sizeof(device), "dsa%.*s", (int)suffix_len,
+			     suffix) >= (int)sizeof(device) ||
+		    snprintf(sysfs, sizeof(sysfs),
+			     "/sys/bus/dsa/devices/%s/max_transfer_size", device) >=
+		    (int)sizeof(sysfs) || hot_read_small_file(sysfs, value, sizeof(value)))
+			return -1;
+	}
+
+	errno = 0;
+	parsed = strtoull(value, &end, 0);
+	if (errno || end == value || parsed < PAGE_SIZE || parsed > UINT_MAX)
+		return -1;
+	*max_xfer = (u32)parsed;
+	return 0;
+}
+
+static int hot_dsa_wq_supports_compare(const char *path)
+{
+	const char *name = strrchr(path, '/');
+	const char *suffix;
+	size_t suffix_len;
+	char device[64];
+	char sysfs[PATH_MAX];
+	char value[512];
+	char *last_word;
+	char *end = NULL;
+	unsigned long op_cap;
+
+	if (!name || !name[1])
+		return -1;
+	name++;
+	if (strncmp(name, "wq", 2))
+		return -1;
+	suffix = name + 2;
+	suffix_len = strcspn(suffix, ".");
+	if (!suffix_len || suffix_len >= sizeof(device) - 4 ||
+	    snprintf(device, sizeof(device), "dsa%.*s", (int)suffix_len,
+		     suffix) >= (int)sizeof(device) ||
+	    snprintf(sysfs, sizeof(sysfs), "/sys/bus/dsa/devices/%s/op_cap",
+		     device) >= (int)sizeof(sysfs) ||
+	    hot_read_small_file(sysfs, value, sizeof(value)))
+		return -1;
+
+	/* accel-config prints op_cap most-significant word first; DSA COMPARE is
+	 * opcode 5, hence lives in the final (least-significant) word. */
+	last_word = strrchr(value, ',');
+	last_word = last_word ? last_word + 1 : value;
+	errno = 0;
+	op_cap = strtoul(last_word, &end, 16);
+	if (errno || end == last_word ||
+	    !(op_cap & (1UL << DSA_OPCODE_COMPARE)))
+		return -1;
+	return 0;
+}
+
 static void hot_dsa_close(struct hot_apply_ctx *ctx)
 {
 	int i;
@@ -351,6 +473,7 @@ static int hot_dsa_open(struct hot_apply_ctx *ctx)
 	char paths[HOT_DSA_MAX_WQ][64];
 	int nr;
 	int i;
+	u32 max_xfer = UINT_MAX;
 
 	for (i = 0; i < HOT_DSA_MAX_WQ; i++) {
 		ctx->dsa_wq_fds[i] = -1;
@@ -365,6 +488,20 @@ static int hot_dsa_open(struct hot_apply_ctx *ctx)
 	}
 
 	for (i = 0; i < nr; i++) {
+		u32 wq_max_xfer;
+
+		if (hot_dsa_wq_supports_compare(paths[i])) {
+			pr_err("DSA hot apply WQ/device doesn't advertise COMPARE: %s\n",
+			       paths[i]);
+			goto err;
+		}
+		if (hot_dsa_wq_max_transfer(paths[i], &wq_max_xfer)) {
+			pr_err("DSA hot apply can't determine max transfer size for %s\n",
+			       paths[i]);
+			goto err;
+		}
+		if (wq_max_xfer < max_xfer)
+			max_xfer = wq_max_xfer;
 		ctx->dsa_wq_fds[i] = open(paths[i], O_RDWR | O_CLOEXEC);
 		if (ctx->dsa_wq_fds[i] < 0) {
 			pr_perror("DSA hot apply can't open workqueue %s", paths[i]);
@@ -382,7 +519,9 @@ static int hot_dsa_open(struct hot_apply_ctx *ctx)
 
 	ctx->dsa_wq_count = nr;
 	ctx->dsa_next_wq = 0;
-	pr_info("DSA hot apply opened %d DSA workqueues\n", nr);
+	ctx->dsa_max_transfer_size = max_xfer;
+	pr_info("DSA hot apply opened %d DSA workqueues max_xfer=%u\n", nr,
+		ctx->dsa_max_transfer_size);
 	return 0;
 
 err:
@@ -643,7 +782,8 @@ static int hot_dsa_compare_first_diff(struct hot_apply_ctx *ctx,
 	if (hot_dsa_submit_ptr(ctx, DSA_OPCODE_COMPARE, a, b, NULL, bytes,
 			       &result, &completed))
 		return -1;
-	ctx->fg_compare_ops++;
+	if (ctx->profile)
+		ctx->fg_compare_ops++;
 	if (result == 0) {
 		*equal = true;
 		*first_diff = bytes;
@@ -656,16 +796,6 @@ static int hot_dsa_compare_first_diff(struct hot_apply_ctx *ctx,
 	}
 	*equal = false;
 	*first_diff = completed;
-	return 0;
-}
-
-static int hot_dsa_memmove_ptr(struct hot_apply_ctx *ctx, void *dst,
-			       const void *src, unsigned int bytes)
-{
-	if (hot_dsa_submit_ptr(ctx, DSA_OPCODE_MEMMOVE, src, NULL, dst, bytes,
-			       NULL, NULL))
-		return -1;
-	ctx->fg_copy_ops++;
 	return 0;
 }
 
@@ -931,7 +1061,10 @@ static bool hot_mode_is_memstore(void)
 
 static bool dsa_fine_grained_enabled(void)
 {
-	const char *enabled = getenv("CRIU_DSA_WRITE_SIDE_FINE_GRAINED");
+	const char *enabled = getenv("CRIU_DSA_FINE_GRAINED");
+
+	if (!enabled || !enabled[0])
+		enabled = getenv("CRIU_DSA_WRITE_SIDE_FINE_GRAINED");
 
 	return enabled && (!strcmp(enabled, "1") || !strcasecmp(enabled, "true") ||
 			   !strcasecmp(enabled, "yes") || !strcasecmp(enabled, "on"));
@@ -959,8 +1092,41 @@ static int hot_fg_open_sidecar(struct hot_apply_ctx *ctx)
 		ctx->fg_idx_fd = -1;
 		return -1;
 	}
+	ctx->fg_dat_off = 0;
 
 	return 0;
+}
+
+static int hot_memstore_seg_cmp(const void *a, const void *b)
+{
+	const struct hot_memstore_seg *left = a;
+	const struct hot_memstore_seg *right = b;
+
+	if (left->img_id != right->img_id)
+		return left->img_id < right->img_id ? -1 : 1;
+	if (left->vaddr != right->vaddr)
+		return left->vaddr < right->vaddr ? -1 : 1;
+	return 0;
+}
+
+static size_t hot_memstore_lower_bound(struct hot_memstore_seg *segs, size_t nr,
+				       unsigned long img_id, unsigned long vaddr)
+{
+	size_t lo = 0;
+	size_t hi = nr;
+
+	while (lo < hi) {
+		size_t mid = lo + (hi - lo) / 2;
+		struct hot_memstore_seg *seg = &segs[mid];
+
+		if (seg->img_id < img_id ||
+		    (seg->img_id == img_id && seg->vaddr <= vaddr))
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+
+	return lo;
 }
 
 static int hot_memstore_load(const char *path, struct hot_memstore_seg **segs_out,
@@ -1014,6 +1180,8 @@ static int hot_memstore_load(const char *path, struct hot_memstore_seg **segs_ou
 	}
 
 	fclose(fp);
+	if (nr)
+		qsort(segs, nr, sizeof(segs[0]), hot_memstore_seg_cmp);
 	*segs_out = segs;
 	*nr_out = nr;
 	return 0;
@@ -1170,23 +1338,105 @@ static int hot_memstore_register_segment(struct hot_apply_ctx *ctx,
 	return 0;
 }
 
-static struct hot_memstore_seg *hot_memstore_find_old_cover(struct hot_apply_ctx *ctx,
-							    unsigned long start,
-							    unsigned long end)
+static int hot_memstore_plan_segment(struct hot_apply_ctx *ctx,
+				    unsigned long start, unsigned long end)
 {
-	size_t i;
+	struct hot_vma_plan *plans;
+	size_t cap;
 
-	for (i = 0; i < ctx->nr_old_memstore; i++) {
+	if (start >= end || start & (PAGE_SIZE - 1) || end & (PAGE_SIZE - 1)) {
+		pr_err("DSA hot memstore has invalid VMA plan %lx-%lx\n", start, end);
+		return -1;
+	}
+	if (ctx->nr_vma_plans == ctx->vma_plans_cap) {
+		cap = ctx->vma_plans_cap ? ctx->vma_plans_cap * 2 : 128;
+		plans = xrealloc(ctx->vma_plans, cap * sizeof(*plans));
+		if (!plans)
+			return -1;
+		ctx->vma_plans = plans;
+		ctx->vma_plans_cap = cap;
+	}
+	ctx->vma_plans[ctx->nr_vma_plans++] = (struct hot_vma_plan) {
+		.start = start,
+		.end = end,
+	};
+	return 0;
+}
+
+static struct hot_memstore_seg *hot_memstore_find_old_cover(struct hot_apply_ctx *ctx,
+						    unsigned long start,
+						    unsigned long end)
+{
+	size_t i = ctx->old_memstore_cursor;
+
+	if (i >= ctx->nr_old_memstore ||
+	    (i < ctx->nr_old_memstore &&
+	     (ctx->old_memstore[i].img_id != ctx->img_id ||
+	      start < ctx->old_memstore[i].vaddr))) {
+		i = hot_memstore_lower_bound(ctx->old_memstore,
+					    ctx->nr_old_memstore, ctx->img_id, start);
+		if (i)
+			i--;
+	}
+
+	for (; i < ctx->nr_old_memstore; i++) {
 		struct hot_memstore_seg *old = &ctx->old_memstore[i];
 		unsigned long old_end;
 
-		if (old->img_id != ctx->img_id)
+		if (old->img_id < ctx->img_id)
 			continue;
+		if (old->img_id > ctx->img_id)
+			break;
 		old_end = old->vaddr + old->len;
-		if (old->vaddr <= start && old_end >= end)
+		if (old_end <= start)
+			continue;
+		if (old->vaddr <= start && old_end >= end) {
+			ctx->old_memstore_cursor = i;
 			return old;
+		}
+		if (old->vaddr > start)
+			break;
 	}
+	ctx->old_memstore_cursor = i;
 	return NULL;
+}
+
+static int hot_memstore_materialize_vmas(struct hot_apply_ctx *ctx)
+{
+	size_t i;
+
+	if (ctx->vmas_materialized)
+		return 0;
+	if (!ctx->nr_vma_plans) {
+		pr_err("DSA hot memstore has no VMA plan for img_id=%lu\n", ctx->img_id);
+		return -1;
+	}
+	if (!ctx->parent_view_loaded) {
+		if (hot_memstore_load(ctx->memory_manifest_path, &ctx->old_memstore,
+				       &ctx->nr_old_memstore))
+			return -1;
+		ctx->parent_view_loaded = true;
+	}
+
+	for (i = 0; i < ctx->nr_vma_plans; i++) {
+		struct hot_vma_plan *plan = &ctx->vma_plans[i];
+		struct hot_memstore_seg *old;
+		const char *reuse_file = NULL;
+		off_t reuse_off = 0;
+
+		old = hot_memstore_find_old_cover(ctx, plan->start, plan->end);
+		if (old) {
+			reuse_file = old->file;
+			reuse_off = old->off + (plan->start - old->vaddr);
+		}
+		if (hot_memstore_register_segment(ctx, plan->start, plan->end,
+					  reuse_file, reuse_off, !old))
+			return -1;
+	}
+	ctx->vmas_materialized = true;
+	pr_info("DSA hot memstore VMA index materialized img_id=%lu segments=%zu old_segments=%zu\n",
+		ctx->img_id, ctx->nr_vma_segments, ctx->nr_old_memstore);
+	return 0;
 }
 
 static int hot_memstore_old_fd(struct hot_memstore_seg *old)
@@ -1214,6 +1464,108 @@ static void *hot_memstore_old_map(struct hot_memstore_seg *old)
 	else
 		old->map_size = old->len;
 	return old->map;
+}
+
+static struct hot_apply_ctx *hot_apply_alloc_ctx(int fd_type,
+						  unsigned long img_id, u32 pages_id)
+{
+	const char *root = getenv("CRIU_DSA_HOT_CURRENT_DIR");
+	const char *hot_root = getenv("CRIU_DSA_HOT_ROOT");
+	const char *manifest = getenv("CRIU_DSA_HOT_MANIFEST");
+	const char *memory_manifest = getenv("CRIU_DSA_HOT_MEMORY_MANIFEST");
+	const char *memory_next = getenv("CRIU_DSA_HOT_MEMORY_NEXT");
+	struct hot_apply_ctx *ctx;
+
+	ctx = xzalloc(sizeof(*ctx));
+	if (!ctx)
+		return NULL;
+
+	ctx->enabled = true;
+	ctx->pipefd[0] = -1;
+	ctx->pipefd[1] = -1;
+	ctx->append_fd = -1;
+	ctx->extent_fd = -1;
+	ctx->manifest_fd = -1;
+	ctx->fg_idx_fd = -1;
+	ctx->fg_dat_fd = -1;
+	ctx->fd_type = fd_type;
+	ctx->img_id = img_id;
+	ctx->pages_id = pages_id;
+	ctx->current_dir = root;
+	ctx->hot_root = hot_root && hot_root[0] ? hot_root : root;
+	ctx->manifest_path = manifest;
+	ctx->memory_manifest_path = memory_manifest;
+	ctx->memory_next_path = memory_next;
+	ctx->memstore = hot_mode_is_memstore();
+	ctx->fine_grained = ctx->memstore && dsa_fine_grained_enabled();
+	ctx->profile = dsa_debug_enabled();
+	ctx->pending_index = (size_t)-1;
+	return ctx;
+}
+
+void page_xfer_hot_cleanup_before_freeze(void)
+{
+	struct page_xfer xfer = {};
+
+	if (!hot_apply_prepared)
+		return;
+	xfer.hot_apply = hot_apply_prepared;
+	hot_apply_prepared = NULL;
+	hot_apply_abort(&xfer);
+}
+
+int page_xfer_hot_prepare_before_freeze(unsigned long img_id)
+{
+	struct hot_apply_ctx *ctx;
+	size_t i;
+
+	if (!dsa_hot_apply_enabled() || !hot_mode_is_memstore() ||
+	    !dsa_fine_grained_enabled())
+		return 0;
+	if (hot_apply_prepared) {
+		pr_err("DSA fine-grained pre-freeze context already exists\n");
+		return -1;
+	}
+
+	ctx = hot_apply_alloc_ctx(CR_FD_PAGEMAP, img_id, 0);
+	if (!ctx)
+		return -1;
+	if (ctx->fd_type != CR_FD_PAGEMAP || !ctx->hot_root || !ctx->hot_root[0]) {
+		pr_err("DSA fine-grained pre-freeze context has no hot root\n");
+		goto err;
+	}
+
+	/* The manifest describes the stable parent, not the target VMA.  Open and
+	 * map it now, but deliberately do not touch all mapped parent pages. */
+	if (hot_memstore_load(ctx->memory_manifest_path, &ctx->old_memstore,
+			       &ctx->nr_old_memstore))
+		goto err;
+	ctx->parent_view_loaded = true;
+	for (i = 0; i < ctx->nr_old_memstore; i++) {
+		if (hot_memstore_old_map(&ctx->old_memstore[i]) == MAP_FAILED)
+			goto err;
+	}
+
+	/* WQ FDs/portals are immutable per round and must not be opened while the
+	 * target is stopped.  The raw capture path has already validated MEMMOVE;
+	 * this context owns the COMPARE portals used after thaw. */
+	if (hot_dsa_open(ctx))
+		goto err;
+
+	ctx->pre_freeze_ready = true;
+	hot_apply_prepared = ctx;
+	pr_info("DSA fine-grained pre-freeze parent view ready img_id=%lu segments=%zu wqs=%d\n",
+		img_id, ctx->nr_old_memstore, ctx->dsa_wq_count);
+	return 0;
+
+err:
+	{
+		struct page_xfer xfer = {};
+
+		xfer.hot_apply = ctx;
+		hot_apply_abort(&xfer);
+	}
+	return -1;
 }
 
 static int copy_fd_range_loop(int src_fd, off_t src_off, int dst_fd,
@@ -1310,15 +1662,36 @@ static struct hot_vma_segment *hot_memstore_find_vma_segment(struct hot_apply_ct
 							     unsigned long vaddr,
 							     unsigned long len)
 {
-	size_t i;
+	size_t i = ctx->vma_segment_cursor;
 	unsigned long end = vaddr + len;
 
-	for (i = 0; i < ctx->nr_vma_segments; i++) {
+	if (i >= ctx->nr_vma_segments ||
+	    (i < ctx->nr_vma_segments && vaddr < ctx->vma_segments[i].start)) {
+		size_t lo = 0;
+		size_t hi = ctx->nr_vma_segments;
+
+		while (lo < hi) {
+			size_t mid = lo + (hi - lo) / 2;
+
+			if (ctx->vma_segments[mid].start <= vaddr)
+				lo = mid + 1;
+			else
+				hi = mid;
+		}
+		i = lo ? lo - 1 : 0;
+	}
+
+	for (; i < ctx->nr_vma_segments; i++) {
 		struct hot_vma_segment *seg = &ctx->vma_segments[i];
 
-		if (vaddr >= seg->start && end <= seg->end)
+		if (vaddr >= seg->start && end <= seg->end) {
+			ctx->vma_segment_cursor = i;
 			return seg;
+		}
+		if (seg->start > vaddr)
+			break;
 	}
+	ctx->vma_segment_cursor = i;
 	return NULL;
 }
 
@@ -1482,6 +1855,13 @@ static int page_xfer_dsa_fg_write_sidecar(struct page_xfer *xfer,
 						goto out;
 					}
 				}
+			} else if (res->flags == DSA_FG_PAGE_PARENT) {
+				if (res->data_len || res->patch_count) {
+					pr_err("DSA fine-grained invalid parent record len=%u patches=%u vaddr=%" PRIx64 "\n",
+					       res->data_len, res->patch_count, res->vaddr);
+					goto out;
+				}
+				meta.data_len = 0;
 			} else {
 				pr_err("DSA fine-grained invalid record flags=%u vaddr=%" PRIx64 "\n",
 				       res->flags, res->vaddr);
@@ -1556,9 +1936,11 @@ int page_xfer_dsa_fg_apply_records(struct page_xfer *xfer,
 						shared + res->data_off,
 						res->vaddr, PAGE_SIZE))
 					return -1;
-				ctx->fg_full_pages++;
-				ctx->fg_patch_bytes += PAGE_SIZE;
-				ctx->memstore_bytes += PAGE_SIZE;
+				if (ctx->profile) {
+					ctx->fg_full_pages++;
+					ctx->fg_patch_bytes += PAGE_SIZE;
+					ctx->memstore_bytes += PAGE_SIZE;
+				}
 			} else if (res->flags == DSA_FG_PAGE_PATCH) {
 				u32 sum = 0;
 
@@ -1591,15 +1973,24 @@ int page_xfer_dsa_fg_apply_records(struct page_xfer *xfer,
 					       res->vaddr, sum, res->data_len);
 					return -1;
 				}
-				ctx->fg_patch_pages++;
-				ctx->fg_patch_bytes += res->data_len;
-				ctx->memstore_bytes += res->data_len;
+				if (ctx->profile) {
+					ctx->fg_patch_pages++;
+					ctx->fg_patch_bytes += res->data_len;
+					ctx->memstore_bytes += res->data_len;
+				}
+			} else if (res->flags == DSA_FG_PAGE_PARENT) {
+				if (res->data_len || res->patch_count) {
+					pr_err("DSA fine-grained hot parent record invalid vaddr=%" PRIx64 " len=%u patches=%u\n",
+					       res->vaddr, res->data_len, res->patch_count);
+					return -1;
+				}
 			} else {
 				pr_err("DSA fine-grained hot record has unknown flags=%u vaddr=%" PRIx64 "\n",
 				       res->flags, res->vaddr);
 				return -1;
 			}
-			ctx->fg_pages++;
+			if (ctx->profile)
+				ctx->fg_pages++;
 		}
 	}
 	delta_us = hot_now_us() - start_us;
@@ -2688,6 +3079,7 @@ static void hot_apply_abort(struct page_xfer *xfer)
 
 	xfree(ctx->old_memstore);
 	xfree(ctx->vma_segments);
+	xfree(ctx->vma_plans);
 	xfree(ctx->entries);
 	xfree(ctx);
 	xfer->hot_apply = NULL;
@@ -2722,7 +3114,8 @@ static int hot_memstore_finish(struct hot_apply_ctx *ctx)
 	ctx->memstore_segments = ctx->nr_vma_segments;
 	producer_time_us = ctx->append_time_us;
 	total_hot_work_us = ctx->append_time_us;
-	pr_info("DSA hot memstore updated img_id=%lu entries=%zu bytes=%" PRIu64 " vma_segments=%" PRIu64 " append_time_us=%" PRIu64 " producer_time_us=%" PRIu64 " tee_us=%" PRIu64 " write_us=%" PRIu64 " fg_pages=%" PRIu64 " fg_patch_pages=%" PRIu64 " fg_full_pages=%" PRIu64 " fg_patch_bytes=%" PRIu64 " fg_compare_ops=%" PRIu64 " fg_copy_ops=%" PRIu64 " enqueue_wait_us=%" PRIu64 " worker_wait_us=%" PRIu64 " worker_join_us=%" PRIu64 " queue_max=%" PRIu64 " pipe_size=%" PRIu64 "\n",
+	if (dsa_debug_enabled())
+		pr_info("DSA hot memstore updated img_id=%lu entries=%zu bytes=%" PRIu64 " vma_segments=%" PRIu64 " append_time_us=%" PRIu64 " producer_time_us=%" PRIu64 " tee_us=%" PRIu64 " write_us=%" PRIu64 " fg_pages=%" PRIu64 " fg_patch_pages=%" PRIu64 " fg_full_pages=%" PRIu64 " fg_patch_bytes=%" PRIu64 " fg_compare_ops=%" PRIu64 " fg_copy_ops=%" PRIu64 " enqueue_wait_us=%" PRIu64 " worker_wait_us=%" PRIu64 " worker_join_us=%" PRIu64 " queue_max=%" PRIu64 " pipe_size=%" PRIu64 "\n",
 		ctx->img_id, ctx->nr_entries, ctx->memstore_bytes,
 		ctx->memstore_segments, total_hot_work_us, producer_time_us,
 		ctx->append_tee_us, ctx->append_splice_us,
@@ -2735,6 +3128,42 @@ static int hot_memstore_finish(struct hot_apply_ctx *ctx)
 
 out:
 	return ret;
+}
+
+static int hot_apply_prepare_post_thaw(struct hot_apply_ctx *ctx)
+{
+	int dfd;
+
+	if (ctx->post_thaw_ready)
+		return 0;
+	if (hot_apply_mkdir_root(ctx->hot_root))
+		return -1;
+	if (ctx->pipefd[0] < 0 && pipe2(ctx->pipefd, O_CLOEXEC)) {
+		pr_perror("DSA hot apply can't create pipe");
+		return -1;
+	}
+	if (hot_memstore_materialize_vmas(ctx))
+		return -1;
+	if (ctx->fine_grained) {
+		if (hot_fg_open_sidecar(ctx))
+			return -1;
+		if (!ctx->pre_freeze_ready && hot_dsa_open(ctx))
+			return -1;
+	}
+	if (!ctx->memory_next_path || !ctx->memory_next_path[0]) {
+		pr_err("DSA hot memstore requires CRIU_DSA_HOT_MEMORY_NEXT\n");
+		return -1;
+	}
+	dfd = get_service_fd(IMG_FD_OFF);
+	ctx->manifest_fd = openat(dfd, ctx->memory_next_path,
+				  O_CREAT | O_APPEND | O_WRONLY | O_CLOEXEC, CR_FD_PERM);
+	if (ctx->manifest_fd < 0) {
+		pr_perror("DSA hot memstore can't open next manifest %s",
+			  ctx->memory_next_path);
+		return -1;
+	}
+	ctx->post_thaw_ready = true;
+	return 0;
 }
 
 static int hot_apply_finish(struct page_xfer *xfer)
@@ -2800,39 +3229,31 @@ static int hot_apply_finish(struct page_xfer *xfer)
 static int hot_apply_init_xfer(struct page_xfer *xfer, int fd_type,
 			       unsigned long img_id, u32 pages_id)
 {
-	const char *root = getenv("CRIU_DSA_HOT_CURRENT_DIR");
-	const char *hot_root = getenv("CRIU_DSA_HOT_ROOT");
-	const char *manifest = getenv("CRIU_DSA_HOT_MANIFEST");
-	const char *memory_manifest = getenv("CRIU_DSA_HOT_MEMORY_MANIFEST");
-	const char *memory_next = getenv("CRIU_DSA_HOT_MEMORY_NEXT");
 	struct hot_apply_ctx *ctx;
 
 	if (!dsa_hot_apply_enabled())
 		return 0;
 
-	ctx = xzalloc(sizeof(*ctx));
+	if (hot_apply_prepared) {
+		ctx = hot_apply_prepared;
+		if (ctx->pre_freeze_ready && ctx->fd_type == fd_type &&
+		    ctx->img_id == img_id && ctx->fine_grained) {
+			hot_apply_prepared = NULL;
+			ctx->pages_id = pages_id;
+			xfer->hot_apply = ctx;
+			pr_info("DSA fine-grained attached pre-freeze parent view img_id=%lu pages_id=%u\n",
+				img_id, pages_id);
+			return 0;
+		}
+		/* A process-tree dump can open another task's pagemap first.  It must
+		 * not consume the root task's immutable context; that task follows the
+		 * ordinary post-thaw setup and the prepared context remains available
+		 * for its matching img_id. */
+	}
+
+	ctx = hot_apply_alloc_ctx(fd_type, img_id, pages_id);
 	if (!ctx)
 		return -1;
-
-	ctx->enabled = true;
-	ctx->pipefd[0] = -1;
-	ctx->pipefd[1] = -1;
-	ctx->append_fd = -1;
-	ctx->extent_fd = -1;
-	ctx->manifest_fd = -1;
-	ctx->fg_idx_fd = -1;
-	ctx->fg_dat_fd = -1;
-	ctx->fd_type = fd_type;
-	ctx->img_id = img_id;
-	ctx->pages_id = pages_id;
-	ctx->current_dir = root;
-	ctx->hot_root = hot_root && hot_root[0] ? hot_root : root;
-	ctx->manifest_path = manifest;
-	ctx->memory_manifest_path = memory_manifest;
-	ctx->memory_next_path = memory_next;
-	ctx->memstore = hot_mode_is_memstore();
-	ctx->fine_grained = ctx->memstore && dsa_fine_grained_enabled();
-	ctx->pending_index = (size_t)-1;
 
 	if (!ctx->memstore) {
 		pr_err("DSA hot apply full-pages image/reorder mode has been removed; use CRIU_DSA_HOT_MODE=memstore\n");
@@ -2850,33 +3271,9 @@ static int hot_apply_init_xfer(struct page_xfer *xfer, int fd_type,
 		pr_err("DSA hot apply has no hot root/current dir\n");
 		goto err;
 	}
-	if (hot_apply_mkdir_root(ctx->hot_root))
-		goto err;
-	if (pipe2(ctx->pipefd, O_CLOEXEC)) {
-		pr_perror("DSA hot apply can't create pipe");
-		goto err;
-	}
 
-	if (!ctx->memory_next_path || !ctx->memory_next_path[0]) {
-		pr_err("DSA hot memstore requires CRIU_DSA_HOT_MEMORY_NEXT\n");
-		goto err;
-	}
-	ctx->manifest_fd = open(ctx->memory_next_path,
-				O_CREAT | O_APPEND | O_WRONLY | O_CLOEXEC,
-				0644);
-	if (ctx->manifest_fd < 0) {
-		pr_perror("DSA hot memstore can't open next manifest %s",
-			  ctx->memory_next_path);
-		goto err;
-	}
-	if (ctx->fine_grained) {
-		if (hot_fg_open_sidecar(ctx))
-			goto err;
-		if (hot_dsa_open(ctx))
-			goto err;
-	}
 	xfer->hot_apply = ctx;
-	pr_info("DSA hot memstore enabled fd_type=%d img_id=%lu pages_id=%u root=%s next=%s old=%s fine_grained=%u\n",
+	pr_info("DSA hot memstore plan ready fd_type=%d img_id=%lu pages_id=%u root=%s next=%s old=%s fine_grained=%u\n",
 		fd_type, img_id, pages_id, ctx->hot_root,
 		ctx->memory_next_path,
 		ctx->memory_manifest_path ? ctx->memory_manifest_path : "",
@@ -2902,35 +3299,21 @@ int page_xfer_hot_set_vmas(struct page_xfer *xfer, struct vm_area_list *vmas)
 		return 0;
 	if (ctx->fd_type != CR_FD_PAGEMAP)
 		return 0;
-	if (hot_memstore_load(ctx->memory_manifest_path,
-			      &ctx->old_memstore,
-			      &ctx->nr_old_memstore))
-		return -1;
 
 	list_for_each_entry(vma, &vmas->h, list) {
-		struct hot_memstore_seg *old;
 		unsigned long start, end;
-		const char *reuse_file = NULL;
-		off_t reuse_off = 0;
 
 		if (!hot_memstore_should_track_vma(vma))
 			continue;
 
 		start = vma->e->start;
 		end = vma->e->end;
-		old = hot_memstore_find_old_cover(ctx, start, end);
-		if (old) {
-			reuse_file = old->file;
-			reuse_off = old->off + (start - old->vaddr);
-		}
-
-		if (hot_memstore_register_segment(ctx, start, end,
-						  reuse_file, reuse_off, !old))
+		if (hot_memstore_plan_segment(ctx, start, end))
 			return -1;
 	}
 
-	pr_info("DSA hot memstore VMA index ready img_id=%lu segments=%zu old_segments=%zu\n",
-		ctx->img_id, ctx->nr_vma_segments, ctx->nr_old_memstore);
+	pr_info("DSA hot memstore VMA plan ready img_id=%lu segments=%zu\n",
+		ctx->img_id, ctx->nr_vma_plans);
 	return 0;
 }
 
@@ -3485,21 +3868,53 @@ static int hot_fg_write_meta(struct hot_apply_ctx *ctx,
 	return 0;
 }
 
+static int hot_fg_writev_full_fd(int fd, const struct iovec *src, unsigned int nr)
+{
+	struct iovec iov[DSA_FG_MAX_PATCHES];
+	unsigned int head = 0;
+
+	if (!nr || nr > DSA_FG_MAX_PATCHES)
+		return nr ? -1 : 0;
+	memcpy(iov, src, nr * sizeof(iov[0]));
+
+	while (head < nr) {
+		ssize_t ret = writev(fd, &iov[head], nr - head);
+
+		if (ret < 0) {
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+		if (ret == 0) {
+			errno = EIO;
+			return -1;
+		}
+
+		while (head < nr && ret >= (ssize_t)iov[head].iov_len) {
+			ret -= iov[head].iov_len;
+			head++;
+		}
+		if (head < nr && ret) {
+			iov[head].iov_base = (char *)iov[head].iov_base + ret;
+			iov[head].iov_len -= ret;
+		}
+	}
+
+	return 0;
+}
+
 static int hot_fg_write_full(struct hot_apply_ctx *ctx, unsigned long vaddr,
 			     const void *cur)
 {
 	struct dsa_fg_page_meta meta = {};
 	off_t data_off;
 
-	data_off = lseek(ctx->fg_dat_fd, 0, SEEK_CUR);
-	if (data_off == (off_t)-1) {
-		pr_perror("DSA fine-grained data seek failed");
-		return -1;
-	}
+	data_off = ctx->fg_dat_off;
 	if (write_full_fd(ctx->fg_dat_fd, cur, PAGE_SIZE)) {
 		pr_perror("DSA fine-grained full page write failed");
 		return -1;
 	}
+	ctx->fg_dat_off += PAGE_SIZE;
 
 	meta.vaddr = vaddr;
 	meta.data_off = data_off;
@@ -3509,9 +3924,11 @@ static int hot_fg_write_full(struct hot_apply_ctx *ctx, unsigned long vaddr,
 	if (hot_fg_write_meta(ctx, &meta))
 		return -1;
 
-	ctx->fg_pages++;
-	ctx->fg_full_pages++;
-	ctx->fg_patch_bytes += PAGE_SIZE;
+	if (ctx->profile) {
+		ctx->fg_pages++;
+		ctx->fg_full_pages++;
+		ctx->fg_patch_bytes += PAGE_SIZE;
+	}
 	return 0;
 }
 
@@ -3519,7 +3936,7 @@ static int hot_fg_write_patch(struct hot_apply_ctx *ctx, unsigned long vaddr,
 			      const void *cur, const void *old)
 {
 	struct dsa_fg_patch_entry patches[PAGE_SIZE / DSA_FG_PATCH_SIZE];
-	unsigned char patch_bytes[PAGE_SIZE];
+	struct iovec data_iov[DSA_FG_MAX_PATCHES];
 	unsigned int patch_count = 0;
 	unsigned int bytes = 0;
 	unsigned int cursor = 0;
@@ -3551,39 +3968,39 @@ static int hot_fg_write_patch(struct hot_apply_ctx *ctx, unsigned long vaddr,
 
 		patches[patch_count].off = diff;
 		patches[patch_count].len = len;
-		if (hot_dsa_memmove_ptr(ctx, patch_bytes + bytes,
-					(const char *)cur + diff, len))
-			return -1;
+		data_iov[patch_count].iov_base = (void *)((const char *)cur + diff);
+		data_iov[patch_count].iov_len = len;
 		patch_count++;
 		bytes += len;
 		cursor = diff + len;
 	}
 
-	data_off = lseek(ctx->fg_dat_fd, 0, SEEK_CUR);
-	if (data_off == (off_t)-1) {
-		pr_perror("DSA fine-grained data seek failed");
-		return -1;
-	}
+	data_off = ctx->fg_dat_off;
 	if (patch_count) {
 		if (write_full_fd(ctx->fg_dat_fd, patches,
 				  patch_count * sizeof(patches[0])) ||
-		    write_full_fd(ctx->fg_dat_fd, patch_bytes, bytes)) {
+		    hot_fg_writev_full_fd(ctx->fg_dat_fd, data_iov, patch_count)) {
 			pr_perror("DSA fine-grained patch write failed");
 			return -1;
 		}
+		ctx->fg_dat_off += patch_count * sizeof(patches[0]) + bytes;
 	}
 
 	meta.vaddr = vaddr;
 	meta.data_off = data_off;
 	meta.data_len = patch_count * sizeof(patches[0]) + bytes;
 	meta.patch_count = patch_count;
-	meta.flags = DSA_FG_PAGE_PATCH;
+	meta.flags = patch_count ? DSA_FG_PAGE_PATCH : DSA_FG_PAGE_PARENT;
 	if (hot_fg_write_meta(ctx, &meta))
 		return -1;
 
-	ctx->fg_pages++;
-	ctx->fg_patch_pages++;
-	ctx->fg_patch_bytes += bytes;
+	if (ctx->profile) {
+		ctx->fg_pages++;
+		if (patch_count) {
+			ctx->fg_patch_pages++;
+			ctx->fg_patch_bytes += bytes;
+		}
+	}
 	return 0;
 }
 
@@ -3602,12 +4019,533 @@ static int hot_fg_write_page(struct hot_apply_ctx *ctx, unsigned long vaddr,
 		return -1;
 
 	return hot_fg_write_patch(ctx, vaddr, cur,
-				  (const char *)old_map + (vaddr - old->vaddr));
+			  (const char *)old_map + (vaddr - old->vaddr));
+}
+
+enum hot_fg_raw_page_state {
+	HOT_FG_RAW_PENDING = 0,
+	HOT_FG_RAW_PARENT,
+	HOT_FG_RAW_PATCH,
+	HOT_FG_RAW_FULL,
+};
+
+struct hot_fg_raw_page {
+	unsigned long vaddr;
+	const unsigned char *raw;
+	const unsigned char *parent;
+	u32 capture_run;
+	u32 cursor;
+	u32 patch_bytes;
+	u16 patch_count;
+	u16 state;
+	struct dsa_fg_patch_entry patches[DSA_FG_MAX_PATCHES];
+};
+
+struct hot_fg_compare_slot {
+	struct dsa_hw_desc desc __attribute__((aligned(64)));
+	volatile struct dsa_completion_record comp __attribute__((aligned(32)));
+	struct hot_fg_compare_span *span;
+	u32 submitted_cursor;
+	u32 submitted_len;
+	u32 poll_count;
+	u64 submit_sequence;
+	bool active;
+};
+
+struct hot_fg_compare_span {
+	const unsigned char *raw;
+	const unsigned char *parent;
+	size_t first_page;
+	size_t page_count;
+	u32 length;
+	u32 cursor;
+	size_t finalized_pages;
+	bool active;
+	bool complete;
+};
+
+static int hot_fg_raw_pages_append(struct hot_apply_ctx *ctx,
+				   struct hot_fg_raw_page **pages, size_t *nr,
+				   size_t *cap, unsigned long vaddr,
+				   const unsigned char *raw, u32 capture_run)
+{
+	struct hot_fg_raw_page *page;
+	struct hot_memstore_seg *old;
+	void *old_map;
+
+	if (*nr == *cap) {
+		size_t new_cap = *cap ? *cap * 2 : 4096;
+		void *new_pages = xrealloc(*pages, new_cap * sizeof(**pages));
+
+		if (!new_pages)
+			return -1;
+		*pages = new_pages;
+		*cap = new_cap;
+	}
+	page = &(*pages)[(*nr)++];
+	memset(page, 0, sizeof(*page));
+	page->vaddr = vaddr;
+	page->raw = raw;
+	page->capture_run = capture_run;
+	page->state = HOT_FG_RAW_PENDING;
+
+	old = hot_memstore_find_old_cover(ctx, vaddr, vaddr + PAGE_SIZE);
+	if (!old) {
+		page->state = HOT_FG_RAW_FULL;
+		return 0;
+	}
+	old_map = hot_memstore_old_map(old);
+	if (old_map == MAP_FAILED)
+		return -1;
+	page->parent = (const unsigned char *)old_map + (vaddr - old->vaddr);
+	return 0;
+}
+
+static int hot_fg_compare_submit(struct hot_apply_ctx *ctx,
+				  struct hot_fg_compare_slot *slot,
+				  struct hot_fg_compare_span *span,
+				  u64 submit_sequence)
+{
+	unsigned int wq_idx;
+	unsigned long portal_mask;
+	unsigned long off;
+	uint32_t retry;
+
+	if (!span->parent || span->cursor >= span->length || !ctx->dsa_wq_count ||
+	    !ctx->dsa_max_transfer_size)
+		return -1;
+	wq_idx = ctx->dsa_next_wq++ % (unsigned int)ctx->dsa_wq_count;
+	portal_mask = ((unsigned long)ctx->dsa_portals[wq_idx]) & ~0xfffUL;
+	memset(&slot->desc, 0, sizeof(slot->desc));
+	memset((void *)&slot->comp, 0, sizeof(slot->comp));
+	slot->submitted_cursor = span->cursor;
+	slot->submitted_len = span->length - span->cursor;
+	if (slot->submitted_len > ctx->dsa_max_transfer_size)
+		slot->submitted_len = ctx->dsa_max_transfer_size;
+	if (!slot->submitted_len)
+		return -1;
+	slot->poll_count = 0;
+	slot->span = span;
+	slot->submit_sequence = submit_sequence;
+	slot->desc.opcode = DSA_OPCODE_COMPARE;
+	slot->desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR | IDXD_OP_FLAG_BOF;
+	slot->desc.src_addr = (uint64_t)(unsigned long)(span->raw + span->cursor);
+	slot->desc.src2_addr = (uint64_t)(unsigned long)(span->parent + span->cursor);
+	slot->desc.xfer_size = slot->submitted_len;
+	slot->desc.completion_addr = (uint64_t)(unsigned long)&slot->comp;
+
+	for (retry = 0; retry < HOT_DSA_MAX_ENQ_RETRY; retry++) {
+		void *portal_slot;
+
+		off = ((ctx->dsa_portal_offset[wq_idx]++ << 6) & 0xfffUL);
+		portal_slot = (void *)(portal_mask | off);
+		if (hot_dsa_enqcmd(portal_slot, &slot->desc) == 0)
+			break;
+		hot_dsa_cpu_relax();
+	}
+	if (retry == HOT_DSA_MAX_ENQ_RETRY) {
+		pr_err("DSA fine-grained compare wavefront enqcmd timed out\n");
+		return -1;
+	}
+	if (ctx->profile) {
+		ctx->fg_compare_ops++;
+		ctx->dsa_enqcmd++;
+	}
+	slot->active = true;
+	span->active = true;
+	return 0;
+}
+
+static int hot_fg_compare_complete(struct hot_fg_compare_slot *slot,
+				   bool *complete, bool *equal, u32 *first_diff)
+{
+	uint8_t status = slot->comp.status;
+	uint8_t code = (uint8_t)DSA_COMP_STATUS(status);
+
+	*complete = false;
+	if (status == 0 || code == DSA_COMP_NONE)
+		return 0;
+	if (code != DSA_COMP_SUCCESS && code != DSA_COMP_SUCCESS_PRED) {
+		pr_err("DSA fine-grained compare wavefront completion failed status=%u code=%u\n",
+		       status, code);
+		return -1;
+	}
+	*complete = true;
+	*equal = slot->comp.result == 0;
+	if (*equal) {
+		*first_diff = slot->submitted_len;
+		return 0;
+	}
+	if (slot->comp.bytes_completed >= slot->submitted_len) {
+		pr_err("DSA fine-grained compare wavefront returned invalid first_diff=%u bytes=%u\n",
+		       slot->comp.bytes_completed, slot->submitted_len);
+		return -1;
+	}
+	*first_diff = slot->comp.bytes_completed;
+	return 0;
+}
+
+static int hot_fg_span_finalize(struct hot_fg_compare_span *span,
+				struct hot_fg_raw_page *pages, u32 cursor)
+{
+	while (span->finalized_pages < span->page_count) {
+		size_t page_idx = span->finalized_pages;
+		struct hot_fg_raw_page *page = &pages[span->first_page + page_idx];
+
+		if ((page_idx + 1) * PAGE_SIZE > cursor)
+			break;
+		if (page->state == HOT_FG_RAW_PENDING)
+			page->state = page->patch_count ? HOT_FG_RAW_PATCH :
+				HOT_FG_RAW_PARENT;
+		else if (page->state != HOT_FG_RAW_FULL &&
+			 page->state != HOT_FG_RAW_PATCH &&
+			 page->state != HOT_FG_RAW_PARENT)
+			return -1;
+		span->finalized_pages++;
+	}
+	return 0;
+}
+
+static int hot_fg_span_record_diff(struct hot_fg_compare_span *span,
+					  struct hot_fg_raw_page *pages, u32 diff)
+{
+	size_t page_idx;
+	struct hot_fg_raw_page *page;
+	u32 page_off;
+	u32 patch_len;
+
+	if (diff >= span->length || diff < span->cursor)
+		return -1;
+	if (hot_fg_span_finalize(span, pages, diff))
+		return -1;
+
+	page_idx = diff / PAGE_SIZE;
+	page = &pages[span->first_page + page_idx];
+	page_off = diff % PAGE_SIZE;
+	patch_len = PAGE_SIZE - page_off;
+	if (patch_len > DSA_FG_PATCH_SIZE)
+		patch_len = DSA_FG_PATCH_SIZE;
+
+	if (page->patch_count >= DSA_FG_MAX_PATCHES ||
+	    page->patch_bytes + patch_len > DSA_FG_MAX_BYTES) {
+		page->state = HOT_FG_RAW_FULL;
+		span->cursor = (page_idx + 1) * PAGE_SIZE;
+		return hot_fg_span_finalize(span, pages, span->cursor);
+	}
+	page->patches[page->patch_count].off = page_off;
+	page->patches[page->patch_count].len = patch_len;
+	page->patch_bytes += patch_len;
+	page->patch_count++;
+	span->cursor = diff + patch_len;
+	return hot_fg_span_finalize(span, pages, span->cursor);
+}
+
+static int hot_fg_compare_wavefront(struct hot_apply_ctx *ctx,
+				    struct hot_fg_raw_page *pages,
+				    struct hot_fg_compare_span *spans, size_t nr_spans)
+{
+	struct hot_fg_compare_slot slots[HOT_DSA_COMPARE_INFLIGHT] = {};
+	size_t next = 0;
+	size_t done = 0;
+	size_t active = 0;
+	u64 submit_sequence = 0;
+	size_t i;
+
+	while (done < nr_spans) {
+		for (i = 0; i < HOT_DSA_COMPARE_INFLIGHT &&
+		     active < HOT_DSA_COMPARE_INFLIGHT; i++) {
+			size_t searched = 0;
+			struct hot_fg_compare_span *span = NULL;
+
+			if (slots[i].active)
+				continue;
+			while (searched < nr_spans) {
+				struct hot_fg_compare_span *candidate = &spans[next];
+
+				next = (next + 1) % nr_spans;
+				searched++;
+				if (!candidate->complete && !candidate->active) {
+					span = candidate;
+					break;
+				}
+			}
+			if (!span)
+				break;
+			if (hot_fg_compare_submit(ctx, &slots[i], span, ++submit_sequence))
+				return -1;
+			active++;
+		}
+
+		if (!active) {
+			pr_err("DSA fine-grained compare span wavefront lost all pending descriptors\n");
+			return -1;
+		}
+
+		for (i = 0; i < HOT_DSA_COMPARE_INFLIGHT; i++) {
+			struct hot_fg_compare_slot *slot = &slots[i];
+			struct hot_fg_compare_span *span;
+			bool complete, equal;
+			u32 diff;
+
+			if (!slot->active)
+				continue;
+			if (hot_fg_compare_complete(slot, &complete, &equal, &diff))
+				return -1;
+			if (!complete) {
+				if (++slot->poll_count >= HOT_DSA_MAX_POLL_RETRY) {
+					pr_err("DSA fine-grained compare span completion timed out\n");
+					return -1;
+				}
+				continue;
+			}
+			span = slot->span;
+			if (!span || !span->active || slot->submitted_cursor != span->cursor) {
+				pr_err("DSA fine-grained compare span completion has stale cursor\n");
+				return -1;
+			}
+			slot->active = false;
+			span->active = false;
+			active--;
+			if (equal) {
+				span->cursor += slot->submitted_len;
+				if (hot_fg_span_finalize(span, pages, span->cursor))
+					return -1;
+			} else {
+				diff += slot->submitted_cursor;
+				if (hot_fg_span_record_diff(span, pages, diff))
+					return -1;
+			}
+			if (span->cursor == span->length) {
+				if (hot_fg_span_finalize(span, pages, span->length))
+					return -1;
+				if (span->finalized_pages != span->page_count) {
+					pr_err("DSA fine-grained compare span ended with unfinished pages\n");
+					return -1;
+				}
+				span->complete = true;
+				done++;
+			}
+		}
+		if (active)
+			hot_dsa_cpu_relax();
+	}
+	return 0;
+}
+
+static int hot_fg_emit_raw_page(struct hot_apply_ctx *ctx,
+				struct hot_fg_raw_page *page)
+{
+	struct dsa_fg_page_meta meta = {};
+	struct iovec iov[DSA_FG_MAX_PATCHES];
+	off_t data_off = ctx->fg_dat_off;
+	u16 i;
+
+	meta.vaddr = page->vaddr;
+	meta.flags = page->state == HOT_FG_RAW_FULL ? DSA_FG_PAGE_FULL :
+		(page->state == HOT_FG_RAW_PATCH ? DSA_FG_PAGE_PATCH : DSA_FG_PAGE_PARENT);
+	if (page->state == HOT_FG_RAW_FULL) {
+		if (write_full_fd(ctx->fg_dat_fd, page->raw, PAGE_SIZE))
+			return -1;
+		meta.data_len = PAGE_SIZE;
+		ctx->fg_dat_off += PAGE_SIZE;
+	} else if (page->state == HOT_FG_RAW_PATCH) {
+		if (write_full_fd(ctx->fg_dat_fd, page->patches,
+				  page->patch_count * sizeof(page->patches[0])))
+			return -1;
+		for (i = 0; i < page->patch_count; i++) {
+			iov[i].iov_base = (void *)(page->raw + page->patches[i].off);
+			iov[i].iov_len = page->patches[i].len;
+		}
+		if (hot_fg_writev_full_fd(ctx->fg_dat_fd, iov, page->patch_count))
+			return -1;
+		meta.patch_count = page->patch_count;
+		meta.data_len = page->patch_count * sizeof(page->patches[0]) +
+			page->patch_bytes;
+		ctx->fg_dat_off += meta.data_len;
+	}
+	meta.data_off = data_off;
+	if (hot_fg_write_meta(ctx, &meta))
+		return -1;
+	if (ctx->profile) {
+		ctx->fg_pages++;
+		if (page->state == HOT_FG_RAW_FULL) {
+			ctx->fg_full_pages++;
+			ctx->fg_patch_bytes += PAGE_SIZE;
+		} else if (page->state == HOT_FG_RAW_PATCH) {
+			ctx->fg_patch_pages++;
+			ctx->fg_patch_bytes += page->patch_bytes;
+		}
+	}
+	return 0;
+}
+
+static int hot_fg_apply_raw_page(struct hot_apply_ctx *ctx,
+				 struct hot_fg_raw_page *page)
+{
+	u16 i;
+
+	if (page->state == HOT_FG_RAW_PARENT)
+		return 0;
+	if (page->state == HOT_FG_RAW_FULL) {
+		if (hot_memstore_write_to_segments(ctx, page->raw, page->vaddr, PAGE_SIZE))
+			return -1;
+		if (ctx->profile)
+			ctx->memstore_bytes += PAGE_SIZE;
+		return 0;
+	}
+	for (i = 0; i < page->patch_count; i++) {
+		if (hot_memstore_write_to_segments(ctx, page->raw + page->patches[i].off,
+					   page->vaddr + page->patches[i].off,
+					   page->patches[i].len))
+			return -1;
+		if (ctx->profile)
+			ctx->memstore_bytes += page->patches[i].len;
+	}
+	return 0;
+}
+
+static int hot_fg_encode_raw_wavefront(struct page_xfer *xfer,
+				       struct hot_apply_ctx *ctx,
+				       const unsigned char *shared)
+{
+	struct hot_fg_raw_page *pages = NULL;
+	struct hot_fg_compare_span *spans = NULL;
+	size_t nr = 0, cap = 0, nr_spans = 0, spans_cap = 0, i;
+	size_t vma_cursor = 0;
+	u32 desc_off;
+	u32 raw_off = xfer->dsa_fg_raw_payload_base;
+	u32 capture_run = 0;
+	u32 max_xfer;
+
+	for (desc_off = xfer->dsa_fg_desc_area_off;
+	     desc_off < xfer->dsa_fg_desc_head;
+	     desc_off += sizeof(struct dsa_dump_descriptor)) {
+		const struct dsa_dump_descriptor *desc =
+			(const struct dsa_dump_descriptor *)(shared + desc_off);
+		u32 page_off;
+
+		if (!desc->copy_len || desc->copy_len % PAGE_SIZE ||
+		    desc->src_addr & (PAGE_SIZE - 1) ||
+		    raw_off > xfer->dsa_fg_raw_payload_head ||
+		    desc->copy_len > xfer->dsa_fg_raw_payload_head - raw_off) {
+			pr_err("DSA fine-grained raw descriptor is invalid off=%u src=%" PRIx64 " len=%u raw_off=%u raw_head=%u\n",
+			       desc_off, desc->src_addr, desc->copy_len, raw_off,
+			       xfer->dsa_fg_raw_payload_head);
+			goto err;
+		}
+		for (page_off = 0; page_off < desc->copy_len; page_off += PAGE_SIZE) {
+			if (hot_fg_raw_pages_append(ctx, &pages, &nr, &cap,
+						    (unsigned long)desc->src_addr + page_off,
+						    shared + raw_off + page_off,
+						    capture_run))
+				goto err;
+		}
+		raw_off += desc->copy_len;
+		capture_run++;
+	}
+	if (raw_off != xfer->dsa_fg_raw_payload_head) {
+		pr_err("DSA fine-grained raw capture size mismatch used=%u head=%u\n",
+		       raw_off, xfer->dsa_fg_raw_payload_head);
+		goto err;
+	}
+	max_xfer = ctx->dsa_max_transfer_size & ~(PAGE_SIZE - 1);
+	if (max_xfer < PAGE_SIZE) {
+		pr_err("DSA fine-grained compare max transfer is smaller than one page\n");
+		goto err;
+	}
+
+	/* Build spans with three monotonic inputs already ordered by capture:
+	 * raw capture runs, current VMA plans, and parent-map continuity.  A span
+	 * never crosses any of those boundaries or the actual WQ transfer limit. */
+	for (i = 0; i < nr;) {
+		struct hot_fg_raw_page *first = &pages[i];
+		size_t j;
+		unsigned long vma_end;
+		u32 length;
+
+		if (first->state != HOT_FG_RAW_PENDING) {
+			i++;
+			continue;
+		}
+		while (vma_cursor < ctx->nr_vma_plans &&
+		       ctx->vma_plans[vma_cursor].end <= first->vaddr)
+			vma_cursor++;
+		if (vma_cursor == ctx->nr_vma_plans ||
+		    ctx->vma_plans[vma_cursor].start > first->vaddr ||
+		    ctx->vma_plans[vma_cursor].end < first->vaddr + PAGE_SIZE) {
+			pr_err("DSA fine-grained raw page lacks current VMA plan vaddr=%lx\n",
+			       first->vaddr);
+			goto err;
+		}
+		vma_end = ctx->vma_plans[vma_cursor].end;
+		j = i + 1;
+		length = PAGE_SIZE;
+		while (j < nr && length + PAGE_SIZE <= max_xfer) {
+			struct hot_fg_raw_page *prev = &pages[j - 1];
+			struct hot_fg_raw_page *next = &pages[j];
+
+			if (next->state != HOT_FG_RAW_PENDING ||
+			    next->capture_run != first->capture_run ||
+			    next->vaddr != prev->vaddr + PAGE_SIZE ||
+			    next->raw != prev->raw + PAGE_SIZE ||
+			    next->parent != prev->parent + PAGE_SIZE ||
+			    next->vaddr + PAGE_SIZE > vma_end)
+				break;
+			length += PAGE_SIZE;
+			j++;
+		}
+		if (nr_spans == spans_cap) {
+			size_t new_cap = spans_cap ? spans_cap * 2 : 256;
+			void *new_spans = xrealloc(spans, new_cap * sizeof(*spans));
+
+			if (!new_spans)
+				goto err;
+			spans = new_spans;
+			spans_cap = new_cap;
+		}
+		spans[nr_spans] = (struct hot_fg_compare_span) {
+			.raw = first->raw,
+			.parent = first->parent,
+			.first_page = i,
+			.page_count = j - i,
+			.length = length,
+		};
+		/* This is deliberately once per actual span; submit/retry paths never
+		 * re-prefault a suffix after a first-difference completion. */
+		hot_dsa_prefault_range((void *)first->raw, length, false);
+		hot_dsa_prefault_range((void *)first->parent, length, false);
+		nr_spans++;
+		i = j;
+	}
+	if (nr_spans && hot_fg_compare_wavefront(ctx, pages, spans, nr_spans))
+		goto err;
+	for (i = 0; i < nr; i++) {
+		if (hot_fg_emit_raw_page(ctx, &pages[i]))
+			goto err;
+	}
+	for (i = 0; i < nr; i++) {
+		if (hot_fg_apply_raw_page(ctx, &pages[i]))
+			goto err;
+	}
+	xfer->dsa_fg_materialized = true;
+	if (dsa_debug_enabled())
+		pr_info("DSA_FG_RAW_ENCODE: pages_id=%u raw_bytes=%u compare_ops=%" PRIu64 " copy_ops=%" PRIu64 " spans=%zu inflight=%u max_xfer=%u\n",
+			xfer->pages_id,
+			xfer->dsa_fg_raw_payload_head - xfer->dsa_fg_raw_payload_base,
+			ctx->fg_compare_ops, ctx->fg_copy_ops, nr_spans,
+			HOT_DSA_COMPARE_INFLIGHT, max_xfer);
+	xfree(spans);
+	xfree(pages);
+	return 0;
+err:
+	xfree(spans);
+	xfree(pages);
+	return -1;
 }
 
 static int hot_fg_write_pages_loc(struct page_xfer *xfer, int p,
-				  unsigned long len,
-				  struct hot_apply_extent *pending_entry)
+			  unsigned long len,
+			  struct hot_apply_extent *pending_entry)
 {
 	struct hot_apply_ctx *ctx = xfer->hot_apply;
 	unsigned long curr;
@@ -3638,6 +4576,122 @@ static int hot_fg_write_pages_loc(struct page_xfer *xfer, int p,
 	}
 
 	return 0;
+}
+
+/*
+ * The normal DSA dump has already copied the frozen target bytes into the
+ * shared payload arena.  Encode that stable arena after thaw; do not read the
+ * target address space again and do not route it back through the replay pipe.
+ */
+static int page_xfer_dsa_fg_encode_raw_capture(struct page_xfer *xfer)
+{
+	struct hot_apply_ctx *ctx;
+	const unsigned char *shared;
+
+	if (!xfer || !xfer->dsa_fg_raw_capture || !xfer->dsa_fg_shared) {
+		pr_err("DSA fine-grained raw capture metadata is incomplete\n");
+		return -1;
+	}
+	ctx = xfer->hot_apply;
+	if (!ctx || !ctx->memstore || !ctx->fine_grained) {
+		pr_err("DSA fine-grained raw capture requires an initialized hot memstore\n");
+		return -1;
+	}
+	if (hot_apply_prepare_post_thaw(ctx))
+		return -1;
+	if (xfer->dsa_fg_desc_head < xfer->dsa_fg_desc_area_off ||
+	    xfer->dsa_fg_raw_payload_head < xfer->dsa_fg_raw_payload_base) {
+		pr_err("DSA fine-grained raw capture has invalid bounds\n");
+		return -1;
+	}
+
+	shared = xfer->dsa_fg_shared;
+	return hot_fg_encode_raw_wavefront(xfer, ctx, shared);
+
+	/* Kept below temporarily as the old single-page implementation reference. */
+#if 0
+	raw_off = xfer->dsa_fg_raw_payload_base;
+	start_us = hot_now_us();
+
+	for (desc_off = xfer->dsa_fg_desc_area_off;
+	     desc_off < xfer->dsa_fg_desc_head;
+	     desc_off += sizeof(struct dsa_dump_descriptor)) {
+		const struct dsa_dump_descriptor *desc =
+			(const struct dsa_dump_descriptor *)(shared + desc_off);
+		u32 page_off;
+
+		if (!desc->copy_len || desc->copy_len % PAGE_SIZE ||
+		    desc->src_addr & (PAGE_SIZE - 1) ||
+		    raw_off > xfer->dsa_fg_raw_payload_head ||
+		    desc->copy_len > xfer->dsa_fg_raw_payload_head - raw_off) {
+			pr_err("DSA fine-grained raw descriptor is invalid off=%u src=%" PRIx64 " len=%u raw_off=%u raw_head=%u\n",
+			       desc_off, desc->src_addr, desc->copy_len, raw_off,
+			       xfer->dsa_fg_raw_payload_head);
+			return -1;
+		}
+
+		for (page_off = 0; page_off < desc->copy_len; page_off += PAGE_SIZE) {
+			unsigned long vaddr = (unsigned long)desc->src_addr + page_off;
+			const void *cur = shared + raw_off + page_off;
+
+			if (hot_fg_write_page(ctx, vaddr, cur))
+				return -1;
+			ctx->append_bytes += PAGE_SIZE;
+		}
+		raw_off += desc->copy_len;
+	}
+
+	if (raw_off != xfer->dsa_fg_raw_payload_head) {
+		pr_err("DSA fine-grained raw capture size mismatch used=%u head=%u\n",
+		       raw_off, xfer->dsa_fg_raw_payload_head);
+		return -1;
+	}
+
+	/*
+	 * Do not alter the hot parent while classification/sidecar generation is
+	 * still running.  A descriptor is a compact cursor into the stable raw
+	 * arena, so a second descriptor pass is enough: no second page buffer and
+	 * no copy of PATCH/FULL data is needed.  If this pass fails CDP marks the
+	 * hot cache INVALID rather than exposing a partially updated parent.
+	 */
+	raw_off = xfer->dsa_fg_raw_payload_base;
+	for (desc_off = xfer->dsa_fg_desc_area_off;
+	     desc_off < xfer->dsa_fg_desc_head;
+	     desc_off += sizeof(struct dsa_dump_descriptor)) {
+		const struct dsa_dump_descriptor *desc =
+			(const struct dsa_dump_descriptor *)(shared + desc_off);
+		u32 page_off;
+
+		if (!desc->copy_len || desc->copy_len % PAGE_SIZE ||
+		    raw_off > xfer->dsa_fg_raw_payload_head ||
+		    desc->copy_len > xfer->dsa_fg_raw_payload_head - raw_off) {
+			pr_err("DSA fine-grained hot apply descriptor is invalid off=%u\n", desc_off);
+			return -1;
+		}
+		for (page_off = 0; page_off < desc->copy_len; page_off += PAGE_SIZE) {
+			unsigned long vaddr = (unsigned long)desc->src_addr + page_off;
+			const void *cur = shared + raw_off + page_off;
+
+			if (hot_memstore_write_to_segments(ctx, cur, vaddr, PAGE_SIZE))
+				return -1;
+			if (ctx->profile)
+				ctx->memstore_bytes += PAGE_SIZE;
+		}
+		raw_off += desc->copy_len;
+	}
+
+	if (ctx->profile) {
+		ctx->append_splice_us += hot_now_us() - start_us;
+		ctx->append_time_us += hot_now_us() - start_us;
+	}
+	xfer->dsa_fg_materialized = true;
+	if (dsa_debug_enabled())
+		pr_info("DSA_FG_RAW_ENCODE: pages_id=%u raw_bytes=%u compare_ops=%" PRIu64 " copy_ops=%" PRIu64 "\n",
+			xfer->pages_id,
+			xfer->dsa_fg_raw_payload_head - xfer->dsa_fg_raw_payload_base,
+		ctx->fg_compare_ops, ctx->fg_copy_ops);
+	return 0;
+#endif
 }
 
 static void close_page_xfer(struct page_xfer *xfer)
@@ -4228,7 +5282,14 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 	unsigned int cur_hole = 0;
 	int ret;
 
-	if (xfer->dsa_fine_grained && !xfer->dsa_fg_materialized) {
+	if (xfer->hot_apply && !xfer->hot_apply->post_thaw_ready &&
+	    hot_apply_prepare_post_thaw(xfer->hot_apply))
+		return -1;
+
+	if (xfer->dsa_fg_raw_capture && !xfer->dsa_fg_materialized) {
+		if (page_xfer_dsa_fg_encode_raw_capture(xfer))
+			return -1;
+	} else if (xfer->dsa_fine_grained && !xfer->dsa_fg_materialized) {
 		uint64_t fg_start_us = hot_now_us();
 		uint64_t fg_sidecar_us;
 		uint64_t fg_apply_us;

@@ -181,6 +181,9 @@ static inline bool page_read_has_parent(struct page_read *pr)
 #ifndef DSA_FG_PAGE_FULL
 #define DSA_FG_PAGE_FULL  2
 #endif
+#ifndef DSA_FG_PAGE_PARENT
+#define DSA_FG_PAGE_PARENT 3
+#endif
 
 struct dsa_fg_page_meta {
 	u64 vaddr;

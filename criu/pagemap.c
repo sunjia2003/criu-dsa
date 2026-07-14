@@ -566,6 +566,24 @@ static int read_fg_page_one(struct page_read *pr, unsigned long vaddr, void *buf
 		pr->timing_fg_read_us += page_read_now_us() - start_us;
 		return 0;
 	}
+	if (meta.flags == DSA_FG_PAGE_PARENT) {
+		if (meta.data_len || meta.patch_count) {
+			pr_err("Invalid DSA fine-grained parent record vaddr=%lx len=%u patches=%u\n",
+			       vaddr, meta.data_len, meta.patch_count);
+			return -1;
+		}
+		if (!pr->parent) {
+			pr_err("DSA fine-grained parent page has no parent vaddr=%lx\n", vaddr);
+			return -1;
+		}
+		part_start_us = page_read_now_us();
+		if (read_parent_page(pr, vaddr, 1, buf, flags & ~(PR_ASYNC | PR_ASAP)) < 0)
+			return -1;
+		pr->timing_fg_patch_parent_incl_us += page_read_now_us() - part_start_us;
+		pr->fg_pages_read++;
+		pr->timing_fg_read_us += page_read_now_us() - start_us;
+		return 0;
+	}
 
 	if (meta.flags != DSA_FG_PAGE_PATCH) {
 		pr_err("Unknown DSA fine-grained record flags=%u vaddr=%lx\n",

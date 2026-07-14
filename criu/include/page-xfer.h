@@ -55,6 +55,9 @@ struct page_xfer {
 	const void *dsa_fg_shared;
 	u32 dsa_fg_desc_area_off;
 	u32 dsa_fg_desc_head;
+	u32 dsa_fg_raw_payload_base;
+	u32 dsa_fg_raw_payload_head;
+	bool dsa_fg_raw_capture;
 	bool dsa_fg_materialized;
 };
 
@@ -67,6 +70,9 @@ struct vm_area_list;
 extern int page_xfer_dump_pages(struct page_xfer *, struct page_pipe *);
 extern int page_xfer_predump_pages(int pid, struct page_xfer *, struct page_pipe *);
 extern int page_xfer_hot_set_vmas(struct page_xfer *, struct vm_area_list *);
+/* Prepare only immutable fine-grained inputs before collect_pstree freezes the task. */
+extern int page_xfer_hot_prepare_before_freeze(unsigned long img_id);
+extern void page_xfer_hot_cleanup_before_freeze(void);
 extern int connect_to_page_server_to_send(void);
 extern int connect_to_page_server_to_recv(int epfd);
 extern int disconnect_from_page_server(void);
