@@ -1756,7 +1756,11 @@ static struct frozen_detail_timeline frozen_detail_tl;
 
 static bool frozen_detail_enabled(void)
 {
-	const char *env = getenv("CRIU_DSA_SCAN_PROFILE");
+	const char *env = getenv("CRIU_DSA_PROFILE");
+
+	if (env && atoi(env) > 0)
+		return true;
+	env = getenv("CRIU_DSA_SCAN_PROFILE");
 
 	return env && atoi(env) > 0;
 }
@@ -1807,6 +1811,8 @@ static void frozen_detail_write_csv(int ret)
 		fprintf(f, ",%llu", (unsigned long long)frozen_detail_tl.phase_us[i]);
 	fprintf(f, "\n");
 	fclose(f);
+	pr_info("FROZEN_DETAIL_TIMELINE: enabled=1 path=%s ret=%d write_ok=1\n",
+		path, ret);
 }
 
 static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
@@ -2503,6 +2509,7 @@ static int cr_dump_finish(int ret)
 		timing_stop(TIME_FROZEN);
 		frozen_timeline_finish(ret);
 		frozen_timeline_write_csv();
+		frozen_detail_write_csv(ret);
 		memdump_timeline_write_csv();
 
 		if (!ret)
