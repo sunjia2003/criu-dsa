@@ -19,6 +19,11 @@
 #include <string.h>
 #include <stdbool.h>
 
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#define HOT_FG_HAVE_X86_SIMD 1
+#endif
+
 #undef LOG_PREFIX
 #define LOG_PREFIX "page-xfer: "
 
@@ -48,6 +53,13 @@
 #define HOT_DSA_COMPARE_INFLIGHT 128
 #define HOT_DSA_MAX_ENQ_RETRY 1000000U
 #define HOT_DSA_MAX_POLL_RETRY 1000000U
+
+enum hot_fg_compare_backend {
+	HOT_FG_COMPARE_DSA = 0,
+	HOT_FG_COMPARE_SIMD_AVX2,
+	HOT_FG_COMPARE_SIMD_AVX512,
+	HOT_FG_COMPARE_VALIDATE,
+};
 
 static int page_server_sk = -1;
 
@@ -114,6 +126,7 @@ struct hot_apply_ctx {
 	bool memstore;
 	bool fine_grained;
 	bool profile;
+	enum hot_fg_compare_backend fg_compare_backend;
 	bool finished;
 	int pipefd[2];
 	int append_fd;
@@ -244,6 +257,8 @@ struct hot_apply_ctx {
 	u64 profile_compare_poll_sweeps;
 	u64 profile_compare_not_ready;
 	u64 profile_compare_max_active;
+	u64 profile_simd_vector_ops;
+	u64 profile_simd_bytes_examined;
 	u64 profile_prefault_spans;
 	u64 profile_prefault_pages;
 	u64 profile_parent_pages;
@@ -1149,6 +1164,79 @@ static bool dsa_fine_grained_enabled(void)
 			   !strcasecmp(enabled, "yes") || !strcasecmp(enabled, "on"));
 }
 
+static const char *hot_fg_compare_backend_name(enum hot_fg_compare_backend backend)
+{
+	switch (backend) {
+	case HOT_FG_COMPARE_DSA:
+		return "dsa";
+	case HOT_FG_COMPARE_SIMD_AVX2:
+		return "simd-avx2";
+	case HOT_FG_COMPARE_SIMD_AVX512:
+		return "simd-avx512";
+	case HOT_FG_COMPARE_VALIDATE:
+		return "validate";
+	default:
+		return "invalid";
+	}
+}
+
+static bool hot_fg_cpu_supports_avx2(void)
+{
+#ifdef HOT_FG_HAVE_X86_SIMD
+	__builtin_cpu_init();
+	return __builtin_cpu_supports("avx2");
+#else
+	return false;
+#endif
+}
+
+static bool hot_fg_cpu_supports_avx512(void)
+{
+#ifdef HOT_FG_HAVE_X86_SIMD
+	__builtin_cpu_init();
+	return __builtin_cpu_supports("avx512f") &&
+		__builtin_cpu_supports("avx512bw") &&
+		__builtin_cpu_supports("avx512vl");
+#else
+	return false;
+#endif
+}
+
+static int hot_fg_select_compare_backend(struct hot_apply_ctx *ctx)
+{
+	const char *value = getenv("CRIU_DSA_FG_COMPARE_BACKEND");
+	enum hot_fg_compare_backend backend = HOT_FG_COMPARE_DSA;
+
+	if (value && value[0]) {
+		if (!strcasecmp(value, "dsa"))
+			backend = HOT_FG_COMPARE_DSA;
+		else if (!strcasecmp(value, "simd-avx2"))
+			backend = HOT_FG_COMPARE_SIMD_AVX2;
+		else if (!strcasecmp(value, "simd-avx512"))
+			backend = HOT_FG_COMPARE_SIMD_AVX512;
+		else if (!strcasecmp(value, "validate"))
+			backend = HOT_FG_COMPARE_VALIDATE;
+		else {
+			pr_err("DSA fine-grained compare backend is invalid: %s\n", value);
+			return -1;
+		}
+	}
+
+	if (backend == HOT_FG_COMPARE_SIMD_AVX2 && !hot_fg_cpu_supports_avx2()) {
+		pr_err("DSA fine-grained simd-avx2 backend requires AVX2\n");
+		return -1;
+	}
+	if ((backend == HOT_FG_COMPARE_SIMD_AVX512 ||
+	     backend == HOT_FG_COMPARE_VALIDATE) && !hot_fg_cpu_supports_avx512()) {
+		pr_err("DSA fine-grained %s backend requires AVX-512F/BW/VL\n",
+		       hot_fg_compare_backend_name(backend));
+		return -1;
+	}
+
+	ctx->fg_compare_backend = backend;
+	return 0;
+}
+
 static int hot_fg_open_sidecar(struct hot_apply_ctx *ctx)
 {
 	char path[64];
@@ -1580,6 +1668,10 @@ static struct hot_apply_ctx *hot_apply_alloc_ctx(int fd_type,
 	ctx->memstore = hot_mode_is_memstore();
 	ctx->fine_grained = ctx->memstore && dsa_fine_grained_enabled();
 	ctx->profile = dsa_profile_enabled();
+	if (ctx->fine_grained && hot_fg_select_compare_backend(ctx)) {
+		xfree(ctx);
+		return NULL;
+	}
 	ctx->pending_index = (size_t)-1;
 	return ctx;
 }
@@ -1656,19 +1748,22 @@ int page_xfer_hot_prepare_before_freeze(unsigned long img_id)
 
 	ctx->pre_freeze_ready = true;
 	hot_apply_prepared = ctx;
-	pr_info("DSA fine-grained pre-freeze parent view ready img_id=%lu segments=%zu wqs=%d\n",
-		img_id, ctx->nr_old_memstore, ctx->dsa_wq_count);
+	pr_info("DSA fine-grained pre-freeze parent view ready img_id=%lu segments=%zu wqs=%d backend=%s\n",
+		img_id, ctx->nr_old_memstore, ctx->dsa_wq_count,
+		hot_fg_compare_backend_name(ctx->fg_compare_backend));
 	if (ctx->profile)
-		pr_info("DSA_PRE_FREEZE_PROFILE: version=1 img_id=%lu ret=0 total_us=%" PRIu64 " manifest_us=%" PRIu64 " parent_map_us=%" PRIu64 " wq_open_us=%" PRIu64 " parent_segments=%zu parent_bytes=%" PRIu64 " wqs=%d\n",
-			img_id, dsa_profile_delta_us(total_start_us, dsa_profile_wall_now_us()),
+		pr_info("DSA_PRE_FREEZE_PROFILE: version=2 img_id=%lu backend=%s ret=0 total_us=%" PRIu64 " manifest_us=%" PRIu64 " parent_map_us=%" PRIu64 " wq_open_us=%" PRIu64 " parent_segments=%zu parent_bytes=%" PRIu64 " wqs=%d\n",
+			img_id, hot_fg_compare_backend_name(ctx->fg_compare_backend),
+			dsa_profile_delta_us(total_start_us, dsa_profile_wall_now_us()),
 			manifest_us, map_us, wq_us, ctx->nr_old_memstore, parent_bytes,
 			ctx->dsa_wq_count);
 	return 0;
 
-err:
+	err:
 	if (ctx->profile)
-		pr_info("DSA_PRE_FREEZE_PROFILE: version=1 img_id=%lu ret=-1 total_us=%" PRIu64 " manifest_us=%" PRIu64 " parent_map_us=%" PRIu64 " wq_open_us=%" PRIu64 " parent_segments=%zu parent_bytes=%" PRIu64 " wqs=%d\n",
-			img_id, dsa_profile_delta_us(total_start_us, dsa_profile_wall_now_us()),
+		pr_info("DSA_PRE_FREEZE_PROFILE: version=2 img_id=%lu backend=%s ret=-1 total_us=%" PRIu64 " manifest_us=%" PRIu64 " parent_map_us=%" PRIu64 " wq_open_us=%" PRIu64 " parent_segments=%zu parent_bytes=%" PRIu64 " wqs=%d\n",
+			img_id, hot_fg_compare_backend_name(ctx->fg_compare_backend),
+			dsa_profile_delta_us(total_start_us, dsa_profile_wall_now_us()),
 			manifest_us, map_us, wq_us, ctx->nr_old_memstore, parent_bytes,
 			ctx->dsa_wq_count);
 	{
@@ -3456,6 +3551,7 @@ static void hot_profile_begin(struct hot_apply_ctx *ctx)
 
 static void hot_profile_emit(struct hot_apply_ctx *ctx, int ret)
 {
+	const char *backend;
 	u64 total_us;
 	u64 accounted_us;
 	u64 unaccounted_us;
@@ -3464,6 +3560,7 @@ static void hot_profile_emit(struct hot_apply_ctx *ctx, int ret)
 
 	if (!ctx || !ctx->profile || !ctx->profile_started || ctx->profile_emitted)
 		return;
+	backend = hot_fg_compare_backend_name(ctx->fg_compare_backend);
 
 	total_us = dsa_profile_delta_us(ctx->profile_total_start_us,
 					 dsa_profile_wall_now_us());
@@ -3477,8 +3574,8 @@ static void hot_profile_emit(struct hot_apply_ctx *ctx, int ret)
 	dat_bytes = ctx->fg_dat_off >= 0 ? (u64)ctx->fg_dat_off : 0;
 
 	ctx->profile_emitted = true;
-	pr_info("DSA_POST_THAW_PROFILE_TIME: version=2 pages_id=%u ret=%d total_us=%" PRIu64 " post_prepare_us=%" PRIu64 " materialize_us=%" PRIu64 " raw_index_us=%" PRIu64 " span_build_us=%" PRIu64 " compare_pipeline_wall_us=%" PRIu64 " compare_pipeline_cpu_us=%" PRIu64 " sidecar_emit_us=%" PRIu64 " hot_apply_us=%" PRIu64 " pagemap_us=%" PRIu64 " pagemap_plan_us=%" PRIu64 " parent_validate_us=%" PRIu64 " pagemap_pack_us=%" PRIu64 " finish_us=%" PRIu64 " accounted_us=%" PRIu64 " unaccounted_us=%" PRIu64 " ledger_overrun=%u\n",
-		ctx->pages_id, ret, total_us, ctx->profile_post_prepare_us,
+	pr_info("DSA_POST_THAW_PROFILE_TIME: version=3 pages_id=%u backend=%s ret=%d total_us=%" PRIu64 " post_prepare_us=%" PRIu64 " materialize_us=%" PRIu64 " raw_index_us=%" PRIu64 " span_build_us=%" PRIu64 " compare_pipeline_wall_us=%" PRIu64 " compare_pipeline_cpu_us=%" PRIu64 " sidecar_emit_us=%" PRIu64 " hot_apply_us=%" PRIu64 " pagemap_us=%" PRIu64 " pagemap_plan_us=%" PRIu64 " parent_validate_us=%" PRIu64 " pagemap_pack_us=%" PRIu64 " finish_us=%" PRIu64 " accounted_us=%" PRIu64 " unaccounted_us=%" PRIu64 " ledger_overrun=%u\n",
+		ctx->pages_id, backend, ret, total_us, ctx->profile_post_prepare_us,
 		ctx->profile_materialize_us, ctx->profile_raw_index_us,
 		ctx->profile_span_build_us, ctx->profile_compare_wall_us,
 		ctx->profile_compare_cpu_us,
@@ -3487,11 +3584,12 @@ static void hot_profile_emit(struct hot_apply_ctx *ctx, int ret)
 		ctx->profile_parent_validate_us, ctx->profile_pagemap_pack_us,
 		ctx->profile_finish_us, accounted_us,
 		unaccounted_us, accounted_us > total_us ? 1 : 0);
-	pr_info("DSA_POST_THAW_PROFILE_COUNT: version=2 pages_id=%u ret=%d raw_pages=%" PRIu64 " raw_bytes=%" PRIu64 " capture_runs=%" PRIu64 " spans=%" PRIu64 " span_pages=%" PRIu64 " max_span_pages=%" PRIu64 " compare_ops=%" PRIu64 " enq_retries=%" PRIu64 " poll_sweeps=%" PRIu64 " not_ready=%" PRIu64 " max_active=%" PRIu64 " prefault_spans=%" PRIu64 " prefault_pages=%" PRIu64 " parent_pages=%" PRIu64 " patch_pages=%" PRIu64 " full_pages=%" PRIu64 " patch_ranges=%" PRIu64 " patch_bytes=%" PRIu64 " idx_write_calls=%" PRIu64 " idx_bytes=%" PRIu64 " dat_write_calls=%" PRIu64 " dat_writev_calls=%" PRIu64 " dat_bytes=%" PRIu64 " hot_pwrite_ops=%" PRIu64 " hot_pwrite_bytes=%" PRIu64 " hot_mprotect_ops=%" PRIu64 " hot_memcpy_bytes=%" PRIu64 " pagemap_iovs=%" PRIu64 " pagemap_input_records=%" PRIu64 " pagemap_records=%zu pagemap_merged_records=%" PRIu64 " pagemap_present_pages=%" PRIu64 " pagemap_fg_pages=%" PRIu64 " pagemap_bytes=%" PRIu64 " pagemap_flushes=%" PRIu64 "\n",
-		ctx->pages_id, ret, ctx->profile_raw_pages, ctx->profile_raw_bytes,
+	pr_info("DSA_POST_THAW_PROFILE_COUNT: version=3 pages_id=%u backend=%s ret=%d raw_pages=%" PRIu64 " raw_bytes=%" PRIu64 " capture_runs=%" PRIu64 " spans=%" PRIu64 " span_pages=%" PRIu64 " max_span_pages=%" PRIu64 " compare_ops=%" PRIu64 " simd_vector_ops=%" PRIu64 " simd_bytes_examined=%" PRIu64 " enq_retries=%" PRIu64 " poll_sweeps=%" PRIu64 " not_ready=%" PRIu64 " max_active=%" PRIu64 " prefault_spans=%" PRIu64 " prefault_pages=%" PRIu64 " parent_pages=%" PRIu64 " patch_pages=%" PRIu64 " full_pages=%" PRIu64 " patch_ranges=%" PRIu64 " patch_bytes=%" PRIu64 " idx_write_calls=%" PRIu64 " idx_bytes=%" PRIu64 " dat_write_calls=%" PRIu64 " dat_writev_calls=%" PRIu64 " dat_bytes=%" PRIu64 " hot_pwrite_ops=%" PRIu64 " hot_pwrite_bytes=%" PRIu64 " hot_mprotect_ops=%" PRIu64 " hot_memcpy_bytes=%" PRIu64 " pagemap_iovs=%" PRIu64 " pagemap_input_records=%" PRIu64 " pagemap_records=%zu pagemap_merged_records=%" PRIu64 " pagemap_present_pages=%" PRIu64 " pagemap_fg_pages=%" PRIu64 " pagemap_bytes=%" PRIu64 " pagemap_flushes=%" PRIu64 "\n",
+		ctx->pages_id, backend, ret, ctx->profile_raw_pages, ctx->profile_raw_bytes,
 		ctx->profile_capture_runs, ctx->profile_spans,
 		ctx->profile_span_pages, ctx->profile_max_span_pages,
-		ctx->fg_compare_ops, ctx->profile_compare_enq_retries,
+		ctx->fg_compare_ops, ctx->profile_simd_vector_ops,
+		ctx->profile_simd_bytes_examined, ctx->profile_compare_enq_retries,
 		ctx->profile_compare_poll_sweeps, ctx->profile_compare_not_ready,
 		ctx->profile_compare_max_active, ctx->profile_prefault_spans,
 		ctx->profile_prefault_pages, ctx->profile_parent_pages,
@@ -4693,7 +4791,7 @@ static int hot_fg_span_finalize(struct hot_fg_compare_span *span,
 }
 
 static int hot_fg_span_record_diff(struct hot_fg_compare_span *span,
-					  struct hot_fg_raw_page *pages, u32 diff)
+				  struct hot_fg_raw_page *pages, u32 diff)
 {
 	size_t page_idx;
 	struct hot_fg_raw_page *page;
@@ -4724,6 +4822,214 @@ static int hot_fg_span_record_diff(struct hot_fg_compare_span *span,
 	page->patch_count++;
 	span->cursor = diff + patch_len;
 	return hot_fg_span_finalize(span, pages, span->cursor);
+}
+
+struct hot_fg_simd_scan_stats {
+	u64 vector_ops;
+	u64 bytes_examined;
+};
+
+#ifdef HOT_FG_HAVE_X86_SIMD
+static int __attribute__((target("avx2")))
+hot_fg_simd_avx2_first_diff(const unsigned char *raw,
+			    const unsigned char *parent, u32 length,
+			    bool *equal, u32 *first_diff,
+			    struct hot_fg_simd_scan_stats *stats)
+{
+	u32 cursor = 0;
+
+	while (cursor + 32 <= length) {
+		__m256i raw_v = _mm256_loadu_si256((const __m256i *)(raw + cursor));
+		__m256i parent_v = _mm256_loadu_si256((const __m256i *)(parent + cursor));
+		u32 equal_mask = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(raw_v, parent_v));
+
+		if (stats) {
+			stats->vector_ops++;
+			stats->bytes_examined += 32;
+		}
+		if (equal_mask != UINT32_MAX) {
+			*equal = false;
+			*first_diff = cursor + (u32)__builtin_ctz(~equal_mask);
+			return 0;
+		}
+		cursor += 32;
+	}
+	while (cursor < length) {
+		if (stats)
+			stats->bytes_examined++;
+		if (raw[cursor] != parent[cursor]) {
+			*equal = false;
+			*first_diff = cursor;
+			return 0;
+		}
+		cursor++;
+	}
+	*equal = true;
+	*first_diff = length;
+	return 0;
+}
+
+static int __attribute__((target("avx512f,avx512bw,avx512vl")))
+hot_fg_simd_avx512_first_diff(const unsigned char *raw,
+			      const unsigned char *parent, u32 length,
+			      bool *equal, u32 *first_diff,
+			      struct hot_fg_simd_scan_stats *stats)
+{
+	u32 cursor = 0;
+
+	while (cursor + 64 <= length) {
+		__m512i raw_v = _mm512_loadu_si512((const void *)(raw + cursor));
+		__m512i parent_v = _mm512_loadu_si512((const void *)(parent + cursor));
+		__mmask64 equal_mask = _mm512_cmpeq_epi8_mask(raw_v, parent_v);
+
+		if (stats) {
+			stats->vector_ops++;
+			stats->bytes_examined += 64;
+		}
+		if (equal_mask != ~(__mmask64)0) {
+			*equal = false;
+			*first_diff = cursor + (u32)__builtin_ctzll((u64)~equal_mask);
+			return 0;
+		}
+		cursor += 64;
+	}
+	while (cursor < length) {
+		if (stats)
+			stats->bytes_examined++;
+		if (raw[cursor] != parent[cursor]) {
+			*equal = false;
+			*first_diff = cursor;
+			return 0;
+		}
+		cursor++;
+	}
+	*equal = true;
+	*first_diff = length;
+	return 0;
+}
+#endif
+
+static int hot_fg_simd_first_diff(enum hot_fg_compare_backend backend,
+				  const unsigned char *raw,
+				  const unsigned char *parent, u32 length,
+				  bool *equal, u32 *first_diff,
+				  struct hot_fg_simd_scan_stats *stats)
+{
+	if (!raw || !parent || !length || !equal || !first_diff)
+		return -1;
+
+#ifdef HOT_FG_HAVE_X86_SIMD
+	if (backend == HOT_FG_COMPARE_SIMD_AVX2)
+		return hot_fg_simd_avx2_first_diff(raw, parent, length, equal,
+					  first_diff, stats);
+	if (backend == HOT_FG_COMPARE_SIMD_AVX512 ||
+	    backend == HOT_FG_COMPARE_VALIDATE)
+		return hot_fg_simd_avx512_first_diff(raw, parent, length, equal,
+					    first_diff, stats);
+#else
+	(void)backend;
+	(void)stats;
+#endif
+
+	pr_err("DSA fine-grained SIMD backend is unavailable\n");
+	return -1;
+}
+
+static int hot_fg_compare_simd(struct hot_apply_ctx *ctx,
+				       struct hot_fg_raw_page *pages,
+				       struct hot_fg_compare_span *spans, size_t nr_spans,
+				       enum hot_fg_compare_backend backend,
+				       bool record_profile)
+{
+	struct hot_fg_simd_scan_stats stats = {};
+	size_t i;
+
+	for (i = 0; i < nr_spans; i++) {
+		struct hot_fg_compare_span *span = &spans[i];
+
+		if (!span->parent || span->state != HOT_FG_SPAN_UNPREFAULTED ||
+		    !span->length || span->length % PAGE_SIZE) {
+			pr_err("DSA fine-grained SIMD compare has invalid span=%zu state=%u length=%u\n",
+			       i, span->state, span->length);
+			return -1;
+		}
+		hot_dsa_prefault_range((void *)span->parent, span->length, false);
+		if (record_profile && ctx->profile) {
+			ctx->profile_prefault_spans++;
+			ctx->profile_prefault_pages += span->length / PAGE_SIZE;
+		}
+		span->state = HOT_FG_SPAN_ACTIVE;
+		while (span->cursor < span->length) {
+			bool equal;
+			u32 diff;
+
+			if (hot_fg_simd_first_diff(backend, span->raw + span->cursor,
+						   span->parent + span->cursor,
+						   span->length - span->cursor, &equal, &diff,
+						   record_profile && ctx->profile ? &stats : NULL))
+				return -1;
+			if (equal) {
+				span->cursor = span->length;
+				if (hot_fg_span_finalize(span, pages, span->cursor))
+					return -1;
+				break;
+			}
+			if (hot_fg_span_record_diff(span, pages, span->cursor + diff))
+				return -1;
+		}
+		if (span->cursor != span->length ||
+		    hot_fg_span_finalize(span, pages, span->length) ||
+		    span->finalized_pages != span->page_count) {
+			pr_err("DSA fine-grained SIMD compare span ended with unfinished pages\n");
+			return -1;
+		}
+		span->state = HOT_FG_SPAN_DONE;
+	}
+
+	if (record_profile && ctx->profile) {
+		ctx->profile_simd_vector_ops += stats.vector_ops;
+		ctx->profile_simd_bytes_examined += stats.bytes_examined;
+	}
+	return 0;
+}
+
+static int hot_fg_validate_compare_metadata(const struct hot_fg_raw_page *dsa_pages,
+					    const struct hot_fg_raw_page *simd_pages,
+					    size_t nr_pages,
+					    const struct hot_fg_compare_span *dsa_spans,
+					    const struct hot_fg_compare_span *simd_spans,
+					    size_t nr_spans)
+{
+	size_t i;
+
+	for (i = 0; i < nr_pages; i++) {
+		const struct hot_fg_raw_page *dsa = &dsa_pages[i];
+		const struct hot_fg_raw_page *simd = &simd_pages[i];
+
+		if (dsa->state != simd->state || dsa->cursor != simd->cursor ||
+		    dsa->patch_bytes != simd->patch_bytes ||
+		    dsa->patch_count != simd->patch_count ||
+		    memcmp(dsa->patches, simd->patches,
+			   dsa->patch_count * sizeof(dsa->patches[0]))) {
+			pr_err("DSA fine-grained validate page metadata mismatch page=%zu vaddr=%lx dsa_state=%u simd_state=%u dsa_ranges=%u simd_ranges=%u\n",
+			       i, dsa->vaddr, dsa->state, simd->state,
+			       dsa->patch_count, simd->patch_count);
+			return -1;
+		}
+	}
+	for (i = 0; i < nr_spans; i++) {
+		const struct hot_fg_compare_span *dsa = &dsa_spans[i];
+		const struct hot_fg_compare_span *simd = &simd_spans[i];
+
+		if (dsa->cursor != simd->cursor ||
+		    dsa->finalized_pages != simd->finalized_pages ||
+		    dsa->state != simd->state) {
+			pr_err("DSA fine-grained validate span metadata mismatch span=%zu dsa_cursor=%u simd_cursor=%u dsa_state=%u simd_state=%u\n",
+			       i, dsa->cursor, simd->cursor, dsa->state, simd->state);
+			return -1;
+		}
+	}
+	return 0;
 }
 
 static int hot_fg_compare_wavefront(struct hot_apply_ctx *ctx,
@@ -5041,6 +5347,8 @@ static int hot_fg_encode_raw_wavefront(struct page_xfer *xfer,
 {
 	struct hot_fg_raw_page *pages = NULL;
 	struct hot_fg_compare_span *spans = NULL;
+	struct hot_fg_raw_page *validate_pages = NULL;
+	struct hot_fg_compare_span *validate_spans = NULL;
 	size_t nr = 0, cap = 0, nr_spans = 0, spans_cap = 0, i;
 	size_t vma_cursor = 0;
 	u32 desc_off;
@@ -5174,8 +5482,39 @@ static int hot_fg_encode_raw_wavefront(struct page_xfer *xfer,
 		phase_start_us = dsa_profile_wall_now_us();
 		compare_cpu_start_us = dsa_profile_thread_now_us();
 	}
-	if (nr_spans && hot_fg_compare_wavefront(ctx, pages, spans, nr_spans))
-		goto err;
+	if (ctx->fg_compare_backend == HOT_FG_COMPARE_VALIDATE && nr_spans) {
+		validate_pages = xmalloc(nr * sizeof(*validate_pages));
+		validate_spans = xmalloc(nr_spans * sizeof(*validate_spans));
+		if (!validate_pages || !validate_spans)
+			goto err;
+		memcpy(validate_pages, pages, nr * sizeof(*validate_pages));
+		memcpy(validate_spans, spans, nr_spans * sizeof(*validate_spans));
+	}
+	if (nr_spans) {
+		switch (ctx->fg_compare_backend) {
+		case HOT_FG_COMPARE_DSA:
+			if (hot_fg_compare_wavefront(ctx, pages, spans, nr_spans))
+				goto err;
+			break;
+		case HOT_FG_COMPARE_SIMD_AVX2:
+		case HOT_FG_COMPARE_SIMD_AVX512:
+			if (hot_fg_compare_simd(ctx, pages, spans, nr_spans,
+						ctx->fg_compare_backend, true))
+				goto err;
+			break;
+		case HOT_FG_COMPARE_VALIDATE:
+			if (hot_fg_compare_wavefront(ctx, pages, spans, nr_spans) ||
+			    hot_fg_compare_simd(ctx, validate_pages, validate_spans, nr_spans,
+						HOT_FG_COMPARE_SIMD_AVX512, false) ||
+			    hot_fg_validate_compare_metadata(pages, validate_pages, nr,
+						     spans, validate_spans, nr_spans))
+				goto err;
+			break;
+		default:
+			pr_err("DSA fine-grained compare backend is invalid\n");
+			goto err;
+		}
+	}
 	if (ctx->profile) {
 		compare_cpu_end_us = dsa_profile_thread_now_us();
 		ctx->profile_compare_wall_us += dsa_profile_delta_us(phase_start_us,
@@ -5200,15 +5539,22 @@ static int hot_fg_encode_raw_wavefront(struct page_xfer *xfer,
 							       dsa_profile_wall_now_us());
 	xfer->dsa_fg_materialized = true;
 	if (dsa_debug_enabled())
-		pr_info("DSA_FG_RAW_ENCODE: pages_id=%u raw_bytes=%u compare_ops=%" PRIu64 " copy_ops=%" PRIu64 " spans=%zu inflight=%u max_xfer=%u\n",
+		pr_info("DSA_FG_RAW_ENCODE: pages_id=%u backend=%s raw_bytes=%u compare_ops=%" PRIu64 " copy_ops=%" PRIu64 " spans=%zu inflight=%u max_xfer=%u\n",
 			xfer->pages_id,
+			hot_fg_compare_backend_name(ctx->fg_compare_backend),
 			xfer->dsa_fg_raw_payload_head - xfer->dsa_fg_raw_payload_base,
 			ctx->fg_compare_ops, ctx->fg_copy_ops, nr_spans,
-			HOT_DSA_COMPARE_INFLIGHT, max_xfer);
+			ctx->fg_compare_backend == HOT_FG_COMPARE_DSA ||
+			ctx->fg_compare_backend == HOT_FG_COMPARE_VALIDATE ?
+			HOT_DSA_COMPARE_INFLIGHT : 0, max_xfer);
+	xfree(validate_spans);
+	xfree(validate_pages);
 	xfree(spans);
 	xfree(pages);
 	return 0;
 err:
+	xfree(validate_spans);
+	xfree(validate_pages);
 	xfree(spans);
 	xfree(pages);
 	return -1;
