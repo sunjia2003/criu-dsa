@@ -56,6 +56,8 @@
 
 enum hot_fg_compare_backend {
 	HOT_FG_COMPARE_DSA = 0,
+	HOT_FG_COMPARE_MEMCMP,
+	HOT_FG_COMPARE_SCALAR64,
 	HOT_FG_COMPARE_SIMD_AVX2,
 	HOT_FG_COMPARE_SIMD_AVX512,
 	HOT_FG_COMPARE_VALIDATE,
@@ -257,6 +259,14 @@ struct hot_apply_ctx {
 	u64 profile_compare_poll_sweeps;
 	u64 profile_compare_not_ready;
 	u64 profile_compare_max_active;
+	u64 profile_memcmp_calls;
+	u64 profile_memcmp_requested_bytes;
+	u64 profile_memcmp_scalar_bytes;
+	u64 profile_scalar64_calls;
+	u64 profile_scalar64_word_ops;
+	u64 profile_scalar64_refine_bytes;
+	u64 profile_scalar64_tail_bytes;
+	u64 profile_scalar64_bytes_examined;
 	u64 profile_simd_vector_ops;
 	u64 profile_simd_bytes_examined;
 	u64 profile_prefault_spans;
@@ -1169,6 +1179,10 @@ static const char *hot_fg_compare_backend_name(enum hot_fg_compare_backend backe
 	switch (backend) {
 	case HOT_FG_COMPARE_DSA:
 		return "dsa";
+	case HOT_FG_COMPARE_MEMCMP:
+		return "memcmp";
+	case HOT_FG_COMPARE_SCALAR64:
+		return "scalar64";
 	case HOT_FG_COMPARE_SIMD_AVX2:
 		return "simd-avx2";
 	case HOT_FG_COMPARE_SIMD_AVX512:
@@ -1210,6 +1224,10 @@ static int hot_fg_select_compare_backend(struct hot_apply_ctx *ctx)
 	if (value && value[0]) {
 		if (!strcasecmp(value, "dsa"))
 			backend = HOT_FG_COMPARE_DSA;
+		else if (!strcasecmp(value, "memcmp"))
+			backend = HOT_FG_COMPARE_MEMCMP;
+		else if (!strcasecmp(value, "scalar64"))
+			backend = HOT_FG_COMPARE_SCALAR64;
 		else if (!strcasecmp(value, "simd-avx2"))
 			backend = HOT_FG_COMPARE_SIMD_AVX2;
 		else if (!strcasecmp(value, "simd-avx512"))
@@ -3584,11 +3602,16 @@ static void hot_profile_emit(struct hot_apply_ctx *ctx, int ret)
 		ctx->profile_parent_validate_us, ctx->profile_pagemap_pack_us,
 		ctx->profile_finish_us, accounted_us,
 		unaccounted_us, accounted_us > total_us ? 1 : 0);
-	pr_info("DSA_POST_THAW_PROFILE_COUNT: version=3 pages_id=%u backend=%s ret=%d raw_pages=%" PRIu64 " raw_bytes=%" PRIu64 " capture_runs=%" PRIu64 " spans=%" PRIu64 " span_pages=%" PRIu64 " max_span_pages=%" PRIu64 " compare_ops=%" PRIu64 " simd_vector_ops=%" PRIu64 " simd_bytes_examined=%" PRIu64 " enq_retries=%" PRIu64 " poll_sweeps=%" PRIu64 " not_ready=%" PRIu64 " max_active=%" PRIu64 " prefault_spans=%" PRIu64 " prefault_pages=%" PRIu64 " parent_pages=%" PRIu64 " patch_pages=%" PRIu64 " full_pages=%" PRIu64 " patch_ranges=%" PRIu64 " patch_bytes=%" PRIu64 " idx_write_calls=%" PRIu64 " idx_bytes=%" PRIu64 " dat_write_calls=%" PRIu64 " dat_writev_calls=%" PRIu64 " dat_bytes=%" PRIu64 " hot_pwrite_ops=%" PRIu64 " hot_pwrite_bytes=%" PRIu64 " hot_mprotect_ops=%" PRIu64 " hot_memcpy_bytes=%" PRIu64 " pagemap_iovs=%" PRIu64 " pagemap_input_records=%" PRIu64 " pagemap_records=%zu pagemap_merged_records=%" PRIu64 " pagemap_present_pages=%" PRIu64 " pagemap_fg_pages=%" PRIu64 " pagemap_bytes=%" PRIu64 " pagemap_flushes=%" PRIu64 "\n",
+	pr_info("DSA_POST_THAW_PROFILE_COUNT: version=3 pages_id=%u backend=%s ret=%d raw_pages=%" PRIu64 " raw_bytes=%" PRIu64 " capture_runs=%" PRIu64 " spans=%" PRIu64 " span_pages=%" PRIu64 " max_span_pages=%" PRIu64 " compare_ops=%" PRIu64 " memcmp_calls=%" PRIu64 " memcmp_requested_bytes=%" PRIu64 " memcmp_scalar_bytes=%" PRIu64 " scalar64_calls=%" PRIu64 " scalar64_word_ops=%" PRIu64 " scalar64_refine_bytes=%" PRIu64 " scalar64_tail_bytes=%" PRIu64 " scalar64_bytes_examined=%" PRIu64 " simd_vector_ops=%" PRIu64 " simd_bytes_examined=%" PRIu64 " enq_retries=%" PRIu64 " poll_sweeps=%" PRIu64 " not_ready=%" PRIu64 " max_active=%" PRIu64 " prefault_spans=%" PRIu64 " prefault_pages=%" PRIu64 " parent_pages=%" PRIu64 " patch_pages=%" PRIu64 " full_pages=%" PRIu64 " patch_ranges=%" PRIu64 " patch_bytes=%" PRIu64 " idx_write_calls=%" PRIu64 " idx_bytes=%" PRIu64 " dat_write_calls=%" PRIu64 " dat_writev_calls=%" PRIu64 " dat_bytes=%" PRIu64 " hot_pwrite_ops=%" PRIu64 " hot_pwrite_bytes=%" PRIu64 " hot_mprotect_ops=%" PRIu64 " hot_memcpy_bytes=%" PRIu64 " pagemap_iovs=%" PRIu64 " pagemap_input_records=%" PRIu64 " pagemap_records=%zu pagemap_merged_records=%" PRIu64 " pagemap_present_pages=%" PRIu64 " pagemap_fg_pages=%" PRIu64 " pagemap_bytes=%" PRIu64 " pagemap_flushes=%" PRIu64 "\n",
 		ctx->pages_id, backend, ret, ctx->profile_raw_pages, ctx->profile_raw_bytes,
 		ctx->profile_capture_runs, ctx->profile_spans,
 		ctx->profile_span_pages, ctx->profile_max_span_pages,
-		ctx->fg_compare_ops, ctx->profile_simd_vector_ops,
+		ctx->fg_compare_ops, ctx->profile_memcmp_calls,
+		ctx->profile_memcmp_requested_bytes,
+		ctx->profile_memcmp_scalar_bytes, ctx->profile_scalar64_calls,
+		ctx->profile_scalar64_word_ops, ctx->profile_scalar64_refine_bytes,
+		ctx->profile_scalar64_tail_bytes, ctx->profile_scalar64_bytes_examined,
+		ctx->profile_simd_vector_ops,
 		ctx->profile_simd_bytes_examined, ctx->profile_compare_enq_retries,
 		ctx->profile_compare_poll_sweeps, ctx->profile_compare_not_ready,
 		ctx->profile_compare_max_active, ctx->profile_prefault_spans,
@@ -4824,17 +4847,168 @@ static int hot_fg_span_record_diff(struct hot_fg_compare_span *span,
 	return hot_fg_span_finalize(span, pages, span->cursor);
 }
 
-struct hot_fg_simd_scan_stats {
+struct hot_fg_cpu_scan_stats {
+	u64 memcmp_calls;
+	u64 memcmp_requested_bytes;
+	u64 memcmp_scalar_bytes;
+	u64 scalar64_calls;
+	u64 scalar64_word_ops;
+	u64 scalar64_refine_bytes;
+	u64 scalar64_tail_bytes;
+	u64 scalar64_bytes_examined;
 	u64 vector_ops;
 	u64 bytes_examined;
 };
 
+static int (*volatile hot_fg_libc_memcmp)(const void *, const void *, size_t) = memcmp;
+
+static noinline u32 __attribute__((optimize("no-tree-vectorize")))
+hot_fg_scalar_first_diff(const unsigned char *raw,
+			 const unsigned char *parent, u32 length)
+{
+	u32 cursor;
+
+	for (cursor = 0; cursor < length; cursor++) {
+		if (raw[cursor] != parent[cursor])
+			return cursor;
+	}
+	return length;
+}
+
+static int hot_fg_memcmp_first_diff(const unsigned char *raw,
+				    const unsigned char *parent, u32 length,
+				    bool *equal, u32 *first_diff,
+				    struct hot_fg_cpu_scan_stats *stats)
+{
+	u32 diff;
+
+	if (stats) {
+		stats->memcmp_calls++;
+		stats->memcmp_requested_bytes += length;
+	}
+	if (hot_fg_libc_memcmp(raw, parent, length) == 0) {
+		*equal = true;
+		*first_diff = length;
+		return 0;
+	}
+
+	diff = hot_fg_scalar_first_diff(raw, parent, length);
+	if (diff >= length) {
+		pr_err("DSA fine-grained memcmp backend couldn't recover first difference\n");
+		return -1;
+	}
+	if (stats)
+		stats->memcmp_scalar_bytes += diff + 1;
+	*equal = false;
+	*first_diff = diff;
+	return 0;
+}
+
+static noinline int __attribute__((optimize("no-tree-vectorize", "no-tree-slp-vectorize")))
+hot_fg_scalar64_first_diff(const unsigned char *raw,
+			   const unsigned char *parent, u32 length,
+			   bool *equal, u32 *first_diff,
+			   struct hot_fg_cpu_scan_stats *stats)
+{
+	u32 cursor = 0;
+	u32 word_region = length & ~((u32)sizeof(u64) - 1);
+
+	while (length - cursor >= sizeof(u64)) {
+		u64 raw_word;
+		u64 parent_word;
+		u32 byte;
+
+		/* memcpy keeps unaligned accesses and aliasing valid.  With the
+		 * vectorizers disabled, x86-64 lowers these to ordinary GPR loads. */
+		memcpy(&raw_word, raw + cursor, sizeof(raw_word));
+		memcpy(&parent_word, parent + cursor, sizeof(parent_word));
+		if ((raw_word ^ parent_word) == 0) {
+			cursor += sizeof(u64);
+			continue;
+		}
+
+		/* Refine by address order rather than ctz so this remains correct
+		 * independently of host byte order. */
+		for (byte = 0; byte < sizeof(u64); byte++) {
+			if (raw[cursor + byte] != parent[cursor + byte]) {
+				*equal = false;
+				*first_diff = cursor + byte;
+				goto account;
+			}
+		}
+		pr_err("DSA fine-grained scalar64 backend couldn't refine unequal word\n");
+		return -1;
+	}
+
+	while (cursor < length) {
+		if (raw[cursor] != parent[cursor]) {
+			*equal = false;
+			*first_diff = cursor;
+			goto account;
+		}
+		cursor++;
+	}
+	*equal = true;
+	*first_diff = length;
+
+account:
+	/* Derive the profile geometry once per first-diff call.  Keeping all
+	 * counters out of the 8-byte loop makes profile mode low disturbance. */
+	if (stats) {
+		u64 word_ops;
+		u64 refine_bytes = 0;
+		u64 tail_bytes = 0;
+
+		if (*equal) {
+			word_ops = length / sizeof(u64);
+			tail_bytes = length - word_region;
+		} else if (*first_diff < word_region) {
+			word_ops = *first_diff / sizeof(u64) + 1;
+			refine_bytes = *first_diff % sizeof(u64) + 1;
+		} else {
+			word_ops = length / sizeof(u64);
+			tail_bytes = *first_diff - word_region + 1;
+		}
+		stats->scalar64_calls++;
+		stats->scalar64_word_ops += word_ops;
+		stats->scalar64_refine_bytes += refine_bytes;
+		stats->scalar64_tail_bytes += tail_bytes;
+		stats->scalar64_bytes_examined += word_ops * sizeof(u64) +
+			refine_bytes + tail_bytes;
+	}
+	return 0;
+}
+
 #ifdef HOT_FG_HAVE_X86_SIMD
+static void hot_fg_account_simd_scan(struct hot_fg_cpu_scan_stats *stats,
+				     u32 length, bool equal, u32 first_diff,
+				     u32 vector_bytes)
+{
+	u32 vector_region;
+	u64 vector_ops;
+	u64 tail_bytes = 0;
+
+	if (!stats)
+		return;
+	vector_region = length - length % vector_bytes;
+	if (equal) {
+		vector_ops = length / vector_bytes;
+		tail_bytes = length - vector_region;
+	} else if (first_diff < vector_region) {
+		vector_ops = first_diff / vector_bytes + 1;
+	} else {
+		vector_ops = length / vector_bytes;
+		tail_bytes = first_diff - vector_region + 1;
+	}
+	stats->vector_ops += vector_ops;
+	stats->bytes_examined += vector_ops * vector_bytes + tail_bytes;
+}
+
 static int __attribute__((target("avx2")))
 hot_fg_simd_avx2_first_diff(const unsigned char *raw,
 			    const unsigned char *parent, u32 length,
 			    bool *equal, u32 *first_diff,
-			    struct hot_fg_simd_scan_stats *stats)
+			    struct hot_fg_cpu_scan_stats *stats)
 {
 	u32 cursor = 0;
 
@@ -4843,29 +5017,26 @@ hot_fg_simd_avx2_first_diff(const unsigned char *raw,
 		__m256i parent_v = _mm256_loadu_si256((const __m256i *)(parent + cursor));
 		u32 equal_mask = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(raw_v, parent_v));
 
-		if (stats) {
-			stats->vector_ops++;
-			stats->bytes_examined += 32;
-		}
 		if (equal_mask != UINT32_MAX) {
 			*equal = false;
 			*first_diff = cursor + (u32)__builtin_ctz(~equal_mask);
-			return 0;
+			goto account;
 		}
 		cursor += 32;
 	}
 	while (cursor < length) {
-		if (stats)
-			stats->bytes_examined++;
 		if (raw[cursor] != parent[cursor]) {
 			*equal = false;
 			*first_diff = cursor;
-			return 0;
+			goto account;
 		}
 		cursor++;
 	}
 	*equal = true;
 	*first_diff = length;
+
+account:
+	hot_fg_account_simd_scan(stats, length, *equal, *first_diff, 32);
 	return 0;
 }
 
@@ -4873,7 +5044,7 @@ static int __attribute__((target("avx512f,avx512bw,avx512vl")))
 hot_fg_simd_avx512_first_diff(const unsigned char *raw,
 			      const unsigned char *parent, u32 length,
 			      bool *equal, u32 *first_diff,
-			      struct hot_fg_simd_scan_stats *stats)
+			      struct hot_fg_cpu_scan_stats *stats)
 {
 	u32 cursor = 0;
 
@@ -4882,41 +5053,45 @@ hot_fg_simd_avx512_first_diff(const unsigned char *raw,
 		__m512i parent_v = _mm512_loadu_si512((const void *)(parent + cursor));
 		__mmask64 equal_mask = _mm512_cmpeq_epi8_mask(raw_v, parent_v);
 
-		if (stats) {
-			stats->vector_ops++;
-			stats->bytes_examined += 64;
-		}
 		if (equal_mask != ~(__mmask64)0) {
 			*equal = false;
 			*first_diff = cursor + (u32)__builtin_ctzll((u64)~equal_mask);
-			return 0;
+			goto account;
 		}
 		cursor += 64;
 	}
 	while (cursor < length) {
-		if (stats)
-			stats->bytes_examined++;
 		if (raw[cursor] != parent[cursor]) {
 			*equal = false;
 			*first_diff = cursor;
-			return 0;
+			goto account;
 		}
 		cursor++;
 	}
 	*equal = true;
 	*first_diff = length;
+
+account:
+	hot_fg_account_simd_scan(stats, length, *equal, *first_diff, 64);
 	return 0;
 }
 #endif
 
-static int hot_fg_simd_first_diff(enum hot_fg_compare_backend backend,
-				  const unsigned char *raw,
-				  const unsigned char *parent, u32 length,
-				  bool *equal, u32 *first_diff,
-				  struct hot_fg_simd_scan_stats *stats)
+static int hot_fg_cpu_first_diff(enum hot_fg_compare_backend backend,
+				 const unsigned char *raw,
+				 const unsigned char *parent, u32 length,
+				 bool *equal, u32 *first_diff,
+				 struct hot_fg_cpu_scan_stats *stats)
 {
 	if (!raw || !parent || !length || !equal || !first_diff)
 		return -1;
+
+	if (backend == HOT_FG_COMPARE_MEMCMP)
+		return hot_fg_memcmp_first_diff(raw, parent, length, equal,
+					       first_diff, stats);
+	if (backend == HOT_FG_COMPARE_SCALAR64)
+		return hot_fg_scalar64_first_diff(raw, parent, length, equal,
+						 first_diff, stats);
 
 #ifdef HOT_FG_HAVE_X86_SIMD
 	if (backend == HOT_FG_COMPARE_SIMD_AVX2)
@@ -4931,17 +5106,17 @@ static int hot_fg_simd_first_diff(enum hot_fg_compare_backend backend,
 	(void)stats;
 #endif
 
-	pr_err("DSA fine-grained SIMD backend is unavailable\n");
+	pr_err("DSA fine-grained CPU compare backend is unavailable\n");
 	return -1;
 }
 
-static int hot_fg_compare_simd(struct hot_apply_ctx *ctx,
-				       struct hot_fg_raw_page *pages,
-				       struct hot_fg_compare_span *spans, size_t nr_spans,
-				       enum hot_fg_compare_backend backend,
-				       bool record_profile)
+static int hot_fg_compare_cpu(struct hot_apply_ctx *ctx,
+			      struct hot_fg_raw_page *pages,
+			      struct hot_fg_compare_span *spans, size_t nr_spans,
+			      enum hot_fg_compare_backend backend,
+			      bool record_profile)
 {
-	struct hot_fg_simd_scan_stats stats = {};
+	struct hot_fg_cpu_scan_stats stats = {};
 	size_t i;
 
 	for (i = 0; i < nr_spans; i++) {
@@ -4949,8 +5124,9 @@ static int hot_fg_compare_simd(struct hot_apply_ctx *ctx,
 
 		if (!span->parent || span->state != HOT_FG_SPAN_UNPREFAULTED ||
 		    !span->length || span->length % PAGE_SIZE) {
-			pr_err("DSA fine-grained SIMD compare has invalid span=%zu state=%u length=%u\n",
-			       i, span->state, span->length);
+			pr_err("DSA fine-grained CPU compare has invalid backend=%s span=%zu state=%u length=%u\n",
+			       hot_fg_compare_backend_name(backend), i,
+			       span->state, span->length);
 			return -1;
 		}
 		hot_dsa_prefault_range((void *)span->parent, span->length, false);
@@ -4963,10 +5139,10 @@ static int hot_fg_compare_simd(struct hot_apply_ctx *ctx,
 			bool equal;
 			u32 diff;
 
-			if (hot_fg_simd_first_diff(backend, span->raw + span->cursor,
-						   span->parent + span->cursor,
-						   span->length - span->cursor, &equal, &diff,
-						   record_profile && ctx->profile ? &stats : NULL))
+			if (hot_fg_cpu_first_diff(backend, span->raw + span->cursor,
+						  span->parent + span->cursor,
+						  span->length - span->cursor, &equal, &diff,
+						  record_profile && ctx->profile ? &stats : NULL))
 				return -1;
 			if (equal) {
 				span->cursor = span->length;
@@ -4980,13 +5156,22 @@ static int hot_fg_compare_simd(struct hot_apply_ctx *ctx,
 		if (span->cursor != span->length ||
 		    hot_fg_span_finalize(span, pages, span->length) ||
 		    span->finalized_pages != span->page_count) {
-			pr_err("DSA fine-grained SIMD compare span ended with unfinished pages\n");
+			pr_err("DSA fine-grained CPU compare backend=%s span ended with unfinished pages\n",
+			       hot_fg_compare_backend_name(backend));
 			return -1;
 		}
 		span->state = HOT_FG_SPAN_DONE;
 	}
 
 	if (record_profile && ctx->profile) {
+		ctx->profile_memcmp_calls += stats.memcmp_calls;
+		ctx->profile_memcmp_requested_bytes += stats.memcmp_requested_bytes;
+		ctx->profile_memcmp_scalar_bytes += stats.memcmp_scalar_bytes;
+		ctx->profile_scalar64_calls += stats.scalar64_calls;
+		ctx->profile_scalar64_word_ops += stats.scalar64_word_ops;
+		ctx->profile_scalar64_refine_bytes += stats.scalar64_refine_bytes;
+		ctx->profile_scalar64_tail_bytes += stats.scalar64_tail_bytes;
+		ctx->profile_scalar64_bytes_examined += stats.scalar64_bytes_examined;
 		ctx->profile_simd_vector_ops += stats.vector_ops;
 		ctx->profile_simd_bytes_examined += stats.bytes_examined;
 	}
@@ -5496,16 +5681,18 @@ static int hot_fg_encode_raw_wavefront(struct page_xfer *xfer,
 			if (hot_fg_compare_wavefront(ctx, pages, spans, nr_spans))
 				goto err;
 			break;
+		case HOT_FG_COMPARE_MEMCMP:
+		case HOT_FG_COMPARE_SCALAR64:
 		case HOT_FG_COMPARE_SIMD_AVX2:
 		case HOT_FG_COMPARE_SIMD_AVX512:
-			if (hot_fg_compare_simd(ctx, pages, spans, nr_spans,
-						ctx->fg_compare_backend, true))
+			if (hot_fg_compare_cpu(ctx, pages, spans, nr_spans,
+					       ctx->fg_compare_backend, true))
 				goto err;
 			break;
 		case HOT_FG_COMPARE_VALIDATE:
 			if (hot_fg_compare_wavefront(ctx, pages, spans, nr_spans) ||
-			    hot_fg_compare_simd(ctx, validate_pages, validate_spans, nr_spans,
-						HOT_FG_COMPARE_SIMD_AVX512, false) ||
+			    hot_fg_compare_cpu(ctx, validate_pages, validate_spans, nr_spans,
+					       HOT_FG_COMPARE_SIMD_AVX512, false) ||
 			    hot_fg_validate_compare_metadata(pages, validate_pages, nr,
 						     spans, validate_spans, nr_spans))
 				goto err;
