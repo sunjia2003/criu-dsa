@@ -48,6 +48,7 @@ static struct dsa_hw_desc dsa_copy_hw_descs[DSA_DUMP_BATCH_SIZE] __attribute__((
 static volatile struct dsa_completion_record dsa_copy_comps[DSA_DUMP_BATCH_SIZE] __attribute__((aligned(32)));
 static u32 dsa_copy_lpt_order[DSA_DUMP_BATCH_SIZE];
 static u32 dsa_copy_submitted_idx[DSA_DUMP_BATCH_SIZE];
+static u32 dsa_copy_wq_idx[DSA_DUMP_BATCH_SIZE];
 
 #ifndef SPLICE_F_GIFT
 #define SPLICE_F_GIFT 0x08
@@ -81,6 +82,12 @@ static u32 dsa_copy_submitted_idx[DSA_DUMP_BATCH_SIZE];
 #define DSA_MAX_ENQ_RETRY   1000000U
 #define HUGEPAGE_2MB_SIZE   (2UL * 1024UL * 1024UL)
 #define DSA_DESC_PER_WQ     128U
+#define DSA_PAGE_SIZE       4096U
+#define DSA_FAULT_ADDR_MASKED 0x1U
+#define DSA_FAULT_OPERAND_SHIFT 1U
+#define DSA_FAULT_OPERAND_MASK 0x7U
+#define DSA_FAULT_OPERAND_SRC 1U
+#define DSA_FAULT_OPERAND_DST 3U
 
 static inline unsigned long dsa_align_up(unsigned long x, unsigned long align)
 {
@@ -139,6 +146,22 @@ static inline void dsa_prefault_range(uint8_t *buf, uint32_t len)
 		sink ^= buf[i];
 
 	(void)sink;
+}
+
+static inline void dsa_touch_read(uint8_t *addr)
+{
+	volatile uint8_t value;
+
+	value = *(volatile uint8_t *)addr;
+	(void)value;
+}
+
+static inline void dsa_touch_write(uint8_t *addr)
+{
+	volatile uint8_t *target = (volatile uint8_t *)addr;
+	uint8_t value = *target;
+
+	*target = value;
 }
 
 static inline u64 dsa_now_us(void)
@@ -224,6 +247,41 @@ static inline void dsa_atomic_store_u32(volatile u32 *p, u32 v)
 	__atomic_store_n(p, v, __ATOMIC_RELEASE);
 }
 
+static int dsa_submit_copy_desc(struct parasite_dsa_dump_pages_args *a,
+				struct dsa_hw_desc *desc, uint32_t wq_idx,
+				int *use_portal, unsigned long *portal_mask,
+				unsigned long *portal_offset)
+{
+	uint32_t retry_count;
+	u64 submit_begin;
+	u64 submit_end;
+	int ret = 0;
+
+	submit_begin = dsa_now_us();
+	if (!use_portal[wq_idx]) {
+		ret = -EOPNOTSUPP;
+		goto out;
+	}
+
+	for (retry_count = 0; retry_count < DSA_MAX_ENQ_RETRY; retry_count++) {
+		unsigned long off = ((unsigned long)portal_offset[wq_idx]++ << 6) & 0xfffUL;
+		void *slot = (void *)(portal_mask[wq_idx] | off);
+
+		if (dsa_enqcmd_local(slot, desc) == 0) {
+			a->submit_enqcmd++;
+			goto out;
+		}
+		dsa_cpu_relax();
+	}
+
+	ret = -EAGAIN;
+out:
+	submit_end = dsa_now_us();
+	if (submit_end > submit_begin)
+		a->submit_us += submit_end - submit_begin;
+	return ret;
+}
+
 static int dsa_copy_descs(struct parasite_dsa_dump_pages_args *a,
 			  uint8_t *shared_buf,
 			  struct dsa_dump_descriptor *descriptors,
@@ -240,6 +298,7 @@ static int dsa_copy_descs(struct parasite_dsa_dump_pages_args *a,
 	volatile struct dsa_completion_record *dsa_comps = dsa_copy_comps;
 	uint32_t *lpt_order = dsa_copy_lpt_order;
 	uint32_t *submitted_idx = dsa_copy_submitted_idx;
+	uint32_t *submitted_wq_idx = dsa_copy_wq_idx;
 	const uint32_t max_timeout_retries = 1000000;
 	uint32_t desc_base = 0;
 	uint32_t buf_write_offset = data_off;
@@ -265,9 +324,11 @@ static int dsa_copy_descs(struct parasite_dsa_dump_pages_args *a,
 	while (desc_base < nr_descriptors) {
 		uint32_t remaining = nr_descriptors - desc_base;
 		uint32_t window = a->wq_count * DSA_DESC_PER_WQ;
+		u64 window_bytes = 0;
 		uint32_t submitted = 0;
 		uint32_t completed = 0;
 		uint32_t order_cnt;
+		int window_failed = 0;
 
 		if (window > DSA_DUMP_BATCH_SIZE)
 			window = DSA_DUMP_BATCH_SIZE;
@@ -275,12 +336,61 @@ static int dsa_copy_descs(struct parasite_dsa_dump_pages_args *a,
 			window = remaining;
 
 		for (i = 0; i < window; i++) {
+			struct dsa_dump_descriptor *desc =
+				&descriptors[desc_base + i];
+
+			if (!desc->copy_len ||
+			    (desc->src_addr & (DSA_PAGE_SIZE - 1U)) ||
+			    (desc->copy_len & (DSA_PAGE_SIZE - 1U))) {
+				a->failed_idx = desc_base + i;
+				a->op_ret = -EINVAL;
+				return -1;
+			}
+			window_bytes += desc->copy_len;
+			if (window_bytes > data_bytes - total_size ||
+			    window_bytes > a->shared_buf_size - buf_write_offset) {
+				a->failed_idx = desc_base + i;
+				a->op_ret = -ENOSPC;
+				return -1;
+			}
+		}
+
+		/*
+		 * A generation without a direct parent is a dense full capture.
+		 * Populate only the source pages represented by this window's
+		 * capture runs. Later generations keep this loop disabled and
+		 * recover only addresses reported by PAGE_FAULT_NOBOF.
+		 */
+		if (a->raw_full_prefault) {
+			u64 prefault_begin = 0;
+			u64 prefault_end = 0;
+
+			if (a->profile_enabled)
+				prefault_begin = dsa_now_us();
+
+			for (i = 0; i < window; i++) {
+				struct dsa_dump_descriptor *desc =
+					&descriptors[desc_base + i];
+
+				dsa_prefault_range(
+					(uint8_t *)(unsigned long)desc->src_addr,
+					desc->copy_len);
+				a->raw_prefault_pages +=
+					desc->copy_len / DSA_PAGE_SIZE;
+			}
+
+			if (a->profile_enabled) {
+				prefault_end = dsa_now_us();
+				if (prefault_end > prefault_begin)
+					a->prefault_us += prefault_end - prefault_begin;
+			}
+		}
+
+		for (i = 0; i < window; i++) {
 			struct dsa_dump_descriptor *desc = &descriptors[desc_base + i];
 			uint8_t *src = (uint8_t *)(unsigned long)desc->src_addr;
 			uint32_t copy_len = desc->copy_len;
 			uint8_t *dst = shared_buf + buf_write_offset;
-			u64 prefault_begin;
-			u64 prefault_end;
 
 			if (buf_write_offset + copy_len > a->shared_buf_size ||
 			    total_size + copy_len > data_bytes) {
@@ -291,15 +401,9 @@ static int dsa_copy_descs(struct parasite_dsa_dump_pages_args *a,
 				return -1;
 			}
 
-			prefault_begin = dsa_now_us();
-			dsa_prefault_range(src, copy_len);
-			prefault_end = dsa_now_us();
-			if (prefault_end > prefault_begin)
-				a->prefault_us += prefault_end - prefault_begin;
-
 			dsa_memzero(&dsa_descs[i], sizeof(struct dsa_hw_desc));
 			dsa_descs[i].opcode = DSA_OPCODE_MEMMOVE;
-			dsa_descs[i].flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR | IDXD_OP_FLAG_BOF;
+			dsa_descs[i].flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
 			dsa_descs[i].src_addr = (uint64_t)(unsigned long)src;
 			dsa_descs[i].dst_addr = (uint64_t)(unsigned long)dst;
 			dsa_descs[i].xfer_size = copy_len;
@@ -339,13 +443,10 @@ static int dsa_copy_descs(struct parasite_dsa_dump_pages_args *a,
 
 		for (k = 0; k < order_cnt; k++) {
 			uint32_t desc_idx = lpt_order[k];
-			uint32_t retry_count = 0;
 			uint32_t wq_sel;
 			uint32_t wq_idx;
-			u64 submit_begin;
-			u64 submit_end;
+			int submit_ret;
 
-			submit_begin = dsa_now_us();
 			if (a->wq_policy == DSA_WQ_POLICY_RR) {
 				wq_sel = k % active_wq_count;
 			} else {
@@ -357,40 +458,20 @@ static int dsa_copy_descs(struct parasite_dsa_dump_pages_args *a,
 			}
 
 			wq_idx = active_wq_idx[wq_sel];
-			if (!use_portal[wq_idx]) {
+			submit_ret = dsa_submit_copy_desc(a, &dsa_descs[desc_idx],
+							  wq_idx, use_portal,
+							  portal_mask, portal_offset);
+			if (submit_ret) {
 				a->failed_idx = desc_base + desc_idx;
-				a->op_ret = -EOPNOTSUPP;
-				submit_end = dsa_now_us();
-				if (submit_end > submit_begin)
-					a->submit_us += submit_end - submit_begin;
+				a->op_ret = submit_ret;
+				window_failed = 1;
 				goto poll_completed;
 			}
 
-			for (retry_count = 0; retry_count < DSA_MAX_ENQ_RETRY; retry_count++) {
-				unsigned long off = ((unsigned long)portal_offset[wq_idx]++ << 6) & 0xfffUL;
-				void *slot = (void *)(portal_mask[wq_idx] | off);
-
-				if (dsa_enqcmd_local(slot, &dsa_descs[desc_idx]) == 0) {
-					submitted_idx[submitted++] = desc_idx;
-					a->submit_enqcmd++;
-					active_wq_load[wq_sel] +=
-						descriptors[desc_base + desc_idx].copy_len;
-					break;
-				}
-				dsa_cpu_relax();
-			}
-			if (retry_count == DSA_MAX_ENQ_RETRY) {
-				a->failed_idx = desc_base + desc_idx;
-				a->op_ret = -EAGAIN;
-				submit_end = dsa_now_us();
-				if (submit_end > submit_begin)
-					a->submit_us += submit_end - submit_begin;
-				goto poll_completed;
-			}
-
-			submit_end = dsa_now_us();
-			if (submit_end > submit_begin)
-				a->submit_us += submit_end - submit_begin;
+			submitted_idx[submitted++] = desc_idx;
+			submitted_wq_idx[desc_idx] = wq_idx;
+			active_wq_load[wq_sel] +=
+				descriptors[desc_base + desc_idx].copy_len;
 		}
 
 poll_completed:
@@ -401,23 +482,135 @@ poll_completed:
 		for (k = 0; k < submitted; k++) {
 			uint32_t desc_idx = submitted_idx[k];
 			uint32_t timeout_count = 0;
+			uint32_t fault_count = 0;
+			uint32_t max_fault_count;
+			uint32_t last_fault_operand = ~0U;
+			uint64_t last_fault_page = ~0ULL;
+			uint64_t last_fault_progress = ~0ULL;
+			uint64_t logical_progress = 0;
+			uint32_t original_len = dsa_descs[desc_idx].xfer_size;
 			u64 poll_begin;
 			u64 poll_end;
 			int poll_failed = 0;
 
+			max_fault_count =
+				2U * (((original_len - 1U) / DSA_PAGE_SIZE) + 1U) + 2U;
 			poll_begin = dsa_now_us();
 			while (1) {
 				uint8_t comp_status = dsa_comps[desc_idx].status;
 				uint8_t comp_code = (uint8_t)DSA_COMP_STATUS(comp_status);
 
 				if (comp_status != 0 && comp_code != DSA_COMP_NONE) {
-					a->completed_count++;
 					if (comp_code == DSA_COMP_SUCCESS || comp_code == DSA_COMP_SUCCESS_PRED) {
+						a->completed_count++;
 						completed++;
+					} else if (comp_code == DSA_COMP_PAGE_FAULT_NOBOF &&
+						   !window_failed) {
+						uint8_t fault_info = dsa_comps[desc_idx].fault_info;
+						uint32_t fault_operand =
+							(fault_info >> DSA_FAULT_OPERAND_SHIFT) &
+							DSA_FAULT_OPERAND_MASK;
+						uint32_t partial = dsa_comps[desc_idx].bytes_completed;
+						uint64_t fault_addr = dsa_comps[desc_idx].fault_addr;
+						uint64_t operand_addr;
+						uint64_t expected_addr;
+						uint64_t fault_page;
+						uint64_t expected_page;
+						u64 touch_begin;
+						u64 touch_end;
+						u64 resubmit_begin;
+						u64 resubmit_end;
+						int submit_ret;
+
+						if ((fault_info & DSA_FAULT_ADDR_MASKED) ||
+						    (fault_operand != DSA_FAULT_OPERAND_SRC &&
+						     fault_operand != DSA_FAULT_OPERAND_DST) ||
+						    partial >= dsa_descs[desc_idx].xfer_size) {
+							a->failed_idx = desc_base + desc_idx;
+							a->failed_status = comp_code;
+							a->op_ret = -EPROTO;
+							poll_failed = 1;
+							break;
+						}
+
+						operand_addr =
+							fault_operand == DSA_FAULT_OPERAND_SRC ?
+							dsa_descs[desc_idx].src_addr :
+							dsa_descs[desc_idx].dst_addr;
+						expected_addr = operand_addr + partial;
+						fault_page =
+							fault_addr & ~((uint64_t)DSA_PAGE_SIZE - 1ULL);
+						expected_page =
+							expected_addr & ~((uint64_t)DSA_PAGE_SIZE - 1ULL);
+						if (fault_page != expected_page ||
+						    fault_count++ >= max_fault_count ||
+						    (fault_operand == last_fault_operand &&
+						     fault_page == last_fault_page &&
+						     logical_progress + partial ==
+							     last_fault_progress)) {
+							a->failed_idx = desc_base + desc_idx;
+							a->failed_status = comp_code;
+							a->op_ret = -EPROTO;
+							poll_failed = 1;
+							break;
+						}
+
+						last_fault_operand = fault_operand;
+						last_fault_page = fault_page;
+						last_fault_progress = logical_progress + partial;
+						logical_progress += partial;
+						a->raw_faults++;
+						a->raw_fault_partial_bytes += partial;
+						if (fault_operand == DSA_FAULT_OPERAND_SRC)
+							a->raw_fault_source++;
+						else
+							a->raw_fault_destination++;
+
+						dsa_descs[desc_idx].src_addr += partial;
+						dsa_descs[desc_idx].dst_addr += partial;
+						dsa_descs[desc_idx].xfer_size -= partial;
+
+						touch_begin = dsa_now_us();
+						if (touch_begin > poll_begin)
+							a->poll_us += touch_begin - poll_begin;
+						if (fault_operand == DSA_FAULT_OPERAND_SRC)
+							dsa_touch_read((uint8_t *)(unsigned long)
+								       expected_addr);
+						else
+							dsa_touch_write((uint8_t *)(unsigned long)
+									expected_addr);
+						touch_end = dsa_now_us();
+						if (touch_end > touch_begin)
+							a->raw_fault_touch_us += touch_end - touch_begin;
+
+						dsa_memzero((void *)&dsa_comps[desc_idx],
+							    sizeof(struct dsa_completion_record));
+						resubmit_begin = dsa_now_us();
+						submit_ret = dsa_submit_copy_desc(
+							a, &dsa_descs[desc_idx],
+							submitted_wq_idx[desc_idx], use_portal,
+							portal_mask, portal_offset);
+						resubmit_end = dsa_now_us();
+						if (resubmit_end > resubmit_begin)
+							a->raw_fault_resubmit_us +=
+								resubmit_end - resubmit_begin;
+						poll_begin = resubmit_end;
+						if (submit_ret) {
+							a->failed_idx = desc_base + desc_idx;
+							a->failed_status = comp_code;
+							a->op_ret = submit_ret;
+							poll_failed = 1;
+							break;
+						}
+						a->raw_fault_resubmits++;
+						timeout_count = 0;
+						continue;
 					} else {
-						a->failed_idx = desc_base + desc_idx;
-						a->failed_status = comp_code;
-						a->op_ret = -(int)comp_code;
+						if (!window_failed) {
+							a->failed_idx = desc_base + desc_idx;
+							a->failed_status = comp_code;
+							a->op_ret = -(int)comp_code;
+						}
 						poll_failed = 1;
 					}
 					break;
@@ -437,9 +630,14 @@ poll_completed:
 				a->poll_us += poll_end - poll_begin;
 
 			if (poll_failed) {
-				return -1;
+				window_failed = 1;
+				if (a->op_ret == -ETIMEDOUT)
+					return -1;
 			}
 		}
+
+		if (window_failed)
+			return -1;
 
 		if (completed != submitted) {
 			return -1;
@@ -1261,6 +1459,14 @@ static int parasite_dsa_dump_pages(struct parasite_dsa_dump_pages_args *a)
 	a->fg_compare_ops = 0;
 	a->fg_copy_ops = 0;
 	a->map_populate_fallbacks = 0;
+	a->raw_faults = 0;
+	a->raw_fault_source = 0;
+	a->raw_fault_destination = 0;
+	a->raw_fault_resubmits = 0;
+	a->raw_prefault_pages = 0;
+	a->raw_fault_partial_bytes = 0;
+	a->raw_fault_touch_us = 0;
+	a->raw_fault_resubmit_us = 0;
 	a->prefault_us = 0;
 	a->submit_us = 0;
 	a->poll_us = 0;
@@ -1737,6 +1943,14 @@ out_cleanup:
 		stream_hdr->result_submit_write = a->submit_write;
 		stream_hdr->result_fg_compare_ops = a->fg_compare_ops;
 		stream_hdr->result_fg_copy_ops = a->fg_copy_ops;
+		stream_hdr->result_raw_faults = a->raw_faults;
+		stream_hdr->result_raw_fault_source = a->raw_fault_source;
+		stream_hdr->result_raw_fault_destination = a->raw_fault_destination;
+		stream_hdr->result_raw_fault_resubmits = a->raw_fault_resubmits;
+		stream_hdr->result_raw_prefault_pages = a->raw_prefault_pages;
+		stream_hdr->result_raw_fault_partial_bytes = a->raw_fault_partial_bytes;
+		stream_hdr->result_raw_fault_touch_us = a->raw_fault_touch_us;
+		stream_hdr->result_raw_fault_resubmit_us = a->raw_fault_resubmit_us;
 		__atomic_thread_fence(__ATOMIC_RELEASE);
 	}
 	return 0;

@@ -418,6 +418,14 @@ struct parasite_dsa_stream_hdr {
 	u32 result_submit_write;
 	u32 result_fg_compare_ops;
 	u32 result_fg_copy_ops;
+	u32 result_raw_faults;
+	u32 result_raw_fault_source;
+	u32 result_raw_fault_destination;
+	u32 result_raw_fault_resubmits;
+	u64 result_raw_prefault_pages;
+	u64 result_raw_fault_partial_bytes;
+	u64 result_raw_fault_touch_us;
+	u64 result_raw_fault_resubmit_us;
 };
 
 struct parasite_dsa_dump_pages_args {
@@ -435,6 +443,8 @@ struct parasite_dsa_dump_pages_args {
 	u32 wq_policy;		/* enum dsa_wq_policy, default LPT */
 	u32 fg_enabled;		/* Fine-grained DSA compare/copy mode */
 	u32 fg_old_seg_count;	/* Number of old segment FDs sent over RPC */
+	u32 raw_full_prefault;	/* Initial full generation: prefault every capture source page */
+	u32 profile_enabled;	/* Collect optional aggregate timing */
 	char wq_paths[DSA_DUMP_MAX_WQ][64];  /* WQ paths or empty if using FD */
 
 	/* Output from PARASITE */
@@ -449,6 +459,14 @@ struct parasite_dsa_dump_pages_args {
 	u32 fg_compare_ops;	/* Number of fine-grained compare ops */
 	u32 fg_copy_ops;	/* Number of fine-grained memmove ops */
 	u32 map_populate_fallbacks;	/* MAP_POPULATE -> MAP_SHARED fallbacks */
+	u32 raw_faults;	/* Recoverable raw MEMMOVE page faults */
+	u32 raw_fault_source;	/* Raw source operand page faults */
+	u32 raw_fault_destination;	/* Raw destination operand page faults */
+	u32 raw_fault_resubmits;	/* Remaining-suffix MEMMOVE submissions */
+	u64 raw_prefault_pages;	/* Source pages touched by initial-full prefault */
+	u64 raw_fault_partial_bytes;	/* Prefix bytes committed before faults */
+	u64 raw_fault_touch_us;	/* Time spent touching exact fault pages */
+	u64 raw_fault_resubmit_us;	/* Time spent resubmitting fault suffixes */
 	u64 prefault_us;	/* Total time spent in source prefault for this batch */
 	u64 submit_us;	/* Total time spent in DSA submit for this batch */
 	u64 poll_us;	/* Total time spent in DSA completion poll for this batch */

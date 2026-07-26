@@ -63,6 +63,10 @@
 #define HOT_FG_OUTPUT_LOGICAL_BYTES (2U * 1024U * 1024U)
 #define HOT_FG_OUTPUT_WRITE_BYTES (64U * 1024U)
 
+#ifndef MADV_POPULATE_READ
+#define MADV_POPULATE_READ 22
+#endif
+
 enum hot_fg_compare_backend {
 	HOT_FG_COMPARE_DSA = 0,
 	HOT_FG_COMPARE_MEMCMP,
@@ -6083,6 +6087,34 @@ static int hot_fg_cpu_first_diff(enum hot_fg_compare_backend backend,
 	return -1;
 }
 
+static int hot_fg_prefault_parent_span(const struct hot_fg_compare_span *span,
+				       size_t span_idx, const char *stage)
+{
+	if (!span || !span->parent || !span->length ||
+	    ((unsigned long)span->parent & (PAGE_SIZE - 1)) ||
+	    span->length % PAGE_SIZE) {
+		pr_err("DSA fine-grained parent prefault invalid stage=%s span=%zu parent=%p length=%u\n",
+		       stage, span_idx, span ? span->parent : NULL,
+		       span ? span->length : 0);
+		return -1;
+	}
+
+	/*
+	 * Populate only the exact compare span.  The hot parent is already a
+	 * resident tmpfs-backed, read-only MAP_SHARED mapping; this establishes
+	 * readable PTEs synchronously without the post-fault user load performed
+	 * by the old byte-per-page loop.  A failed populate must not submit DSA
+	 * against a partially prepared span or silently change fault semantics.
+	 */
+	if (madvise((void *)span->parent, span->length, MADV_POPULATE_READ)) {
+		pr_perror("DSA fine-grained parent MADV_POPULATE_READ failed stage=%s span=%zu parent=%p length=%u",
+			  stage, span_idx, span->parent, span->length);
+		return -1;
+	}
+
+	return 0;
+}
+
 static int hot_fg_prefault_all(struct hot_apply_ctx *ctx,
 			       struct hot_fg_compare_span *spans, size_t nr_spans)
 {
@@ -6097,7 +6129,8 @@ static int hot_fg_prefault_all(struct hot_apply_ctx *ctx,
 			       i, span->state, span->length);
 			return -1;
 		}
-		hot_dsa_prefault_range((void *)span->parent, span->length, false);
+		if (hot_fg_prefault_parent_span(span, i, "breakdown"))
+			return -1;
 		span->state = HOT_FG_SPAN_READY;
 		if (ctx->profile) {
 			ctx->profile_prefault_spans++;
@@ -6111,7 +6144,7 @@ static int hot_fg_compare_cpu(struct hot_apply_ctx *ctx,
 			      struct hot_fg_raw_page *pages,
 			      struct hot_fg_compare_span *spans, size_t nr_spans,
 			      enum hot_fg_compare_backend backend,
-			      bool record_profile)
+			      bool record_profile, bool parent_prepared)
 {
 	struct hot_fg_cpu_scan_stats stats = {};
 	size_t i;
@@ -6127,8 +6160,9 @@ static int hot_fg_compare_cpu(struct hot_apply_ctx *ctx,
 			       span->state, span->length);
 			return -1;
 		}
-		if (span->state == HOT_FG_SPAN_UNPREFAULTED) {
-			hot_dsa_prefault_range((void *)span->parent, span->length, false);
+		if (span->state == HOT_FG_SPAN_UNPREFAULTED && !parent_prepared) {
+			if (hot_fg_prefault_parent_span(span, i, "cpu-compare"))
+				return -1;
 			if (record_profile && ctx->profile) {
 				ctx->profile_prefault_spans++;
 				ctx->profile_prefault_pages += span->length / PAGE_SIZE;
@@ -6232,7 +6266,8 @@ static int hot_fg_wavefront_prefault(struct hot_apply_ctx *ctx,
 			       span->state, span_idx);
 			return -1;
 		}
-		hot_dsa_prefault_range((void *)span->parent, span->length, false);
+		if (hot_fg_prefault_parent_span(span, span_idx, "dsa-wavefront"))
+			return -1;
 		if (ctx->profile) {
 			ctx->profile_prefault_spans++;
 			ctx->profile_prefault_pages += span->length / PAGE_SIZE;
@@ -7182,7 +7217,7 @@ static int hot_fg_encode_raw_wavefront(struct page_xfer *xfer,
 		case HOT_FG_COMPARE_SIMD_AVX2:
 		case HOT_FG_COMPARE_SIMD_AVX512:
 			if (hot_fg_compare_cpu(ctx, pages, spans, nr_spans,
-					       ctx->fg_compare_backend, true))
+					       ctx->fg_compare_backend, true, false))
 				goto err;
 			break;
 		case HOT_FG_COMPARE_HYBRID_DEMAND:
@@ -7192,7 +7227,7 @@ static int hot_fg_encode_raw_wavefront(struct page_xfer *xfer,
 		case HOT_FG_COMPARE_VALIDATE:
 			if (hot_fg_compare_wavefront(ctx, pages, spans, nr_spans) ||
 			    hot_fg_compare_cpu(ctx, validate_pages, validate_spans, nr_spans,
-					       HOT_FG_COMPARE_SIMD_AVX512, false) ||
+					       HOT_FG_COMPARE_SIMD_AVX512, false, true) ||
 			    hot_fg_validate_compare_metadata(pages, validate_pages, nr,
 						     spans, validate_spans, nr_spans))
 				goto err;

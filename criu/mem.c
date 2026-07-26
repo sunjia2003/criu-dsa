@@ -1967,6 +1967,7 @@ struct dsa_desc_scan_ctx {
 	u64 stream_bytes;
 	u64 stream_descs;
 	bool fine_grained;
+	bool raw_full_prefault;
 	u32 fg_record_stride;
 	struct dsa_fg_descriptor fg_descs[DSA_STREAM_SLOT_DESC_CAP];
 	u64 fg_pages;
@@ -2187,6 +2188,8 @@ static int dsa_stream_layout_init(struct dsa_desc_scan_ctx *sc)
 	sc->rpc_args.wq_policy = DSA_WQ_POLICY_LPT;
 	sc->rpc_args.fg_enabled = sc->dsa_ctx->fine_grained ? 1 : 0;
 	sc->rpc_args.fg_old_seg_count = sc->dsa_ctx->fg_old_seg_count;
+	sc->rpc_args.raw_full_prefault = sc->raw_full_prefault ? 1 : 0;
+	sc->rpc_args.profile_enabled = sc->scan_profile ? 1 : 0;
 
 	for (j = 0; j < (unsigned int)sc->dsa_ctx->wq_count; j++) {
 		size_t path_len;
@@ -2274,6 +2277,20 @@ static int dsa_stream_join_rpc(struct dsa_desc_scan_ctx *sc)
 		sc->rpc_args.submit_write = sc->stream_hdr->result_submit_write;
 		sc->rpc_args.fg_compare_ops = sc->stream_hdr->result_fg_compare_ops;
 		sc->rpc_args.fg_copy_ops = sc->stream_hdr->result_fg_copy_ops;
+		sc->rpc_args.raw_faults = sc->stream_hdr->result_raw_faults;
+		sc->rpc_args.raw_fault_source = sc->stream_hdr->result_raw_fault_source;
+		sc->rpc_args.raw_fault_destination =
+			sc->stream_hdr->result_raw_fault_destination;
+		sc->rpc_args.raw_fault_resubmits =
+			sc->stream_hdr->result_raw_fault_resubmits;
+		sc->rpc_args.raw_prefault_pages =
+			sc->stream_hdr->result_raw_prefault_pages;
+		sc->rpc_args.raw_fault_partial_bytes =
+			sc->stream_hdr->result_raw_fault_partial_bytes;
+		sc->rpc_args.raw_fault_touch_us =
+			sc->stream_hdr->result_raw_fault_touch_us;
+		sc->rpc_args.raw_fault_resubmit_us =
+			sc->stream_hdr->result_raw_fault_resubmit_us;
 	}
 	dsa_stream_restore_parasite_args(sc);
 
@@ -2722,20 +2739,30 @@ static int dsa_stream_finish(struct dsa_desc_scan_ctx *sc)
 			(unsigned long long)sc->rpc_args.cleanup_close_us,
 			(unsigned long long)sc->rpc_args.setup_shared_us);
 	if (sc->scan_profile)
-		pr_info("DSA_SCAN_PROFILE: mode=streaming payload_bytes=%llu desc_count=%llu stream_flush_count=%u producer_wait_slot_us=%llu stream_finish_wait_us=%llu parasite_prefault_us=%llu parasite_submit_us=%llu parasite_poll_us=%llu parasite_completed_count=%u parasite_submit_enqcmd=%u parasite_submit_write=%u parasite_fg_compare_ops=%u parasite_fg_copy_ops=%u\n",
+		pr_info("DSA_SCAN_PROFILE: mode=streaming raw_capture_mode=%s payload_bytes=%llu desc_count=%llu stream_flush_count=%u producer_wait_slot_us=%llu stream_finish_wait_us=%llu parasite_prefault_us=%llu raw_prefault_pages=%llu parasite_submit_us=%llu parasite_poll_us=%llu parasite_completed_count=%u parasite_submit_enqcmd=%u parasite_submit_write=%u parasite_fg_compare_ops=%u parasite_fg_copy_ops=%u raw_faults=%u raw_fault_source=%u raw_fault_destination=%u raw_fault_resubmits=%u raw_fault_partial_bytes=%llu raw_fault_touch_us=%llu raw_fault_resubmit_us=%llu\n",
+			sc->rpc_args.raw_full_prefault ?
+				"initial-full-prefault" : "incremental-exact-touch",
 			(unsigned long long)sc->stream_bytes,
 			(unsigned long long)sc->stream_descs,
 			sc->produced_slots,
 			(unsigned long long)sc->producer_wait_slot_us,
 			(unsigned long long)sc->finish_wait_us,
 			(unsigned long long)sc->rpc_args.prefault_us,
+			(unsigned long long)sc->rpc_args.raw_prefault_pages,
 			(unsigned long long)sc->rpc_args.submit_us,
 			(unsigned long long)sc->rpc_args.poll_us,
 			sc->rpc_args.completed_count,
 			sc->rpc_args.submit_enqcmd,
 			sc->rpc_args.submit_write,
 			sc->rpc_args.fg_compare_ops,
-			sc->rpc_args.fg_copy_ops);
+			sc->rpc_args.fg_copy_ops,
+			sc->rpc_args.raw_faults,
+			sc->rpc_args.raw_fault_source,
+			sc->rpc_args.raw_fault_destination,
+			sc->rpc_args.raw_fault_resubmits,
+			(unsigned long long)sc->rpc_args.raw_fault_partial_bytes,
+			(unsigned long long)sc->rpc_args.raw_fault_touch_us,
+			(unsigned long long)sc->rpc_args.raw_fault_resubmit_us);
 	if (sc->scan_profile)
 		{
 			u64 flush_nonwait_us = sc->flush_slot_us >= sc->producer_wait_slot_us ?
@@ -2837,6 +2864,8 @@ static int dsa_legacy_single_rpc_layout_init(struct dsa_desc_scan_ctx *sc)
 	sc->rpc_args.use_shared_buf_fd = !sc->dsa_ctx->shared_fds_sent;
 	sc->rpc_args.use_wq_fd = 0;
 	sc->rpc_args.wq_policy = DSA_WQ_POLICY_LPT;
+	sc->rpc_args.raw_full_prefault = sc->raw_full_prefault ? 1 : 0;
+	sc->rpc_args.profile_enabled = sc->scan_profile ? 1 : 0;
 
 	for (j = 0; j < (unsigned int)sc->dsa_ctx->wq_count; j++) {
 		size_t path_len;
@@ -2956,15 +2985,25 @@ static int dsa_legacy_single_rpc_finish(struct dsa_desc_scan_ctx *sc)
 			(unsigned long long)sc->rpc_args.cleanup_close_us,
 			(unsigned long long)sc->rpc_args.setup_shared_us);
 	if (sc->scan_profile)
-		pr_info("DSA_SCAN_PROFILE: mode=legacy_single_rpc payload_bytes=%llu desc_count=%u stream_flush_count=1 producer_wait_slot_us=0 stream_finish_wait_us=0 parasite_prefault_us=%llu parasite_submit_us=%llu parasite_poll_us=%llu parasite_completed_count=%u parasite_submit_enqcmd=%u parasite_submit_write=%u\n",
+		pr_info("DSA_SCAN_PROFILE: mode=legacy_single_rpc raw_capture_mode=%s payload_bytes=%llu desc_count=%u stream_flush_count=1 producer_wait_slot_us=0 stream_finish_wait_us=0 parasite_prefault_us=%llu raw_prefault_pages=%llu parasite_submit_us=%llu parasite_poll_us=%llu parasite_completed_count=%u parasite_submit_enqcmd=%u parasite_submit_write=%u raw_faults=%u raw_fault_source=%u raw_fault_destination=%u raw_fault_resubmits=%u raw_fault_partial_bytes=%llu raw_fault_touch_us=%llu raw_fault_resubmit_us=%llu\n",
+			sc->rpc_args.raw_full_prefault ?
+				"initial-full-prefault" : "incremental-exact-touch",
 			(unsigned long long)sc->stream_bytes,
 			sc->legacy_desc_count,
 			(unsigned long long)sc->rpc_args.prefault_us,
+			(unsigned long long)sc->rpc_args.raw_prefault_pages,
 			(unsigned long long)sc->rpc_args.submit_us,
 			(unsigned long long)sc->rpc_args.poll_us,
 			sc->rpc_args.completed_count,
 			sc->rpc_args.submit_enqcmd,
-			sc->rpc_args.submit_write);
+			sc->rpc_args.submit_write,
+			sc->rpc_args.raw_faults,
+			sc->rpc_args.raw_fault_source,
+			sc->rpc_args.raw_fault_destination,
+			sc->rpc_args.raw_fault_resubmits,
+			(unsigned long long)sc->rpc_args.raw_fault_partial_bytes,
+			(unsigned long long)sc->rpc_args.raw_fault_touch_us,
+			(unsigned long long)sc->rpc_args.raw_fault_resubmit_us);
 
 	return 0;
 }
@@ -3819,6 +3858,12 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 		dsa_sc.args = args;
 		dsa_sc.dsa_ctx = dsa_ctx;
 		dsa_sc.timeline = timeline;
+		/*
+		 * Direct-parent coverage is prepared before collect_pstree freezes
+		 * the target. Keep this decision generation-wide and immutable:
+		 * no usable parent means a dense initial full capture.
+		 */
+		dsa_sc.raw_full_prefault = !dsa_parent_coverage_prev.ready;
 	}
 
 	if (!(mdc->pre_dump || mdc->lazy))
@@ -4032,8 +4077,10 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 		}
 		dsa_rpc_total_us = dsa_wall_delta_us(dsa_rpc_start_us, dsa_wall_now_us());
 		if (dsa_sc.scan_profile)
-			pr_info("DSA_MEMDUMP_DETAIL: mode=streaming fine_grained=%u scan_build_us=%llu scan_pages=%llu dump_pages=%llu hole_pages=%llu lazy_pages=%llu stream_finish_us=%llu fg_sidecar_write_us=%llu fg_apply_records_us=%llu fg_enable_us=%llu dsa_rpc_total_us=%llu stream_payload_bytes=%llu stream_desc_count=%llu stream_flush_count=%u producer_wait_slot_us=%llu stream_finish_wait_us=%llu parasite_prefault_us=%llu parasite_submit_us=%llu parasite_poll_us=%llu parasite_completed_count=%u parasite_submit_enqcmd=%u parasite_submit_write=%u parasite_fg_compare_ops=%u parasite_fg_copy_ops=%u fg_pages=%llu fg_patch_pages=%llu fg_full_pages=%llu fg_patch_bytes=%llu\n",
+			pr_info("DSA_MEMDUMP_DETAIL: mode=streaming fine_grained=%u raw_capture_mode=%s scan_build_us=%llu scan_pages=%llu dump_pages=%llu hole_pages=%llu lazy_pages=%llu stream_finish_us=%llu fg_sidecar_write_us=%llu fg_apply_records_us=%llu fg_enable_us=%llu dsa_rpc_total_us=%llu stream_payload_bytes=%llu stream_desc_count=%llu stream_flush_count=%u producer_wait_slot_us=%llu stream_finish_wait_us=%llu parasite_prefault_us=%llu raw_prefault_pages=%llu parasite_submit_us=%llu parasite_poll_us=%llu parasite_completed_count=%u parasite_submit_enqcmd=%u parasite_submit_write=%u parasite_fg_compare_ops=%u parasite_fg_copy_ops=%u raw_faults=%u raw_fault_source=%u raw_fault_destination=%u raw_fault_resubmits=%u raw_fault_partial_bytes=%llu raw_fault_touch_us=%llu raw_fault_resubmit_us=%llu fg_pages=%llu fg_patch_pages=%llu fg_full_pages=%llu fg_patch_bytes=%llu\n",
 		dsa_ctx->raw_fg_capture ? 1 : 0,
+			dsa_sc.rpc_args.raw_full_prefault ?
+				"initial-full-prefault" : "incremental-exact-touch",
 			(unsigned long long)scan_build_us,
 			(unsigned long long)dsa_sc.scan_pages,
 			(unsigned long long)dsa_sc.scan_dump_pages,
@@ -4050,6 +4097,7 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 			(unsigned long long)dsa_sc.producer_wait_slot_us,
 			(unsigned long long)dsa_sc.finish_wait_us,
 			(unsigned long long)dsa_sc.rpc_args.prefault_us,
+			(unsigned long long)dsa_sc.rpc_args.raw_prefault_pages,
 			(unsigned long long)dsa_sc.rpc_args.submit_us,
 			(unsigned long long)dsa_sc.rpc_args.poll_us,
 			dsa_sc.rpc_args.completed_count,
@@ -4057,6 +4105,13 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 			dsa_sc.rpc_args.submit_write,
 			dsa_sc.rpc_args.fg_compare_ops,
 			dsa_sc.rpc_args.fg_copy_ops,
+			dsa_sc.rpc_args.raw_faults,
+			dsa_sc.rpc_args.raw_fault_source,
+			dsa_sc.rpc_args.raw_fault_destination,
+			dsa_sc.rpc_args.raw_fault_resubmits,
+			(unsigned long long)dsa_sc.rpc_args.raw_fault_partial_bytes,
+			(unsigned long long)dsa_sc.rpc_args.raw_fault_touch_us,
+			(unsigned long long)dsa_sc.rpc_args.raw_fault_resubmit_us,
 			(unsigned long long)dsa_sc.fg_pages,
 			(unsigned long long)dsa_sc.fg_patch_pages,
 			(unsigned long long)dsa_sc.fg_full_pages,
