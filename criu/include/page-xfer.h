@@ -15,6 +15,11 @@ extern int cr_page_server(bool daemon_mode, bool lazy_dump, int cfd);
 /* User buffer for read-mode pre-dump*/
 #define PIPE_MAX_BUFFER_SIZE (PIPE_MAX_SIZE << PAGE_SHIFT)
 
+#define DSA_DIRECT_METADATA_STAGE_BYTES (2U * 1024U * 1024U)
+#define DSA_DIRECT_PAYLOAD_STAGE_BYTES  (4U * 1024U * 1024U)
+#define DSA_DIRECT_SCRATCH_BYTES        \
+	(2U * DSA_DIRECT_METADATA_STAGE_BYTES + DSA_DIRECT_PAYLOAD_STAGE_BYTES)
+
 /*
  * page_xfer -- transfer pages into image file.
  * Two images backends are implemented -- local image file
@@ -63,6 +68,12 @@ struct page_xfer {
 	u32 dsa_fg_result_meta_base;
 	u32 dsa_fg_result_meta_head;
 	u32 dsa_fg_result_meta_limit;
+	/* Generation-exclusive O_DIRECT staging inside the persistent hugetlb
+	 * arena. The raw producer's payload limit ends before idx_scratch_off. */
+	u32 dsa_dio_idx_scratch_off;
+	u32 dsa_dio_dat_scratch_off;
+	u32 dsa_dio_pagemap_scratch_off;
+	u32 dsa_dio_scratch_limit;
 	u32 dsa_fg_vma_plan_base;
 	u32 dsa_fg_vma_plan_head;
 	u32 dsa_fg_vma_plan_limit;
@@ -111,6 +122,9 @@ struct page_xfer {
 	u32 dsa_fg_raw_emit_cursor;
 	bool dsa_fg_raw_capture;
 	bool dsa_fg_materialized;
+	/* Set only for the CDP-selected DSA full/fine transfer.  It never leaks
+	 * into base, shmem or sibling-process page images. */
+	bool dsa_output_direct;
 };
 
 extern int page_xfer_dsa_fg_enable(struct page_xfer *xfer);

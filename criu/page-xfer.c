@@ -2131,6 +2131,26 @@ static bool dsa_aligned_full_enabled(void)
 	return format && !strcasecmp(format, "full");
 }
 
+static bool dsa_direct_output_enabled_for_img(unsigned long img_id)
+{
+	const char *io = getenv("CRIU_DSA_OUTPUT_IO");
+	const char *target = getenv("CRIU_DSA_MEMORY_SERVICE_IMG_ID");
+	char *end = NULL;
+	unsigned long long parsed;
+
+	/* direct-sync is the default for the aligned full/fine comparison paths;
+	 * an explicit buffered value is retained solely for old-image debugging. */
+	if (io && strcasecmp(io, "direct-sync"))
+		return false;
+	if (!dsa_fine_grained_enabled() && !dsa_aligned_full_enabled())
+		return false;
+	if (!target || !target[0])
+		return false;
+	errno = 0;
+	parsed = strtoull(target, &end, 10);
+	return !errno && end && !*end && parsed == img_id;
+}
+
 static const char *hot_fg_compare_backend_name(enum hot_fg_compare_backend backend)
 {
 	switch (backend) {
@@ -5709,7 +5729,7 @@ static int hot_fg_write_pages_loc(struct page_xfer *xfer, int p,
 				  unsigned long len,
 				  struct hot_apply_extent *pending_entry);
 
-#define DSA_ALIGNED_FULL_WRITE_BATCH (2U * 1024U * 1024U)
+#define DSA_ALIGNED_FULL_WRITE_BATCH (4U * 1024U * 1024U)
 
 static int dsa_aligned_full_flush(struct page_xfer *xfer)
 {
@@ -5721,8 +5741,9 @@ static int dsa_aligned_full_flush(struct page_xfer *xfer)
 		return -1;
 	}
 	/* The sealed payload is contiguous even when its capture IOVs were not.
-	 * Write it in bounded chunks after the generic pagemap pass; this avoids
-	 * both replay-pipe syscalls and an otherwise pointless 64 MiB CPU copy. */
+	 * Submit large native chunks after the generic pagemap pass.  This keeps
+	 * queue-depth-one DIO setup/completion costs bounded without allocating a
+	 * matching staging buffer or copying the payload. */
 	for (off = xfer->dsa_fg_raw_payload_base;
 	     off < xfer->dsa_fg_raw_payload_head;) {
 		u32 left = xfer->dsa_fg_raw_payload_head - off;
@@ -6226,6 +6247,116 @@ struct dsa_fg_sidecar_stats {
 	u64 *dat_write_us;
 };
 
+/* idx/dat records are deliberately not forced into an artificial on-disk
+ * padding format.  The direct stream owns a bounded aligned staging block,
+ * emits only full 4 KiB units while records arrive, then zero-pads and
+ * truncates at finish so the externally visible file remains byte-identical
+ * to the buffered format. */
+struct dsa_direct_stream {
+	int fd;
+	unsigned char *buf;
+	size_t used;
+	size_t capacity;
+	off_t logical;
+	bool enabled;
+	bool external;
+};
+
+static int dsa_direct_stream_init(struct dsa_direct_stream *stream, int fd,
+				  bool enabled, size_t capacity, void *external)
+{
+	memset(stream, 0, sizeof(*stream));
+	stream->fd = fd;
+	stream->enabled = enabled;
+	if (!enabled)
+		return 0;
+	if (!capacity || capacity % PAGE_SIZE) {
+		errno = EINVAL;
+		return -1;
+	}
+	if (external) {
+		if ((unsigned long)external % PAGE_SIZE) {
+			errno = EINVAL;
+			return -1;
+		}
+		stream->buf = external;
+		stream->external = true;
+	} else {
+		stream->buf = mmap(NULL, capacity, PROT_READ | PROT_WRITE,
+				   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (stream->buf == MAP_FAILED) {
+			stream->buf = NULL;
+			return -1;
+		}
+	}
+	stream->capacity = capacity;
+	return 0;
+}
+
+static int dsa_direct_stream_flush(struct dsa_direct_stream *stream, bool finish,
+				   u64 *syscalls)
+{
+	size_t bytes;
+
+	if (!stream->enabled || !stream->used)
+		return 0;
+	bytes = finish ? ((stream->used + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1)) :
+		(stream->used & ~(PAGE_SIZE - 1));
+	if (!bytes)
+		return 0;
+	if (bytes > stream->used)
+		memset(stream->buf + stream->used, 0, bytes - stream->used);
+	if (write_full_fd(stream->fd, stream->buf, bytes))
+		return -1;
+	if (syscalls)
+		(*syscalls)++;
+	stream->logical += stream->used < bytes ? stream->used : bytes;
+	if (bytes < stream->used)
+		memmove(stream->buf, stream->buf + bytes, stream->used - bytes);
+	stream->used = bytes < stream->used ? stream->used - bytes : 0;
+	return 0;
+}
+
+static int dsa_direct_stream_write(struct dsa_direct_stream *stream,
+				   const void *buf, size_t len, u64 *syscalls)
+{
+	const unsigned char *p = buf;
+
+	if (!stream->enabled)
+		return -1;
+	while (len) {
+		size_t room = stream->capacity - stream->used;
+		size_t chunk = len < room ? len : room;
+		memcpy(stream->buf + stream->used, p, chunk);
+		stream->used += chunk;
+		p += chunk;
+		len -= chunk;
+		if (stream->used == stream->capacity &&
+		    dsa_direct_stream_flush(stream, false, syscalls))
+			return -1;
+	}
+	return 0;
+}
+
+static int dsa_direct_stream_finish(struct dsa_direct_stream *stream, u64 *syscalls)
+{
+	if (!stream->enabled)
+		return 0;
+	if (dsa_direct_stream_flush(stream, true, syscalls))
+		return -1;
+	if (ftruncate(stream->fd, stream->logical) < 0 || fdatasync(stream->fd) < 0)
+		return -1;
+	return 0;
+}
+
+static void dsa_direct_stream_fini(struct dsa_direct_stream *stream)
+{
+	if (stream->buf && !stream->external)
+		munmap(stream->buf, stream->capacity);
+	stream->buf = NULL;
+	stream->capacity = 0;
+}
+
 struct dsa_fg_sidecar_sink {
 	int idx_fd;
 	int dat_fd;
@@ -6240,6 +6371,8 @@ struct dsa_fg_sidecar_sink {
 	unsigned int nr_iov;
 	unsigned int iov_head;
 	u64 chunk_dat_bytes;
+	struct dsa_direct_stream *idx_dio;
+	struct dsa_direct_stream *dat_dio;
 };
 
 static void dsa_fg_sidecar_stats_add(u64 *counter, u64 value)
@@ -6301,6 +6434,10 @@ static int dsa_fg_sidecar_sink_write_full(struct dsa_fg_sidecar_sink *sink,
 						  u64 *syscalls)
 {
 	const char *p = buf;
+	struct dsa_direct_stream *dio = fd == sink->idx_fd ? sink->idx_dio : sink->dat_dio;
+
+	if (dio && dio->enabled)
+		return dsa_direct_stream_write(dio, buf, len, syscalls);
 
 	while (len) {
 		ssize_t ret;
@@ -6327,6 +6464,15 @@ static int dsa_fg_sidecar_sink_writev_full(struct dsa_fg_sidecar_sink *sink,
 						   struct iovec *iov, unsigned int nr)
 {
 	unsigned int head = 0;
+
+	if (sink->dat_dio && sink->dat_dio->enabled) {
+		for (head = 0; head < nr; head++)
+			if (dsa_direct_stream_write(sink->dat_dio, iov[head].iov_base,
+						    iov[head].iov_len,
+						    sink->stats.dat_writev_syscalls))
+				return -1;
+		return 0;
+	}
 
 	if (!nr || nr > HOT_FG_WRITEV_MAX) {
 		errno = EINVAL;
@@ -7012,9 +7158,14 @@ static int page_xfer_dsa_fg_write_sidecar_results(struct page_xfer *xfer,
 	size_t i;
 	int idx_fd = -1;
 	int dat_fd = -1;
+	struct dsa_direct_stream idx_dio = {};
+	struct dsa_direct_stream dat_dio = {};
 	int dfd = get_service_fd(IMG_FD_OFF);
 	int ret = -1;
 	bool profile;
+	bool direct;
+	void *idx_scratch = NULL;
+	void *dat_scratch = NULL;
 	u64 phase_start_us = 0;
 	u64 serialize_start_us = 0;
 
@@ -7030,6 +7181,36 @@ static int page_xfer_dsa_fg_write_sidecar_results(struct page_xfer *xfer,
 		pr_err("DSA fine-grained canonical dat size is too large=%" PRIu64 "\n",
 		       expected_dat);
 		return -1;
+	}
+	direct = xfer->dsa_output_direct;
+	if (direct && xfer->dsa_fg_service) {
+		if (!xfer->dsa_fg_shared ||
+		    xfer->dsa_dio_idx_scratch_off % PAGE_SIZE ||
+		    xfer->dsa_dio_dat_scratch_off !=
+			    xfer->dsa_dio_idx_scratch_off +
+				    DSA_DIRECT_METADATA_STAGE_BYTES ||
+		    xfer->dsa_dio_pagemap_scratch_off !=
+			    xfer->dsa_dio_dat_scratch_off +
+				    DSA_DIRECT_PAYLOAD_STAGE_BYTES ||
+		    xfer->dsa_dio_scratch_limit !=
+			    xfer->dsa_dio_pagemap_scratch_off +
+				    DSA_DIRECT_METADATA_STAGE_BYTES ||
+		    xfer->dsa_dio_scratch_limit > xfer->dsa_fg_result_meta_base ||
+		    xfer->dsa_fg_raw_payload_head >
+			    xfer->dsa_dio_idx_scratch_off) {
+			pr_err("DSA fine-grained direct scratch bounds are invalid idx=%u dat=%u pagemap=%u limit=%u raw_head=%u result=%u\n",
+			       xfer->dsa_dio_idx_scratch_off,
+			       xfer->dsa_dio_dat_scratch_off,
+			       xfer->dsa_dio_pagemap_scratch_off,
+			       xfer->dsa_dio_scratch_limit,
+			       xfer->dsa_fg_raw_payload_head,
+			       xfer->dsa_fg_result_meta_base);
+			return -1;
+		}
+		idx_scratch = (unsigned char *)xfer->dsa_fg_shared +
+			xfer->dsa_dio_idx_scratch_off;
+		dat_scratch = (unsigned char *)xfer->dsa_fg_shared +
+			xfer->dsa_dio_dat_scratch_off;
 	}
 	if (profile) {
 		xfer->dsa_fg_service_profile.idx_write_calls = 0;
@@ -7049,14 +7230,16 @@ static int page_xfer_dsa_fg_write_sidecar_results(struct page_xfer *xfer,
 		serialize_start_us = dsa_profile_wall_now_us();
 
 	snprintf(idx_path, sizeof(idx_path), "pages-fg-%u.idx", xfer->pages_id);
-	idx_fd = openat(dfd, idx_path, O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC,
+	idx_fd = openat(dfd, idx_path, O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC |
+			(direct ? O_DIRECT : 0),
 			CR_FD_PERM);
 	if (idx_fd < 0) {
 		pr_perror("DSA fine-grained can't open %s", idx_path);
 		goto out;
 	}
 	snprintf(dat_path, sizeof(dat_path), "pages-fg-%u.dat", xfer->pages_id);
-	dat_fd = openat(dfd, dat_path, O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC,
+	dat_fd = openat(dfd, dat_path, O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC |
+			(direct ? O_DIRECT : 0),
 			CR_FD_PERM);
 	if (dat_fd < 0) {
 		pr_perror("DSA fine-grained can't open %s", dat_path);
@@ -7065,8 +7248,19 @@ static int page_xfer_dsa_fg_write_sidecar_results(struct page_xfer *xfer,
 	sink = xzalloc(sizeof(*sink));
 	if (!sink)
 		goto out;
+	if (dsa_direct_stream_init(&idx_dio, idx_fd, direct,
+				   DSA_DIRECT_METADATA_STAGE_BYTES,
+				   idx_scratch) ||
+	    dsa_direct_stream_init(&dat_dio, dat_fd, direct,
+				   DSA_DIRECT_PAYLOAD_STAGE_BYTES,
+				   dat_scratch)) {
+		pr_perror("DSA fine-grained direct sidecar staging allocation failed");
+		goto out;
+	}
 	sink->idx_fd = idx_fd;
 	sink->dat_fd = dat_fd;
+	sink->idx_dio = &idx_dio;
+	sink->dat_dio = &dat_dio;
 	sink->stats = (struct dsa_fg_sidecar_stats) {
 		.enabled = profile,
 		.idx_write_calls = &xfer->dsa_fg_service_profile.idx_write_calls,
@@ -7124,6 +7318,13 @@ static int page_xfer_dsa_fg_write_sidecar_results(struct page_xfer *xfer,
 	}
 	if (dsa_fg_sidecar_sink_flush(sink))
 		goto out;
+	if (dsa_direct_stream_finish(&idx_dio,
+				     sink->stats.idx_write_syscalls) ||
+	    dsa_direct_stream_finish(&dat_dio,
+				     sink->stats.dat_writev_syscalls)) {
+		pr_perror("DSA fine-grained direct sidecar finish failed");
+		goto out;
+	}
 	if (fstat(idx_fd, &idx_st) || fstat(dat_fd, &dat_st)) {
 		pr_perror("DSA fine-grained canonical sidecar fstat failed");
 		goto out;
@@ -7148,6 +7349,8 @@ static int page_xfer_dsa_fg_write_sidecar_results(struct page_xfer *xfer,
 	}
 	ret = 0;
 out:
+	dsa_direct_stream_fini(&dat_dio);
+	dsa_direct_stream_fini(&idx_dio);
 	xfree(sink);
 	if (dat_fd >= 0 && close(dat_fd))
 		ret = -1;
@@ -9952,6 +10155,7 @@ int open_page_xfer(struct page_xfer *xfer, int fd_type, unsigned long img_id)
 int open_page_xfer_no_parent(struct page_xfer *xfer, int fd_type, unsigned long img_id)
 {
 	u32 pages_id;
+	unsigned long image_flags = O_DUMP;
 
 	if (opts.use_page_server) {
 		pr_err("DSA parent index mode does not support page server xfer\n");
@@ -9968,11 +10172,14 @@ int open_page_xfer_no_parent(struct page_xfer *xfer, int fd_type, unsigned long 
 	xfer->write_profile_emitted = false;
 	xfer->write_profile_target =
 		dsa_page_xfer_profile_target(fd_type, img_id);
-	xfer->pmi = open_image(fd_type, O_DUMP, img_id);
+	xfer->dsa_output_direct = dsa_direct_output_enabled_for_img(img_id);
+	if (xfer->dsa_output_direct)
+		image_flags |= O_DSA_DIRECT_STREAM;
+	xfer->pmi = open_image(fd_type, image_flags, img_id);
 	if (!xfer->pmi)
 		return -1;
 
-	xfer->pi = open_pages_image(O_DUMP, xfer->pmi, &pages_id);
+	xfer->pi = open_pages_image(image_flags, xfer->pmi, &pages_id);
 	if (!xfer->pi) {
 		close_image(xfer->pmi);
 		return -1;
@@ -10496,7 +10703,7 @@ static void page_xfer_write_profile_emit(struct page_xfer *xfer, int ret)
 	total_cpu_us = dsa_profile_delta_us(
 		xfer->write_profile_start_cpu_us, dsa_profile_thread_now_us());
 
-	pr_info("WRITE_PATH_PROFILE: version=1 path=%s output_mode=buffered "
+	pr_info("WRITE_PATH_PROFILE: version=3 path=%s output_mode=%s "
 		"snapshot_ready_to_finish_us=%" PRIu64
 		" snapshot_ready_to_finish_thread_cpu_us=%" PRIu64
 		" io_emit_us=%" PRIu64 " io_emit_thread_cpu_us=%" PRIu64
@@ -10504,18 +10711,69 @@ static void page_xfer_write_profile_emit(struct page_xfer *xfer, int ret)
 		" pagemap_records=%" PRIu64 " pagemap_bytes=%" PRIu64
 		" pages_bytes=%" PRIu64 " sidecar_idx_bytes=%" PRIu64
 		" sidecar_dat_bytes=%" PRIu64 " logical_output_bytes=%" PRIu64
-		" pages_emit_calls=%" PRIu64 " idx_write_syscalls=%" PRIu64
+		" pages_emit_calls=%" PRIu64
+		" pagemap_direct_write_calls=%" PRIu64
+		" idx_write_syscalls=%" PRIu64
 		" dat_write_syscalls=%" PRIu64 " dat_writev_syscalls=%" PRIu64
 		" ret=%d\n",
-		path, total_wall_us, total_cpu_us,
+		path, xfer->dsa_output_direct ? "direct-sync" : "buffered",
+		total_wall_us, total_cpu_us,
 		xfer->write_profile_io_wall_us, xfer->write_profile_io_cpu_us,
 		xfer->write_profile_input_pages, xfer->write_profile_input_bytes,
 		xfer->write_profile_pagemap_records,
 		xfer->write_profile_pagemap_bytes,
 		xfer->write_profile_pages_bytes, sidecar_idx_bytes,
 		sidecar_dat_bytes, logical_output_bytes,
-		xfer->write_profile_pages_emit_calls, idx_write_syscalls,
+		xfer->write_profile_pages_emit_calls,
+	image_direct_write_calls(xfer->pmi), idx_write_syscalls,
 		dat_write_syscalls, dat_writev_syscalls, ret);
+}
+
+static int page_xfer_bind_direct_arena_scratch(struct page_xfer *xfer)
+{
+	void *pagemap_scratch;
+
+	if (!xfer->dsa_output_direct || !xfer->dsa_fg_service)
+		return 0;
+	if (!xfer->dsa_fg_shared ||
+	    xfer->dsa_dio_idx_scratch_off % PAGE_SIZE ||
+	    xfer->dsa_dio_dat_scratch_off !=
+		    xfer->dsa_dio_idx_scratch_off +
+			    DSA_DIRECT_METADATA_STAGE_BYTES ||
+	    xfer->dsa_dio_pagemap_scratch_off !=
+		    xfer->dsa_dio_dat_scratch_off +
+			    DSA_DIRECT_PAYLOAD_STAGE_BYTES ||
+	    xfer->dsa_dio_scratch_limit !=
+		    xfer->dsa_dio_pagemap_scratch_off +
+			    DSA_DIRECT_METADATA_STAGE_BYTES ||
+	    xfer->dsa_dio_scratch_limit > xfer->dsa_fg_result_meta_base ||
+	    xfer->dsa_fg_raw_payload_head > xfer->dsa_dio_idx_scratch_off) {
+		pr_err("DSA direct pagemap scratch bounds are invalid idx=%u dat=%u pagemap=%u limit=%u raw_head=%u result=%u\n",
+		       xfer->dsa_dio_idx_scratch_off,
+		       xfer->dsa_dio_dat_scratch_off,
+		       xfer->dsa_dio_pagemap_scratch_off,
+		       xfer->dsa_dio_scratch_limit,
+		       xfer->dsa_fg_raw_payload_head,
+		       xfer->dsa_fg_result_meta_base);
+		return -1;
+	}
+	pagemap_scratch = (unsigned char *)xfer->dsa_fg_shared +
+		xfer->dsa_dio_pagemap_scratch_off;
+	if (image_direct_rebind_buffer(xfer->pmi, pagemap_scratch,
+				       DSA_DIRECT_METADATA_STAGE_BYTES)) {
+		pr_perror("DSA direct pagemap cannot bind arena scratch");
+		return -1;
+	}
+	if (dsa_profile_enabled())
+		pr_info("DSA_DIRECT_SCRATCH: mode=arena idx_off=%u idx_bytes=%u dat_off=%u dat_bytes=%u pagemap_off=%u pagemap_bytes=%u limit=%u\n",
+			xfer->dsa_dio_idx_scratch_off,
+			DSA_DIRECT_METADATA_STAGE_BYTES,
+			xfer->dsa_dio_dat_scratch_off,
+			DSA_DIRECT_PAYLOAD_STAGE_BYTES,
+			xfer->dsa_dio_pagemap_scratch_off,
+			DSA_DIRECT_METADATA_STAGE_BYTES,
+			xfer->dsa_dio_scratch_limit);
+	return 0;
 }
 
 int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
@@ -10530,6 +10788,8 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 	u64 write_phase_start_cpu_us = 0;
 	bool service_profile = xfer->dsa_fg_service && dsa_profile_enabled();
 
+	if (page_xfer_bind_direct_arena_scratch(xfer))
+		return -1;
 	page_xfer_write_profile_begin(xfer);
 	hot_profile_begin(profile_ctx);
 	if (service_profile)
@@ -10699,6 +10959,15 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 			profile_ctx->profile_pagemap_pack_us +=
 				dsa_profile_delta_us(phase_start_us, dsa_profile_wall_now_us());
 	}
+	/* All logical output bytes are now known.  Complete the direct writers
+	 * before publishing any hot-memory generation; a later APPLY must never
+	 * make an un-synced image visible as its parent. */
+	if (xfer->dsa_output_direct &&
+	    (image_direct_finish(xfer->pi) || image_direct_finish(xfer->pmi)))
+		goto out;
+	if (xfer->dsa_output_direct &&
+	    (image_direct_close(xfer->pi) || image_direct_close(xfer->pmi)))
+		goto out;
 	if (xfer->write_profile_enabled) {
 		xfer->write_profile_io_wall_us += dsa_profile_delta_us(
 			write_phase_start_us, dsa_profile_wall_now_us());

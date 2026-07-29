@@ -24,6 +24,7 @@
  * date per one read call on proc files.
  */
 #define BUFSIZE (PAGE_SIZE)
+#define DSA_DIRECT_BFD_CAPACITY (2U * 1024U * 1024U)
 
 struct bfd_buf {
 	char *mem;
@@ -95,6 +96,12 @@ static int bfdopen(struct bfd *f, bool writable)
 	}
 
 	f->writable = writable;
+	f->direct = false;
+	f->direct_finished = false;
+	f->direct_external_buffer = false;
+	f->direct_logical = 0;
+	f->direct_capacity = 0;
+	f->direct_write_calls = 0;
 	return 0;
 }
 
@@ -108,6 +115,64 @@ int bfdopenw(struct bfd *f)
 	return bfdopen(f, true);
 }
 
+int bfdopenw_direct(struct bfd *f)
+{
+	void *mem;
+
+	mem = mmap(NULL, DSA_DIRECT_BFD_CAPACITY, PROT_READ | PROT_WRITE,
+		   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (mem == MAP_FAILED) {
+		pr_perror("No direct BFD buffer");
+		close_safe(&f->fd);
+		return -1;
+	}
+	f->b.mem = mem;
+	f->b.data = mem;
+	f->b.sz = 0;
+	f->b.buf = NULL;
+	f->writable = true;
+	f->direct = true;
+	f->direct_finished = false;
+	f->direct_external_buffer = false;
+	f->direct_logical = 0;
+	f->direct_capacity = DSA_DIRECT_BFD_CAPACITY;
+	f->direct_write_calls = 0;
+	return 0;
+}
+
+int bfd_direct_rebind_buffer(struct bfd *f, void *mem, size_t capacity)
+{
+	void *old_mem;
+	size_t old_capacity;
+
+	if (!f || !f->direct || !bfd_buffered(f) || f->direct_finished ||
+	    !mem || !capacity || capacity % PAGE_SIZE ||
+	    (unsigned long)mem % PAGE_SIZE || f->b.sz > capacity ||
+	    f->b.data != f->b.mem) {
+		errno = EINVAL;
+		return -1;
+	}
+	if (f->direct_external_buffer && f->b.mem == mem &&
+	    f->direct_capacity == capacity)
+		return 0;
+	if (f->direct_external_buffer) {
+		errno = EBUSY;
+		return -1;
+	}
+
+	old_mem = f->b.mem;
+	old_capacity = f->direct_capacity;
+	if (f->b.sz)
+		memcpy(mem, f->b.data, f->b.sz);
+	if (munmap(old_mem, old_capacity))
+		return -1;
+	f->b.mem = mem;
+	f->b.data = mem;
+	f->direct_capacity = capacity;
+	f->direct_external_buffer = true;
+	return 0;
+}
+
 static int bflush(struct bfd *bfd);
 static bool flush_failed = false;
 
@@ -119,7 +184,8 @@ int bfd_flush_images(void)
 void bclose(struct bfd *f)
 {
 	if (bfd_buffered(f)) {
-		if (f->writable && bflush(f) < 0) {
+		if (f->writable &&
+		    (f->direct ? bfd_direct_finish(f) : bflush(f)) < 0) {
 			/*
 			 * This is to propagate error up. It's
 			 * hardly possible by returning and
@@ -131,9 +197,68 @@ void bclose(struct bfd *f)
 			pr_perror("Error flushing image");
 		}
 
-		buf_put(&f->b);
+		if (f->direct) {
+			if (!f->direct_external_buffer)
+				munmap(f->b.mem, f->direct_capacity);
+			f->b.mem = NULL;
+			f->b.data = NULL;
+		} else {
+			buf_put(&f->b);
+		}
 	}
 	close_safe(&f->fd);
+}
+
+/* The direct writer never exposes its padding as logical image data: it
+ * retains a sub-page tail until finish, zero-pads exactly one final block,
+ * truncates back to the logical length and then makes completion durable. */
+int bfd_direct_finish(struct bfd *f)
+{
+	if (!f || !f->direct || f->direct_finished)
+		return 0;
+	if (!bfd_buffered(f)) {
+		if (fdatasync(f->fd) < 0) {
+			pr_perror("Can't fdatasync direct raw image");
+			return -1;
+		}
+		f->direct_finished = true;
+		return 0;
+	}
+	while (f->b.sz)
+		if (bflush(f) < 0)
+			return -1;
+	if (ftruncate(f->fd, f->direct_logical) < 0) {
+		pr_perror("Can't truncate direct image");
+		return -1;
+	}
+	if (fdatasync(f->fd) < 0) {
+		pr_perror("Can't fdatasync direct image");
+		return -1;
+	}
+	f->direct_finished = true;
+	return 0;
+}
+
+int bfd_direct_close(struct bfd *f)
+{
+	int ret = 0;
+
+	if (!f || !f->direct)
+		return 0;
+	if (bfd_direct_finish(f))
+		return -1;
+	if (bfd_buffered(f)) {
+		if (!f->direct_external_buffer)
+			munmap(f->b.mem, f->direct_capacity);
+		f->b.mem = NULL;
+		f->b.data = NULL;
+	}
+	if (close(f->fd) < 0) {
+		pr_perror("Can't close direct image");
+		ret = -1;
+	}
+	f->fd = -1;
+	return ret;
 }
 
 static int brefill(struct bfd *f)
@@ -236,21 +361,69 @@ static int bflush(struct bfd *bfd)
 {
 	struct xbuf *b = &bfd->b;
 	int ret;
+	size_t aligned;
 
 	if (!b->sz)
 		return 0;
 
-	ret = write_all(bfd->fd, b->data, b->sz);
-	if (ret != b->sz)
-		return -1;
+	if (!bfd->direct) {
+		ret = write_all(bfd->fd, b->data, b->sz);
+		if (ret != b->sz)
+			return -1;
+		b->sz = 0;
+		return 0;
+	}
 
-	b->sz = 0;
+	/* A regular flush writes whole 4 KiB units.  bclose/finish is the only
+	 * place allowed to emit a padded tail. */
+	aligned = b->sz & ~(PAGE_SIZE - 1);
+	if (!aligned && !bfd->direct_finished)
+		aligned = PAGE_SIZE;
+	if (aligned > b->sz) {
+		memset(b->data + b->sz, 0, aligned - b->sz);
+		ret = write_all(bfd->fd, b->data, aligned);
+		if (ret != (int)aligned)
+			return -1;
+		bfd->direct_write_calls++;
+		bfd->direct_logical += b->sz;
+		b->sz = 0;
+		return 0;
+	}
+	if (aligned) {
+		ret = write_all(bfd->fd, b->data, aligned);
+		if (ret != (int)aligned)
+			return -1;
+		bfd->direct_write_calls++;
+		bfd->direct_logical += aligned;
+		if (aligned != b->sz)
+			memmove(b->data, b->data + aligned, b->sz - aligned);
+		b->sz -= aligned;
+	}
 	return 0;
 }
 
 static int __bwrite(struct bfd *bfd, const void *buf, int size)
 {
 	struct xbuf *b = &bfd->b;
+	const char *p = buf;
+
+	if (bfd->direct) {
+		size_t capacity = bfd->direct_capacity;
+
+		/* Do not use write_all on caller buffers: protobuf objects are not
+		 * necessarily suitably aligned for O_DIRECT. */
+		while (size) {
+			size_t room = capacity - b->sz;
+			size_t chunk = (size_t)size < room ? (size_t)size : room;
+			memcpy(b->data + b->sz, p, chunk);
+			b->sz += chunk;
+			p += chunk;
+			size -= chunk;
+			if (b->sz == capacity && bflush(bfd) < 0)
+				return -1;
+		}
+		return p - (const char *)buf;
+	}
 
 	if (b->sz + size > BUFSIZE) {
 		int ret;

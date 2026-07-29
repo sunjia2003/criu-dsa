@@ -602,36 +602,22 @@ static int userns_openat(void *arg, int dfd, int pid)
 	return ret;
 }
 
-static bool direct_pages_env_enabled(void)
-{
-	const char *v = getenv("CRIU_DSA_DIRECT_PAGES");
-
-	return v && (!strcmp(v, "1") || !strcasecmp(v, "true") ||
-		     !strcasecmp(v, "yes") || !strcasecmp(v, "on"));
-}
-
-static bool direct_pages_dump_requested(int type, unsigned long oflags)
-{
-	return type == CR_FD_PAGES && (oflags & O_CREAT) &&
-	       direct_pages_env_enabled();
-}
-
 static int do_open_image(struct cr_img *img, int dfd, int type, unsigned long oflags, char *path)
 {
 	int ret, flags;
-	bool direct_pages;
+	bool direct_stream;
 
-	flags = oflags & ~(O_NOBUF | O_SERVICE | O_FORCE_LOCAL);
-	direct_pages = direct_pages_dump_requested(type, oflags);
+	flags = oflags & ~(O_NOBUF | O_SERVICE | O_FORCE_LOCAL | O_DSA_DIRECT_STREAM);
+	direct_stream = (oflags & O_DSA_DIRECT_STREAM) && (oflags & O_CREAT);
 
-	if (direct_pages) {
+	if (direct_stream) {
 		if (opts.stream && !(oflags & O_FORCE_LOCAL)) {
-			pr_err("DIRECT_PAGES: O_DIRECT pages image is unsupported with image streaming\n");
+			pr_err("DSA direct output is unsupported with image streaming\n");
 			goto err;
 		}
 
 		flags |= O_DIRECT;
-		pr_info("DIRECT_PAGES: opening %s with O_DIRECT\n", path);
+		pr_info("DSA_DIRECT_OUTPUT: opening %s with O_DIRECT\n", path);
 	}
 
 	if (opts.stream && !(oflags & O_FORCE_LOCAL)) {
@@ -666,11 +652,34 @@ static int do_open_image(struct cr_img *img, int dfd, int type, unsigned long of
 	}
 
 	img->_x.fd = ret;
-	if (oflags & O_NOBUF)
+	if (direct_stream) {
+		struct statx stx = {};
+
+		/* The staging buffers and raw arena are 4 KiB aligned.  Refuse a
+		 * filesystem whose reported DIO contract needs a stronger alignment;
+		 * buffered fallback would make an experiment silently incomparable. */
+		if (statx(ret, "", AT_EMPTY_PATH, STATX_DIOALIGN, &stx) < 0 ||
+		    !stx.stx_dio_mem_align || !stx.stx_dio_offset_align ||
+		    stx.stx_dio_mem_align > PAGE_SIZE ||
+		    stx.stx_dio_offset_align > PAGE_SIZE) {
+			pr_err("DSA direct output requires discoverable <=%lu-byte DIO alignment for %s\n",
+			       PAGE_SIZE, path);
+			close_safe(&img->_x.fd);
+			img->_x.fd = EMPTY_IMG_FD;
+			goto err;
+		}
+	}
+	if (oflags & O_NOBUF) {
 		bfd_setraw(&img->_x);
-	else {
+		img->_x.direct = direct_stream;
+		img->_x.direct_finished = false;
+		img->_x.direct_external_buffer = false;
+		img->_x.direct_logical = 0;
+	} else {
 		if (flags == O_RDONLY)
 			ret = bfdopenr(&img->_x);
+		else if (direct_stream)
+			ret = bfdopenw_direct(&img->_x);
 		else
 			ret = bfdopenw(&img->_x);
 
@@ -726,6 +735,36 @@ void close_image(struct cr_img *img)
 		bclose(&img->_x);
 
 	xfree(img);
+}
+
+int image_direct_finish(struct cr_img *img)
+{
+	if (!img || empty_image(img) || lazy_image(img))
+		return 0;
+	if (bfd_direct(&img->_x))
+		return bfd_direct_finish(&img->_x);
+	return 0;
+}
+
+int image_direct_rebind_buffer(struct cr_img *img, void *mem, size_t capacity)
+{
+	if (!img)
+		return -1;
+	return bfd_direct_rebind_buffer(&img->_x, mem, capacity);
+}
+
+int image_direct_close(struct cr_img *img)
+{
+	if (!img || empty_image(img) || lazy_image(img))
+		return 0;
+	return bfd_direct_close(&img->_x);
+}
+
+u64 image_direct_write_calls(struct cr_img *img)
+{
+	if (!img || empty_image(img) || lazy_image(img))
+		return 0;
+	return bfd_direct_write_calls(&img->_x);
 }
 
 struct cr_img *img_from_fd(int fd)

@@ -140,6 +140,11 @@ struct cr_img {
 #define EMPTY_IMG_FD (-404)
 #define LAZY_IMG_FD  (-505)
 
+/* Internal open_image flag, never passed to open(2).  It is used only by
+ * the selected DSA full/fine page xfer; base and other CRIU image writers
+ * never set it. */
+#define O_DSA_DIRECT_STREAM (1UL << 62)
+
 static inline bool empty_image(struct cr_img *img)
 {
 	return img && img->_x.fd == EMPTY_IMG_FD;
@@ -192,6 +197,10 @@ extern int read_img_buf(struct cr_img *, void *ptr, int size);
 extern int read_img_str(struct cr_img *, char **pstr, int size);
 
 extern void close_image(struct cr_img *);
+extern int image_direct_rebind_buffer(struct cr_img *, void *, size_t);
+extern int image_direct_finish(struct cr_img *);
+extern int image_direct_close(struct cr_img *);
+extern u64 image_direct_write_calls(struct cr_img *);
 
 extern int add_inventory_plugin(const char *name);
 extern int check_inventory_plugins(void);

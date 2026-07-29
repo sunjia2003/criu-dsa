@@ -1971,6 +1971,10 @@ struct dsa_desc_scan_ctx {
 	u32 fg_result_data_base;
 	u32 fg_result_data_head;
 	u32 fg_result_data_limit;
+	u32 dio_idx_scratch_off;
+	u32 dio_dat_scratch_off;
+	u32 dio_pagemap_scratch_off;
+	u32 dio_scratch_limit;
 	struct dsa_dump_descriptor descs[DSA_STREAM_SLOT_DESC_CAP];
 	u32 current_slot;
 	u32 produced_slots;
@@ -2088,6 +2092,10 @@ static int dsa_stream_layout_init(struct dsa_desc_scan_ctx *sc)
 	u32 fg_meta_base = 0;
 	u32 fg_meta_limit = 0;
 	u32 fg_data_base = 0;
+	u32 dio_idx_scratch_off = 0;
+	u32 dio_dat_scratch_off = 0;
+	u32 dio_pagemap_scratch_off = 0;
+	u32 dio_scratch_limit = 0;
 	u32 desc_area_bytes;
 	u32 i;
 	unsigned int j;
@@ -2131,18 +2139,39 @@ static int dsa_stream_layout_init(struct dsa_desc_scan_ctx *sc)
 		}
 	} else if (raw_fg_capture) {
 		/* Raw-capture service mode needs a result region after thaw, but the
-		 * parasite must retain the ordinary MEMMOVE descriptor format.  Reserve
-		 * the metadata tail now so frozen capture can never overwrite a result
-		 * published later by the persistent comparator. */
-		if (sc->dsa_ctx->shared_buf_size <= DSA_STREAM_FG_META_REGION_BYTES ||
-		    sc->dsa_ctx->shared_buf_size - DSA_STREAM_FG_META_REGION_BYTES <= payload_base) {
-			pr_err("DSA raw fine-grained result metadata does not fit shared=%zu payload_base=%u\n",
-			       sc->dsa_ctx->shared_buf_size, payload_base);
+		 * parasite must retain the ordinary MEMMOVE descriptor format. Reserve
+		 * the metadata tail and the generation-exclusive direct-I/O scratch
+		 * immediately before it, so frozen capture can overwrite neither. */
+		if (sc->dsa_ctx->shared_buf_size <=
+				DSA_STREAM_FG_META_REGION_BYTES + DSA_DIRECT_SCRATCH_BYTES ||
+		    sc->dsa_ctx->shared_buf_size -
+				(DSA_STREAM_FG_META_REGION_BYTES + DSA_DIRECT_SCRATCH_BYTES) <=
+				payload_base) {
+			pr_err("DSA raw result/direct scratch does not fit shared=%zu payload_base=%u reserve=%u\n",
+			       sc->dsa_ctx->shared_buf_size, payload_base,
+			       DSA_STREAM_FG_META_REGION_BYTES + DSA_DIRECT_SCRATCH_BYTES);
 			return -1;
 		}
 		fg_meta_base = (u32)(sc->dsa_ctx->shared_buf_size -
 					     DSA_STREAM_FG_META_REGION_BYTES);
 		fg_meta_limit = (u32)sc->dsa_ctx->shared_buf_size;
+		dio_idx_scratch_off = fg_meta_base - DSA_DIRECT_SCRATCH_BYTES;
+		dio_dat_scratch_off =
+			dio_idx_scratch_off + DSA_DIRECT_METADATA_STAGE_BYTES;
+		dio_pagemap_scratch_off =
+			dio_dat_scratch_off + DSA_DIRECT_PAYLOAD_STAGE_BYTES;
+		dio_scratch_limit =
+			dio_pagemap_scratch_off + DSA_DIRECT_METADATA_STAGE_BYTES;
+		if (dio_scratch_limit != fg_meta_base ||
+		    (dio_idx_scratch_off | dio_dat_scratch_off |
+		     dio_pagemap_scratch_off | dio_scratch_limit) &
+			    (DSA_SHARED_DATA_ALIGN - 1)) {
+			pr_err("DSA direct scratch layout is invalid idx=%u dat=%u pagemap=%u limit=%u meta=%u\n",
+			       dio_idx_scratch_off, dio_dat_scratch_off,
+			       dio_pagemap_scratch_off, dio_scratch_limit,
+			       fg_meta_base);
+			return -1;
+		}
 	}
 
 	memset(shared_u8, 0, desc_area_off);
@@ -2159,6 +2188,10 @@ static int dsa_stream_layout_init(struct dsa_desc_scan_ctx *sc)
 	sc->fg_result_data_base = fg_data_base;
 	sc->fg_result_data_head = fg_data_base;
 	sc->fg_result_data_limit = sc->dsa_ctx->shared_buf_size;
+	sc->dio_idx_scratch_off = dio_idx_scratch_off;
+	sc->dio_dat_scratch_off = dio_dat_scratch_off;
+	sc->dio_pagemap_scratch_off = dio_pagemap_scratch_off;
+	sc->dio_scratch_limit = dio_scratch_limit;
 	sc->current_slot = 0;
 	sc->produced_slots = 0;
 	sc->desc_count = 0;
@@ -2187,7 +2220,7 @@ static int dsa_stream_layout_init(struct dsa_desc_scan_ctx *sc)
 	sc->stream_hdr->slots_off = slots_off;
 	sc->stream_hdr->desc_area_off = desc_area_off;
 	sc->stream_hdr->payload_base = payload_base;
-	sc->stream_hdr->payload_limit = raw_fg_capture ? fg_meta_base :
+	sc->stream_hdr->payload_limit = raw_fg_capture ? dio_idx_scratch_off :
 		sc->dsa_ctx->shared_buf_size;
 	dsa_shared_store_u32(&sc->stream_hdr->payload_head, payload_base);
 	if (sc->dsa_ctx->fine_grained || raw_fg_capture) {
@@ -4112,6 +4145,11 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 			xfer.dsa_fg_result_meta_base = dsa_sc.fg_result_meta_base;
 			xfer.dsa_fg_result_meta_head = dsa_sc.fg_result_meta_base;
 			xfer.dsa_fg_result_meta_limit = dsa_sc.fg_result_meta_limit;
+			xfer.dsa_dio_idx_scratch_off = dsa_sc.dio_idx_scratch_off;
+			xfer.dsa_dio_dat_scratch_off = dsa_sc.dio_dat_scratch_off;
+			xfer.dsa_dio_pagemap_scratch_off =
+				dsa_sc.dio_pagemap_scratch_off;
+			xfer.dsa_dio_scratch_limit = dsa_sc.dio_scratch_limit;
 			xfer.dsa_fg_materialized = false;
 		}
 		dsa_rpc_total_us = dsa_wall_delta_us(dsa_rpc_start_us, dsa_wall_now_us());
