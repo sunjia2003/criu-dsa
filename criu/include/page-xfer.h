@@ -1,6 +1,7 @@
 #ifndef __CR_PAGE_XFER__H__
 #define __CR_PAGE_XFER__H__
 #include "pagemap.h"
+#include "dsa-memory-service.h"
 
 struct ps_info {
 	int pid;
@@ -57,6 +58,57 @@ struct page_xfer {
 	u32 dsa_fg_desc_head;
 	u32 dsa_fg_raw_payload_base;
 	u32 dsa_fg_raw_payload_head;
+	/* Reserved for the task-scoped memory-service protocol.  The legacy path
+	 * leaves these zero and therefore keeps its existing layout/behavior. */
+	u32 dsa_fg_result_meta_base;
+	u32 dsa_fg_result_meta_head;
+	u32 dsa_fg_result_meta_limit;
+	u32 dsa_fg_vma_plan_base;
+	u32 dsa_fg_vma_plan_head;
+	u32 dsa_fg_vma_plan_limit;
+	u32 dsa_fg_vma_plan_count;
+	/* Client-owned temporary VMA list.  In memory-service mode it is copied
+	 * into the reserved result tail after thaw, then freed before close. */
+	void *dsa_fg_vma_plan_local;
+	/* Set only for the short-lived CRIU side of the task-scoped service. */
+	bool dsa_fg_service;
+	u64 dsa_fg_service_generation;
+	u64 dsa_fg_service_parent_generation;
+	u64 dsa_fg_service_arena_id;
+	u64 dsa_fg_service_arena_epoch;
+	u64 dsa_fg_service_img_id;
+	struct cdp_dsa_memory_service_profile dsa_fg_service_profile;
+	struct cdp_dsa_memory_service_diag dsa_fg_service_diag;
+	u64 dsa_fg_profile_total_start_us;
+	u64 dsa_fg_profile_request_publish_us;
+	u64 dsa_fg_profile_ipc_compare_us;
+	u64 dsa_fg_profile_sidecar_us;
+	u64 dsa_fg_profile_pagemap_us;
+	u64 dsa_fg_profile_finish_us;
+	u64 dsa_fg_profile_ipc_apply_us;
+	/*
+	 * Backend-neutral write-path ledger.  It is enabled only by the explicit
+	 * profile mode and observes the existing writer; it never selects another
+	 * output implementation.
+	 */
+	bool write_profile_enabled;
+	bool write_profile_emitted;
+	bool write_profile_target;
+	u64 write_profile_start_wall_us;
+	u64 write_profile_start_cpu_us;
+	u64 write_profile_io_wall_us;
+	u64 write_profile_io_cpu_us;
+	u64 write_profile_input_pages;
+	u64 write_profile_input_bytes;
+	u64 write_profile_pagemap_records;
+	u64 write_profile_pagemap_bytes;
+	u64 write_profile_pages_bytes;
+	u64 write_profile_pages_emit_calls;
+	/* Aligned full output bypasses the legacy pipe replay and appends raw
+	 * capture bytes to pages.img through this bounded sink.  It is deliberately
+	 * separate from fine sidecar buffering: both consume the same frozen raw
+	 * arena but preserve their native image formats. */
+	u32 dsa_fg_raw_emit_cursor;
 	bool dsa_fg_raw_capture;
 	bool dsa_fg_materialized;
 };
@@ -82,6 +134,10 @@ extern int check_parent_page_xfer(int fd_type, unsigned long id);
 extern int page_xfer_dsa_fg_apply_records(struct page_xfer *xfer,
 					  const void *shared,
 					  u32 desc_area_off, u32 desc_head);
+
+/* Entry point for the task-scoped DSA memory-service command.  It receives a
+ * SOCK_SEQPACKET control fd whose peer is the CDP task worker/CRIU client. */
+extern int page_xfer_dsa_memory_service(int control_fd);
 
 /*
  * The post-copy migration makes it necessary to receive pages from

@@ -87,6 +87,7 @@ struct {
 	{ "service", CR_SERVICE },
 	{ "swrk", CR_SWRK },
 	{ "dedup", CR_DEDUP },
+	{ "dsa-memory-service", CR_DSA_MEMORY_SERVICE },
 	{ "exec", CR_EXEC_DEPRECATED },
 	{ "show", CR_SHOW_DEPRECATED },
 };
@@ -253,7 +254,7 @@ int main(int argc, char *argv[], char *envp[])
 	}
 
 	/* We must not open imgs dir, if service is called */
-	if (opts.mode != CR_SERVICE) {
+	if (opts.mode != CR_SERVICE && opts.mode != CR_DSA_MEMORY_SERVICE) {
 		ret = open_image_dir(opts.imgs_dir, image_dir_mode());
 		if (ret < 0) {
 			pr_err("Couldn't open image dir %s\n", opts.imgs_dir);
@@ -344,6 +345,24 @@ int main(int argc, char *argv[], char *envp[])
 	case CR_DEDUP:
 		return cr_dedup() != 0;
 
+	case CR_DSA_MEMORY_SERVICE: {
+		const char *fd_value = getenv("CRIU_DSA_MEMORY_SERVICE_CONTROL_FD");
+		char *end = NULL;
+		long fd;
+
+		if (!fd_value) {
+			pr_err("DSA memory service requires CRIU_DSA_MEMORY_SERVICE_CONTROL_FD\n");
+			return 1;
+		}
+		errno = 0;
+		fd = strtol(fd_value, &end, 10);
+		if (errno || !end || *end || fd < 0 || fd > INT_MAX) {
+			pr_err("DSA memory service control fd is invalid\n");
+			return 1;
+		}
+		return page_xfer_dsa_memory_service((int)fd) != 0;
+	}
+
 	case CR_CPUINFO_DUMP:
 		return cpuinfo_dump();
 
@@ -373,6 +392,7 @@ usage:
 	       "  criu service [<options>]\n"
 	       "  criu dedup\n"
 	       "  criu lazy-pages -D DIR [<options>]\n"
+	       "  criu dsa-memory-service\n"
 	       "\n"
 	       "Commands:\n"
 	       "  dump           checkpoint a process/tree identified by pid\n"

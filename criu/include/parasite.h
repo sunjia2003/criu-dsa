@@ -354,6 +354,12 @@ struct parasite_dsa_fg_result {
 	struct parasite_dsa_fg_result_entry entries[DSA_FG_MAX_PATCHES];
 };
 
+/* Wire record for a future arena-published frozen VMA plan. */
+struct dsa_fg_vma_plan_record {
+	u64 start;
+	u64 end;
+};
+
 struct parasite_dsa_shm_hdr {
 	u32 magic;
 	u32 version;

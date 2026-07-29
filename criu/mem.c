@@ -1120,6 +1120,20 @@ static bool dsa_fine_grained_enabled(void)
 			   !strcasecmp(enabled, "yes") || !strcasecmp(enabled, "on"));
 }
 
+/* The aligned full control path needs the same sealed raw-arena capture as
+ * fine-grained encoding, but must not set PE_DSA_FG or run COMPARE. */
+static bool dsa_aligned_full_enabled(void)
+{
+	const char *format = getenv("CRIU_DSA_OUTPUT_FORMAT");
+
+	return format && !strcasecmp(format, "full");
+}
+
+static bool dsa_raw_capture_enabled(void)
+{
+	return dsa_fine_grained_enabled() || dsa_aligned_full_enabled();
+}
+
 static void dsa_fg_bf_reset(void)
 {
 	memset(&dsa_fg_bf, 0, sizeof(dsa_fg_bf));
@@ -1128,7 +1142,7 @@ static void dsa_fg_bf_reset(void)
 static int dsa_fg_prepare_before_freeze(void)
 {
 	dsa_fg_bf_reset();
-	dsa_fg_bf.enabled = dsa_fine_grained_enabled();
+	dsa_fg_bf.enabled = dsa_raw_capture_enabled();
 	dsa_fg_bf.ready = dsa_dump_enabled() && dsa_fg_bf.enabled;
 	if (dsa_fg_bf.ready)
 		pr_info("DSA fine-grained prepare before freeze: raw capture only\n");
@@ -1570,13 +1584,14 @@ static int dsa_dump_ctx_init(struct dsa_dump_ctx *ctx, pid_t target_pid)
 	 * to page-xfer after the task has been unfrozen, so the parasite must not
 	 * enter its legacy compare/copy mode here.
 	 */
-	ctx->raw_fg_capture = dsa_fine_grained_enabled();
+	ctx->raw_fg_capture = dsa_raw_capture_enabled();
 	ctx->fine_grained = false;
 	pr_info("DSA_SHARED_MEM_MODE: mode=%s pid=%d shared_buf_size=%zu degrade_count=%u\n",
 		ctx->shared_hugetlb ? "hugetlb" : "normal_memfd", target_pid,
 		ctx->shared_buf_size, ctx->shared_degrade_cnt);
 	if (ctx->raw_fg_capture)
-		pr_info("DSA_FINE_GRAINED_MODE: raw_capture=1 encode=post_thaw\n");
+		pr_info("DSA_RAW_CAPTURE_MODE: format=%s encode=post_thaw\n",
+			dsa_aligned_full_enabled() ? "full" : "fine");
 
 	ctx->shared_fds_sent = false;
 	dsa_replay_ctx_init(ctx);
@@ -2076,6 +2091,7 @@ static int dsa_stream_layout_init(struct dsa_desc_scan_ctx *sc)
 	u32 desc_area_bytes;
 	u32 i;
 	unsigned int j;
+	bool raw_fg_capture = sc->dsa_ctx->raw_fg_capture;
 
 	if (sc->dsa_ctx->shared_buf_size > UINT_MAX) {
 		pr_err("DSA strict: streaming shared buffer exceeds u32 size=%zu\n",
@@ -2113,6 +2129,20 @@ static int dsa_stream_layout_init(struct dsa_desc_scan_ctx *sc)
 			       sc->dsa_ctx->shared_buf_size);
 			return -1;
 		}
+	} else if (raw_fg_capture) {
+		/* Raw-capture service mode needs a result region after thaw, but the
+		 * parasite must retain the ordinary MEMMOVE descriptor format.  Reserve
+		 * the metadata tail now so frozen capture can never overwrite a result
+		 * published later by the persistent comparator. */
+		if (sc->dsa_ctx->shared_buf_size <= DSA_STREAM_FG_META_REGION_BYTES ||
+		    sc->dsa_ctx->shared_buf_size - DSA_STREAM_FG_META_REGION_BYTES <= payload_base) {
+			pr_err("DSA raw fine-grained result metadata does not fit shared=%zu payload_base=%u\n",
+			       sc->dsa_ctx->shared_buf_size, payload_base);
+			return -1;
+		}
+		fg_meta_base = (u32)(sc->dsa_ctx->shared_buf_size -
+					     DSA_STREAM_FG_META_REGION_BYTES);
+		fg_meta_limit = (u32)sc->dsa_ctx->shared_buf_size;
 	}
 
 	memset(shared_u8, 0, desc_area_off);
@@ -2157,9 +2187,10 @@ static int dsa_stream_layout_init(struct dsa_desc_scan_ctx *sc)
 	sc->stream_hdr->slots_off = slots_off;
 	sc->stream_hdr->desc_area_off = desc_area_off;
 	sc->stream_hdr->payload_base = payload_base;
-	sc->stream_hdr->payload_limit = sc->dsa_ctx->shared_buf_size;
+	sc->stream_hdr->payload_limit = raw_fg_capture ? fg_meta_base :
+		sc->dsa_ctx->shared_buf_size;
 	dsa_shared_store_u32(&sc->stream_hdr->payload_head, payload_base);
-	if (sc->dsa_ctx->fine_grained) {
+	if (sc->dsa_ctx->fine_grained || raw_fg_capture) {
 		sc->stream_hdr->fg_result_meta_base = fg_meta_base;
 		sc->stream_hdr->fg_result_meta_head = fg_meta_base;
 		sc->stream_hdr->fg_result_meta_limit = fg_meta_limit;
@@ -4066,13 +4097,21 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 		if (ret < 0)
 			goto out_xfer;
 		if (dsa_ctx->raw_fg_capture) {
-			xfer.dsa_fine_grained = true;
+			/* `raw_fg_capture` means that the frozen DSA transfer owns the
+			 * payload in the stable arena.  Only fine output changes the
+			 * durable page representation to PE_DSA_FG; aligned full output
+			 * deliberately retains ordinary present pagemap records. */
+			xfer.dsa_fine_grained = !dsa_aligned_full_enabled();
 			xfer.dsa_fg_raw_capture = true;
 			xfer.dsa_fg_shared = dsa_sc.dsa_ctx->shared_buf;
 			xfer.dsa_fg_desc_area_off = dsa_sc.desc_area_off;
 			xfer.dsa_fg_desc_head = dsa_sc.desc_head;
 			xfer.dsa_fg_raw_payload_base = dsa_sc.payload_base;
 			xfer.dsa_fg_raw_payload_head = dsa_sc.payload_head;
+			xfer.dsa_fg_raw_emit_cursor = dsa_sc.payload_base;
+			xfer.dsa_fg_result_meta_base = dsa_sc.fg_result_meta_base;
+			xfer.dsa_fg_result_meta_head = dsa_sc.fg_result_meta_base;
+			xfer.dsa_fg_result_meta_limit = dsa_sc.fg_result_meta_limit;
 			xfer.dsa_fg_materialized = false;
 		}
 		dsa_rpc_total_us = dsa_wall_delta_us(dsa_rpc_start_us, dsa_wall_now_us());

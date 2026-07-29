@@ -1,6 +1,7 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <linux/falloc.h>
 #include <sys/uio.h>
 #include <limits.h>
@@ -44,13 +45,23 @@ struct hot_read_segment {
 	unsigned long vaddr;
 	unsigned long len;
 	off_t off;
+	size_t owner;
+};
+
+struct hot_read_owner {
 	int fd;
+	off_t size;
+	dev_t dev;
+	ino_t ino;
 	char file[PATH_MAX];
 };
 
 struct hot_read_ctx {
 	struct hot_read_segment *segs;
 	size_t nr;
+	struct hot_read_owner *owners;
+	size_t nr_owners;
+	size_t owners_cap;
 };
 
 static bool hot_restore_enabled(void)
@@ -67,12 +78,74 @@ static void hot_read_close_ctx(struct hot_read_ctx *ctx)
 
 	if (!ctx)
 		return;
-	for (i = 0; i < ctx->nr; i++) {
-		if (ctx->segs[i].fd >= 0)
-			close(ctx->segs[i].fd);
+	for (i = 0; i < ctx->nr_owners; i++) {
+		if (ctx->owners[i].fd >= 0)
+			close(ctx->owners[i].fd);
 	}
 	xfree(ctx->segs);
+	xfree(ctx->owners);
 	xfree(ctx);
+}
+
+static int hot_read_owner_add(struct hot_read_ctx *ctx, int fd, const char *file,
+				      size_t *owner_out)
+{
+	struct stat st;
+	struct hot_read_owner *owners;
+	size_t i;
+
+	if (fstat(fd, &st)) {
+		pr_perror("hot page_read can't fstat backing %s", file);
+		return -1;
+	}
+	if (!S_ISREG(st.st_mode) || st.st_size <= 0) {
+		pr_err("hot page_read backing is not a nonempty regular file %s\n", file);
+		return -1;
+	}
+	for (i = 0; i < ctx->nr_owners; i++) {
+		if (ctx->owners[i].dev != st.st_dev || ctx->owners[i].ino != st.st_ino)
+			continue;
+		if (ctx->owners[i].size != st.st_size) {
+			pr_err("hot page_read backing size changed while loading %s\n", file);
+			return -1;
+		}
+		close(fd);
+		*owner_out = i;
+		return 0;
+	}
+	if (ctx->nr_owners == ctx->owners_cap) {
+		size_t cap = ctx->owners_cap ? ctx->owners_cap * 2 : 128;
+
+		owners = xrealloc(ctx->owners, cap * sizeof(*owners));
+		if (!owners)
+			return -1;
+		ctx->owners = owners;
+		ctx->owners_cap = cap;
+	}
+	ctx->owners[ctx->nr_owners] = (struct hot_read_owner) {
+		.fd = fd,
+		.size = st.st_size,
+		.dev = st.st_dev,
+		.ino = st.st_ino,
+	};
+	if (snprintf(ctx->owners[ctx->nr_owners].file,
+		     sizeof(ctx->owners[ctx->nr_owners].file), "%s", file) >=
+	    (int)sizeof(ctx->owners[ctx->nr_owners].file))
+		return -1;
+	*owner_out = ctx->nr_owners++;
+	return 0;
+}
+
+static int hot_read_seg_cmp(const void *a, const void *b)
+{
+	const struct hot_read_segment *left = a;
+	const struct hot_read_segment *right = b;
+
+	if (left->img_id != right->img_id)
+		return left->img_id < right->img_id ? -1 : 1;
+	if (left->vaddr != right->vaddr)
+		return left->vaddr < right->vaddr ? -1 : 1;
+	return 0;
 }
 
 static int hot_read_load_ctx(struct page_read *pr)
@@ -101,26 +174,50 @@ static int hot_read_load_ctx(struct page_read *pr)
 
 	while (fgets(line, sizeof(line), fp)) {
 		struct hot_read_segment seg;
+		char file[PATH_MAX];
 		unsigned long long off;
 		int n;
 		uint64_t line_start_us;
 		uint64_t open_start_us;
 
 		memset(&seg, 0, sizeof(seg));
-		seg.fd = -1;
 		pr->manifest_bytes += strlen(line);
 		line_start_us = page_read_now_us();
 		n = sscanf(line, "seg %lu %lx %lu %4095s %llu",
-			   &seg.img_id, &seg.vaddr, &seg.len, seg.file, &off);
+			   &seg.img_id, &seg.vaddr, &seg.len, file, &off);
 		parse_us += page_read_now_us() - line_start_us;
 		if (n != 5 || seg.img_id != pr->img_id)
 			continue;
 		seg.off = (off_t)off;
+		if (!seg.len || seg.vaddr > ULONG_MAX - seg.len ||
+		    seg.vaddr & (PAGE_SIZE - 1) || seg.len & (PAGE_SIZE - 1) ||
+		    seg.off < 0 || (seg.off & (PAGE_SIZE - 1))) {
+			pr_err("hot page_read invalid manifest view\n");
+			fclose(fp);
+			hot_read_close_ctx(ctx);
+			return -1;
+		}
 		open_start_us = page_read_now_us();
-		seg.fd = open(seg.file, O_RDONLY | O_CLOEXEC);
-		open_us += page_read_now_us() - open_start_us;
-		if (seg.fd < 0) {
-			pr_perror("hot page_read can't open segment %s", seg.file);
+		{
+			int fd = open(file, O_RDONLY | O_CLOEXEC);
+
+			open_us += page_read_now_us() - open_start_us;
+			if (fd < 0) {
+				pr_perror("hot page_read can't open backing %s", file);
+				fclose(fp);
+				hot_read_close_ctx(ctx);
+				return -1;
+			}
+			if (hot_read_owner_add(ctx, fd, file, &seg.owner)) {
+				close(fd);
+				fclose(fp);
+				hot_read_close_ctx(ctx);
+				return -1;
+			}
+		}
+		if (seg.off > ctx->owners[seg.owner].size ||
+		    seg.len > ctx->owners[seg.owner].size - seg.off) {
+			pr_err("hot page_read manifest view exceeds backing %s\n", file);
 			fclose(fp);
 			hot_read_close_ctx(ctx);
 			return -1;
@@ -132,7 +229,6 @@ static int hot_read_load_ctx(struct page_read *pr)
 
 			if (!new_segs) {
 				fclose(fp);
-				close(seg.fd);
 				hot_read_close_ctx(ctx);
 				return -1;
 			}
@@ -143,6 +239,19 @@ static int hot_read_load_ctx(struct page_read *pr)
 	}
 
 	fclose(fp);
+	qsort(ctx->segs, ctx->nr, sizeof(ctx->segs[0]), hot_read_seg_cmp);
+	for (cap = 1; cap < ctx->nr; cap++) {
+		struct hot_read_segment *prev = &ctx->segs[cap - 1];
+		struct hot_read_segment *cur = &ctx->segs[cap];
+
+		if (prev->img_id == cur->img_id &&
+		    (prev->vaddr + prev->len < prev->vaddr ||
+		     prev->vaddr + prev->len > cur->vaddr)) {
+			pr_err("hot page_read manifest views overlap\n");
+			hot_read_close_ctx(ctx);
+			return -1;
+		}
+	}
 	pr->timing_manifest_parse_us += parse_us;
 	pr->timing_segment_open_us += open_us;
 	pr->segment_count = ctx->nr;
@@ -161,27 +270,37 @@ static struct hot_read_segment *hot_read_find(struct page_read *pr,
 					      unsigned long vaddr)
 {
 	struct hot_read_ctx *ctx = pr->hot;
+	size_t lo = 0, hi = ctx->nr, steps = 0;
 	size_t i;
 	uint64_t start_us = page_read_now_us();
 
 	pr->hot_find_calls++;
-	for (i = 0; i < ctx->nr; i++) {
-		unsigned long start = ctx->segs[i].vaddr;
-		unsigned long end = start + ctx->segs[i].len;
+	while (lo < hi) {
+		size_t mid = lo + (hi - lo) / 2;
+		struct hot_read_segment *seg = &ctx->segs[mid];
 
-		if (ctx->segs[i].img_id == img_id && vaddr >= start && vaddr < end) {
-			uint64_t steps = i + 1;
-
-			pr->hot_find_steps += steps;
-			if (steps > pr->hot_find_steps_max)
-				pr->hot_find_steps_max = steps;
-			pr->timing_hot_find_us += page_read_now_us() - start_us;
-			return &ctx->segs[i];
-		}
+		steps++;
+		if (seg->img_id < img_id ||
+		    (seg->img_id == img_id && seg->vaddr <= vaddr))
+			lo = mid + 1;
+		else
+			hi = mid;
 	}
-	pr->hot_find_steps += ctx->nr;
-	if (ctx->nr > pr->hot_find_steps_max)
-		pr->hot_find_steps_max = ctx->nr;
+	if (!lo)
+		goto miss;
+	i = lo - 1;
+	if (ctx->segs[i].img_id == img_id && vaddr >= ctx->segs[i].vaddr &&
+	    vaddr - ctx->segs[i].vaddr < ctx->segs[i].len) {
+		pr->hot_find_steps += steps;
+		if (steps > pr->hot_find_steps_max)
+			pr->hot_find_steps_max = steps;
+		pr->timing_hot_find_us += page_read_now_us() - start_us;
+		return &ctx->segs[i];
+	}
+miss:
+	pr->hot_find_steps += steps;
+	if (steps > pr->hot_find_steps_max)
+		pr->hot_find_steps_max = steps;
 	pr->timing_hot_find_us += page_read_now_us() - start_us;
 	return NULL;
 }
@@ -817,6 +936,7 @@ static int maybe_read_page_hot(struct page_read *pr, unsigned long vaddr, unsign
 
 	while (done < len) {
 		struct hot_read_segment *seg;
+		struct hot_read_owner *owner;
 		unsigned long addr = vaddr + done;
 		unsigned long chunk;
 		size_t curr = 0;
@@ -827,6 +947,11 @@ static int maybe_read_page_hot(struct page_read *pr, unsigned long vaddr, unsign
 			       pr->img_id, addr);
 			return -1;
 		}
+		if (seg->owner >= ctx->nr_owners) {
+			pr_err("hot page_read invalid backing owner index=%zu\n", seg->owner);
+			return -1;
+		}
+		owner = &ctx->owners[seg->owner];
 
 		chunk = seg->vaddr + seg->len - addr;
 		if (chunk > len - done)
@@ -834,14 +959,14 @@ static int maybe_read_page_hot(struct page_read *pr, unsigned long vaddr, unsign
 
 		while (curr < chunk) {
 			uint64_t start_us = page_read_now_us();
-			ssize_t ret = pread(seg->fd, buf + done + curr,
+			ssize_t ret = pread(owner->fd, buf + done + curr,
 					    chunk - curr,
 					    seg->off + (addr - seg->vaddr) + curr);
 			pr->timing_hot_pread_us += page_read_now_us() - start_us;
 			pr->hot_pread_calls++;
 			if (ret < 1) {
-				pr_perror("hot page_read failed segment=%s ret=%zd",
-					  seg->file, ret);
+				pr_perror("hot page_read failed backing=%s ret=%zd",
+					  owner->file, ret);
 				return -1;
 			}
 			curr += ret;

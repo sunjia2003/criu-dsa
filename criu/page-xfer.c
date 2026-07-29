@@ -1,4 +1,5 @@
 #include <sys/socket.h>
+#include <poll.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <linux/falloc.h>
@@ -36,6 +37,7 @@
 #include "servicefd.h"
 #include "image.h"
 #include "page-xfer.h"
+#include "dsa-memory-service.h"
 #include "page-pipe.h"
 #include "util.h"
 #include "protobuf.h"
@@ -63,6 +65,13 @@
 #define HOT_FG_OUTPUT_LOGICAL_BYTES (2U * 1024U * 1024U)
 #define HOT_FG_OUTPUT_WRITE_BYTES (64U * 1024U)
 
+/* Completion-record fault_info layout for a DSA descriptor with CRAV. */
+#define HOT_DSA_FAULT_ADDR_MASKED 0x1U
+#define HOT_DSA_FAULT_OPERAND_SHIFT 1U
+#define HOT_DSA_FAULT_OPERAND_MASK 0x7U
+#define HOT_DSA_FAULT_OPERAND_SRC1 1U
+#define HOT_DSA_FAULT_OPERAND_SRC2 2U
+
 #ifndef MADV_POPULATE_READ
 #define MADV_POPULATE_READ 22
 #endif
@@ -74,6 +83,7 @@ enum hot_fg_compare_backend {
 	HOT_FG_COMPARE_SIMD_AVX2,
 	HOT_FG_COMPARE_SIMD_AVX512,
 	HOT_FG_COMPARE_HYBRID_DEMAND,
+	HOT_FG_COMPARE_HYBRID_FAULT_SIMD,
 	HOT_FG_COMPARE_VALIDATE,
 };
 
@@ -105,6 +115,26 @@ static bool dsa_profile_enabled(void)
 	return enabled;
 }
 
+static bool dsa_page_xfer_dump_enabled(void)
+{
+	const char *value = getenv("CRIU_DSA_DUMP");
+
+	return value && !strcmp(value, "1");
+}
+
+static bool dsa_page_xfer_profile_target(int fd_type, unsigned long img_id)
+{
+	const char *value = getenv("CRIU_DSA_PROFILE_IMG_ID");
+	char *end = NULL;
+	unsigned long long parsed;
+
+	if (fd_type != CR_FD_PAGEMAP || !value || !value[0])
+		return false;
+	errno = 0;
+	parsed = strtoull(value, &end, 10);
+	return !errno && end && !*end && parsed == img_id;
+}
+
 static int dsa_compare_breakdown_mode(void)
 {
 	static int mode = -2;
@@ -120,6 +150,296 @@ static int dsa_compare_breakdown_mode(void)
 	    !strcasecmp(value, "yes"))
 		return mode = 1;
 	return mode = -1;
+}
+
+/* The fd is inherited only by a short-lived CRIU dump.  The task worker keeps
+ * the other endpoint and the persistent service owns the peer; CPU/SIMD and
+ * ordinary DSA paths never set this variable. */
+static int dsa_memory_service_client_fd(void)
+{
+	static int cached = -2;
+	const char *value;
+	char *end = NULL;
+	long fd;
+
+	if (cached != -2)
+		return cached;
+	value = getenv("CRIU_DSA_MEMORY_SERVICE_FD");
+	if (!value || !value[0])
+		return cached = -1;
+	errno = 0;
+	fd = strtol(value, &end, 10);
+	if (errno || !end || *end || fd < 0 || fd > INT_MAX) {
+		pr_err("DSA memory service client fd is invalid\n");
+		return cached = -1;
+	}
+	return cached = (int)fd;
+}
+
+static int dsa_memory_service_env_u64(const char *name, u64 *value)
+{
+	const char *text = getenv(name);
+	char *end = NULL;
+	unsigned long long parsed;
+
+	if (!text || !text[0])
+		return -1;
+	errno = 0;
+	parsed = strtoull(text, &end, 10);
+	if (errno || !end || *end)
+		return -1;
+	*value = parsed;
+	return 0;
+}
+
+static int dsa_memory_service_client_init(struct page_xfer *xfer,
+					  unsigned long img_id)
+{
+	int fd = dsa_memory_service_client_fd();
+	u64 service_img_id;
+
+	if (fd < 0)
+		return 0;
+	if (dsa_memory_service_env_u64("CRIU_DSA_MEMORY_SERVICE_IMG_ID",
+					       &service_img_id)) {
+		pr_err("DSA memory service target image environment is missing\n");
+		return -1;
+	}
+	/* A process tree may open non-root pagemaps too.  They retain their
+	 * ordinary transfer path; the one task image selected by CDP is the only
+	 * participant in this service generation. */
+	if (service_img_id != img_id)
+		return 0;
+	if (dsa_memory_service_env_u64("CRIU_DSA_ARENA_GENERATION",
+					       &xfer->dsa_fg_service_generation) ||
+	    dsa_memory_service_env_u64("CRIU_DSA_ARENA_PARENT_GENERATION",
+					       &xfer->dsa_fg_service_parent_generation) ||
+	    dsa_memory_service_env_u64("CRIU_DSA_MEMORY_SERVICE_ARENA_ID",
+					       &xfer->dsa_fg_service_arena_id) ||
+	    dsa_memory_service_env_u64("CRIU_DSA_ARENA_EPOCH",
+					       &xfer->dsa_fg_service_arena_epoch)) {
+		pr_err("DSA memory service client identity environment is incomplete\n");
+		return -1;
+	}
+	xfer->dsa_fg_service = true;
+	xfer->dsa_fg_service_img_id = img_id;
+	return 0;
+}
+
+static const char *dsa_ms_failure_stage_name(u32 stage)
+{
+	switch (stage) {
+	case CDP_DSA_MS_STAGE_NONE:
+		return "none";
+	case CDP_DSA_MS_STAGE_REQUEST_IDENTITY:
+		return "request-identity";
+	case CDP_DSA_MS_STAGE_COMPARE_BOUNDS:
+		return "compare-bounds";
+	case CDP_DSA_MS_STAGE_COMPARE_VMA_PLAN:
+		return "compare-vma-plan";
+	case CDP_DSA_MS_STAGE_COMPARE_ENGINE:
+		return "compare-engine";
+	case CDP_DSA_MS_STAGE_APPLY_PRECHECK:
+		return "apply-precheck";
+	case CDP_DSA_MS_STAGE_APPLY_OPEN_MANIFEST:
+		return "apply-open-manifest";
+	case CDP_DSA_MS_STAGE_APPLY_RESULT_VALIDATE:
+		return "apply-result-validate";
+	case CDP_DSA_MS_STAGE_APPLY_VMA_MATERIALIZE:
+		return "apply-vma-materialize";
+	case CDP_DSA_MS_STAGE_APPLY_PAGE_STORE:
+		return "apply-page-store";
+	case CDP_DSA_MS_STAGE_APPLY_MANIFEST_FINISH:
+		return "apply-manifest-finish";
+	case CDP_DSA_MS_STAGE_APPLY_MANIFEST_CLOSE:
+		return "apply-manifest-close";
+	case CDP_DSA_MS_STAGE_SEND_REPLY:
+		return "send-reply";
+	default:
+		return "unknown";
+	}
+}
+
+static int dsa_ms_status_errno(u32 status)
+{
+	switch (status) {
+	case CDP_DSA_MS_EIDENTITY:
+		return ESTALE;
+	case CDP_DSA_MS_EBOUNDS:
+		return ERANGE;
+	case CDP_DSA_MS_ESTATE:
+		return EBUSY;
+	case CDP_DSA_MS_EIO:
+		return EIO;
+	case CDP_DSA_MS_EHW:
+		return EREMOTEIO;
+	case CDP_DSA_MS_EPROTO:
+	default:
+		return EPROTO;
+	}
+}
+
+static void dsa_ms_client_error_profile(
+	const struct page_xfer *xfer, const char *error_class, u16 request_op,
+	const struct cdp_dsa_memory_service_msg *reply,
+	const struct cdp_dsa_memory_service_diag *diag, bool diag_valid,
+	int saved_errno, short revents)
+{
+	u32 status = reply ? reply->status : 0;
+	u32 stage = diag_valid ? diag->failure_stage : CDP_DSA_MS_STAGE_NONE;
+	int primary_errno = diag_valid ? diag->primary_errno : saved_errno;
+	int cleanup_errno = diag_valid ? diag->cleanup_errno : 0;
+	u64 object_index = diag_valid ? diag->object_index :
+		CDP_DSA_MS_DIAG_INVALID_OBJECT;
+	u64 object_vaddr = diag_valid ? diag->object_vaddr :
+		CDP_DSA_MS_DIAG_INVALID_OBJECT;
+	u64 expected = diag_valid ? diag->expected_results : 0;
+	u64 completed = diag_valid ? diag->completed_results : 0;
+
+	if (!dsa_profile_enabled())
+		return;
+	pr_info("DSA_MEMORY_SERVICE_ERROR_PROFILE: diag_version=%u class=%s request_op=%u reply_op=%u service_status=%u failure_stage=%s failure_stage_id=%u primary_errno=%d cleanup_errno=%d generation=%" PRIu64 " arena_epoch=%" PRIu64 " object_index=%" PRIu64 " object_vaddr=%" PRIx64 " expected_results=%" PRIu64 " completed_results=%" PRIu64 " poll_revents=%d apply_validate_wall_us=%" PRIu64 " apply_materialize_wall_us=%" PRIu64 " apply_store_wall_us=%" PRIu64 " apply_manifest_finish_wall_us=%" PRIu64 " apply_manifest_close_wall_us=%" PRIu64 " apply_total_wall_us=%" PRIu64 " apply_total_cpu_us=%" PRIu64 "\n",
+		diag_valid ? diag->version : 0, error_class, request_op,
+		reply ? reply->op : 0, status, dsa_ms_failure_stage_name(stage),
+		stage, primary_errno, cleanup_errno,
+		diag_valid ? diag->generation_id : xfer->dsa_fg_service_generation,
+		diag_valid ? diag->arena_epoch : xfer->dsa_fg_service_arena_epoch,
+		object_index, object_vaddr, expected, completed, (int)revents,
+		diag_valid ? diag->apply_validate_wall_us : 0,
+		diag_valid ? diag->apply_materialize_wall_us : 0,
+		diag_valid ? diag->apply_store_wall_us : 0,
+		diag_valid ? diag->apply_manifest_finish_wall_us : 0,
+		diag_valid ? diag->apply_manifest_close_wall_us : 0,
+		diag_valid ? diag->apply_total_wall_us : 0,
+		diag_valid ? diag->apply_total_cpu_us : 0);
+}
+
+static bool dsa_ms_diag_valid(const struct cdp_dsa_memory_service_diag *diag,
+			      u16 request_op,
+			      const struct cdp_dsa_memory_service_msg *reply)
+{
+	return diag &&
+		diag->magic == CDP_DSA_MEMORY_SERVICE_DIAG_MAGIC &&
+		diag->version == CDP_DSA_MEMORY_SERVICE_DIAG_VERSION &&
+		diag->size == sizeof(*diag) && diag->request_op == request_op &&
+		diag->reply_op == reply->op &&
+		diag->service_status == reply->status &&
+		diag->generation_id == reply->generation_id &&
+		diag->arena_epoch == reply->arena_epoch;
+}
+
+static int dsa_memory_service_client_exchange(
+	struct page_xfer *xfer, struct cdp_dsa_memory_service_msg *msg,
+	u16 expect_op, struct cdp_dsa_memory_service_diag *diag)
+{
+	struct pollfd pfd = { .fd = dsa_memory_service_client_fd(), .events = POLLIN };
+	const bool profile = dsa_profile_enabled();
+	const u16 request_op = msg ? msg->op : 0;
+	ssize_t ret;
+	bool diag_valid = false;
+	int saved_errno;
+
+	if (!xfer || !msg || !xfer->dsa_fg_service || pfd.fd < 0)
+		return -1;
+	if (diag) {
+		memset(diag, 0, sizeof(*diag));
+		diag->object_index = CDP_DSA_MS_DIAG_INVALID_OBJECT;
+		diag->object_vaddr = CDP_DSA_MS_DIAG_INVALID_OBJECT;
+	}
+	msg->magic = CDP_DSA_MEMORY_SERVICE_MAGIC;
+	msg->version = CDP_DSA_MEMORY_SERVICE_VERSION;
+	msg->generation_id = xfer->dsa_fg_service_generation;
+	msg->parent_generation_id = xfer->dsa_fg_service_parent_generation;
+	msg->img_id = xfer->dsa_fg_service_img_id;
+	msg->arena_id = xfer->dsa_fg_service_arena_id;
+	msg->arena_epoch = xfer->dsa_fg_service_arena_epoch;
+	ret = send(pfd.fd, msg, sizeof(*msg), MSG_NOSIGNAL);
+	if (ret != sizeof(*msg)) {
+		if (ret >= 0)
+			errno = EPROTO;
+		saved_errno = errno;
+		dsa_ms_client_error_profile(xfer, "transport_error", request_op,
+					    NULL, NULL, false, saved_errno, 0);
+		errno = saved_errno;
+		return -1;
+	}
+	ret = poll(&pfd, 1, 30000);
+	if (ret != 1 || !(pfd.revents & POLLIN)) {
+		if (!ret)
+			errno = ETIMEDOUT;
+		else if (ret == 1 && (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)))
+			errno = EPIPE;
+		saved_errno = errno;
+		dsa_ms_client_error_profile(xfer, "transport_error", request_op,
+					    NULL, NULL, false, saved_errno, pfd.revents);
+		errno = saved_errno;
+		return -1;
+	}
+	if (profile) {
+		struct iovec iov[2] = {
+			{ .iov_base = msg, .iov_len = sizeof(*msg) },
+			{ .iov_base = diag, .iov_len = diag ? sizeof(*diag) : 0 },
+		};
+		struct msghdr hdr = {
+			.msg_iov = iov,
+			.msg_iovlen = ARRAY_SIZE(iov),
+		};
+
+		ret = recvmsg(pfd.fd, &hdr, 0);
+		if (ret == (ssize_t)(sizeof(*msg) + (diag ? sizeof(*diag) : 0)) &&
+		    !(hdr.msg_flags & (MSG_TRUNC | MSG_CTRUNC)))
+			diag_valid = dsa_ms_diag_valid(diag, request_op, msg);
+	} else {
+		ret = recv(pfd.fd, msg, sizeof(*msg), 0);
+	}
+	if (ret < 0) {
+		saved_errno = errno;
+		dsa_ms_client_error_profile(xfer, "transport_error", request_op,
+					    NULL, NULL, false, saved_errno,
+					    pfd.revents);
+		errno = saved_errno;
+		return -1;
+	}
+	if (!ret) {
+		saved_errno = ECONNRESET;
+		dsa_ms_client_error_profile(xfer, "transport_error", request_op,
+					    NULL, NULL, false, saved_errno, pfd.revents);
+		errno = saved_errno;
+		return -1;
+	}
+	if ((!profile && ret != sizeof(*msg)) ||
+	    (profile && (ret != (ssize_t)(sizeof(*msg) + sizeof(*diag)) ||
+			 !diag_valid)) ||
+	    msg->magic != CDP_DSA_MEMORY_SERVICE_MAGIC ||
+	    msg->version != CDP_DSA_MEMORY_SERVICE_VERSION ||
+	    msg->generation_id != xfer->dsa_fg_service_generation ||
+	    msg->arena_id != xfer->dsa_fg_service_arena_id ||
+	    msg->arena_epoch != xfer->dsa_fg_service_arena_epoch) {
+		saved_errno = EPROTO;
+		dsa_ms_client_error_profile(xfer, "malformed_reply", request_op,
+					    msg, diag, diag_valid, saved_errno,
+					    pfd.revents);
+		errno = saved_errno;
+		return -1;
+	}
+	if (msg->op == CDP_DSA_MS_ERROR) {
+		saved_errno = diag_valid && diag->primary_errno ?
+			diag->primary_errno : dsa_ms_status_errno(msg->status);
+		dsa_ms_client_error_profile(xfer, "service_error", request_op,
+					    msg, diag, diag_valid, saved_errno,
+					    pfd.revents);
+		errno = saved_errno;
+		return -1;
+	}
+	if (msg->op != expect_op || msg->status != CDP_DSA_MS_OK) {
+		saved_errno = EPROTO;
+		dsa_ms_client_error_profile(xfer, "malformed_reply", request_op,
+					    msg, diag, diag_valid, saved_errno,
+					    pfd.revents);
+		errno = saved_errno;
+		return -1;
+	}
+	return 0;
 }
 
 struct hot_apply_extent {
@@ -190,6 +510,11 @@ struct hot_apply_ctx {
 	struct hot_apply_extent *entries;
 	size_t nr_entries;
 	size_t entries_cap;
+	/* A backing owns the FD/mmap.  Both the committed parent records and this
+	 * generation's coverage records only borrow an index into this table. */
+	struct hot_memstore_owner *owners;
+	size_t nr_owners;
+	size_t owners_cap;
 	struct hot_memstore_seg *old_memstore;
 	size_t nr_old_memstore;
 	size_t old_memstore_cursor;
@@ -331,6 +656,42 @@ struct hot_apply_ctx {
 	u64 profile_hybrid_dsa_to_cpu_handoff_pages;
 	u64 profile_hybrid_dsa_to_cpu_handoff_remaining_bytes;
 	u64 profile_hybrid_unclaimed_empty_count;
+	u64 profile_compare_nobof_faults;
+	u64 profile_compare_nobof_fault_source1;
+	u64 profile_compare_nobof_fault_source2;
+	u64 profile_compare_nobof_equal_prefix_bytes;
+	u64 profile_compare_fault_handoff_spans;
+	u64 profile_compare_fault_handoff_pages;
+	u64 profile_compare_fault_handoff_remaining_bytes;
+	u64 profile_compare_fault_queue_max;
+	u64 profile_compare_fresh_claim_throttles;
+	u64 profile_compare_cpu_fault_waves;
+	u64 profile_dsa_logical_progress_bytes;
+	u64 profile_simd_logical_progress_bytes;
+	u64 profile_normal_simd_logical_progress_bytes;
+	u64 profile_fault_simd_logical_progress_bytes;
+	u64 profile_dsa_fresh_submit_ops;
+	u64 profile_dsa_continuation_submit_ops;
+	u64 profile_dsa_submitted_bytes;
+	u64 profile_simd_progress_while_dsa_active_bytes;
+	u64 profile_simd_quanta_while_dsa_active;
+	u64 profile_dsa_fresh_claim_bytes;
+	u64 profile_dsa_active_zero_while_normal_cpu_work;
+	u64 profile_ready_completions_before_simd;
+	u64 profile_ready_completions_after_simd;
+	u64 profile_scheduler_iterations;
+	u64 profile_dsa_refill_samples;
+	u64 profile_post_refill_active_sum;
+	u64 profile_post_refill_active_lt_32;
+	u64 profile_post_refill_active_lt_64;
+	u64 profile_post_refill_active_lt_96;
+	u64 profile_fresh_refill_spans;
+	u64 profile_fresh_refill_batches;
+	u64 profile_fresh_refill_blocked_fault_debt;
+	u64 profile_dsa_empty_with_claimable_fresh;
+	/* Set only after this service has promoted a locally staged generation.
+	 * It is a scheduling input, not merely a reporting label. */
+	bool service_parent_mapping_warm;
 	struct hot_prq_profile_source profile_prq_sources[HOT_DSA_MAX_WQ];
 	u32 profile_nr_prq_sources;
 	bool profile_prq_available;
@@ -387,13 +748,9 @@ struct hot_page_source {
 struct hot_vma_segment {
 	unsigned long start;
 	unsigned long end;
+	unsigned long vma_start;
 	off_t off;
-	int fd;
-	void *map;
-	size_t map_size;
-	bool map_writable;
-	bool reuses_parent;
-	char file[PATH_MAX];
+	size_t owner;
 };
 
 static uint64_t hot_now_us(void)
@@ -1125,6 +1482,26 @@ static int hot_dsa_wq_supports_demand_paging(const char *path)
 	return 0;
 }
 
+/* no-BOF descriptors still require SVA/ATS so a source translation fault is
+ * returned in the completion record.  Unlike the BOF baseline they do not
+ * require the work queue to block on that fault. */
+static int hot_dsa_wq_supports_ats(const char *path)
+{
+	const char *name = strrchr(path, '/');
+	char sysfs[PATH_MAX];
+	char value[32];
+
+	if (!name || !name[1])
+		return -1;
+	name++;
+	if (snprintf(sysfs, sizeof(sysfs),
+		     "/sys/bus/dsa/devices/%s/ats_disable", name) >=
+		    (int)sizeof(sysfs) ||
+	    hot_read_small_file(sysfs, value, sizeof(value)) || value[0] != '0')
+		return -1;
+	return 0;
+}
+
 static void hot_dsa_close(struct hot_apply_ctx *ctx)
 {
 	int i;
@@ -1174,6 +1551,11 @@ static int hot_dsa_open(struct hot_apply_ctx *ctx)
 		    hot_dsa_wq_supports_demand_paging(paths[i])) {
 			pr_err("DSA hybrid-demand requires block_on_fault=1 and ats_disable=0: %s\n",
 			       paths[i]);
+			goto err;
+		}
+		if (ctx->fg_compare_backend == HOT_FG_COMPARE_HYBRID_FAULT_SIMD &&
+		    hot_dsa_wq_supports_ats(paths[i])) {
+			pr_err("DSA hybrid-fault-simd requires ats_disable=0: %s\n", paths[i]);
 			goto err;
 		}
 		if (hot_dsa_wq_max_transfer(paths[i], &wq_max_xfer)) {
@@ -1696,16 +2078,27 @@ static int read_full_fd(int fd, void *buf, size_t len)
 	return 0;
 }
 
+/* Physical backing.  This is the only object allowed to own an FD or mmap.
+ * A manifest line is deliberately not an owner: one backing may be referenced
+ * by several address views after a VMA split or merge. */
+struct hot_memstore_owner {
+	int fd;
+	void *map;
+	size_t map_size;
+	bool map_writable;
+	bool created;
+	dev_t dev;
+	ino_t ino;
+	char file[PATH_MAX];
+};
+
+/* Logical address coverage from the hot memory manifest. */
 struct hot_memstore_seg {
 	unsigned long img_id;
 	unsigned long vaddr;
 	unsigned long len;
 	off_t off;
-	int fd;
-	void *map;
-	size_t map_size;
-	bool map_writable;
-	char file[PATH_MAX];
+	size_t owner;
 };
 
 #define DSA_FG_PATCH_SIZE	128U
@@ -1731,6 +2124,13 @@ static bool dsa_fine_grained_enabled(void)
 			   !strcasecmp(enabled, "yes") || !strcasecmp(enabled, "on"));
 }
 
+static bool dsa_aligned_full_enabled(void)
+{
+	const char *format = getenv("CRIU_DSA_OUTPUT_FORMAT");
+
+	return format && !strcasecmp(format, "full");
+}
+
 static const char *hot_fg_compare_backend_name(enum hot_fg_compare_backend backend)
 {
 	switch (backend) {
@@ -1746,6 +2146,8 @@ static const char *hot_fg_compare_backend_name(enum hot_fg_compare_backend backe
 		return "simd-avx512";
 	case HOT_FG_COMPARE_HYBRID_DEMAND:
 		return "hybrid-demand";
+	case HOT_FG_COMPARE_HYBRID_FAULT_SIMD:
+		return "hybrid-fault-simd";
 	case HOT_FG_COMPARE_VALIDATE:
 		return "validate";
 	default:
@@ -1778,7 +2180,7 @@ static bool hot_fg_cpu_supports_avx512(void)
 static int hot_fg_select_compare_backend(struct hot_apply_ctx *ctx)
 {
 	const char *value = getenv("CRIU_DSA_FG_COMPARE_BACKEND");
-	enum hot_fg_compare_backend backend = HOT_FG_COMPARE_DSA;
+	enum hot_fg_compare_backend backend = HOT_FG_COMPARE_HYBRID_FAULT_SIMD;
 
 	if (value && value[0]) {
 		if (!strcasecmp(value, "dsa"))
@@ -1793,6 +2195,8 @@ static int hot_fg_select_compare_backend(struct hot_apply_ctx *ctx)
 			backend = HOT_FG_COMPARE_SIMD_AVX512;
 		else if (!strcasecmp(value, "hybrid-demand"))
 			backend = HOT_FG_COMPARE_HYBRID_DEMAND;
+		else if (!strcasecmp(value, "hybrid-fault-simd"))
+			backend = HOT_FG_COMPARE_HYBRID_FAULT_SIMD;
 		else if (!strcasecmp(value, "validate"))
 			backend = HOT_FG_COMPARE_VALIDATE;
 		else {
@@ -1807,6 +2211,7 @@ static int hot_fg_select_compare_backend(struct hot_apply_ctx *ctx)
 	}
 	if ((backend == HOT_FG_COMPARE_SIMD_AVX512 ||
 	     backend == HOT_FG_COMPARE_HYBRID_DEMAND ||
+	     backend == HOT_FG_COMPARE_HYBRID_FAULT_SIMD ||
 	     backend == HOT_FG_COMPARE_VALIDATE) && !hot_fg_cpu_supports_avx512()) {
 		pr_err("DSA fine-grained %s backend requires AVX-512F/BW/VL\n",
 		       hot_fg_compare_backend_name(backend));
@@ -1876,8 +2281,123 @@ static size_t hot_memstore_lower_bound(struct hot_memstore_seg *segs, size_t nr,
 	return lo;
 }
 
-static int hot_memstore_load(const char *path, struct hot_memstore_seg **segs_out,
-			     size_t *nr_out)
+static int hot_memstore_owner_add_fd(struct hot_apply_ctx *ctx, int fd,
+				    const char *file, bool created, size_t *owner_out)
+{
+	struct stat st;
+	struct hot_memstore_owner *owners;
+	size_t i;
+
+	if (fstat(fd, &st)) {
+		pr_perror("DSA hot memstore backing fstat failed %s", file);
+		return -1;
+	}
+	if (!S_ISREG(st.st_mode) || st.st_size <= 0 ||
+	    (uint64_t)st.st_size > (uint64_t)(size_t)-1) {
+		pr_err("DSA hot memstore backing is not a nonempty regular file %s\n", file);
+		return -1;
+	}
+	for (i = 0; i < ctx->nr_owners; i++) {
+		struct hot_memstore_owner *owner = &ctx->owners[i];
+
+		if (owner->dev != st.st_dev || owner->ino != st.st_ino)
+			continue;
+		if (owner->map_size != (size_t)st.st_size) {
+			pr_err("DSA hot memstore backing size changed while loading %s\n", file);
+			return -1;
+		}
+		close(fd);
+		*owner_out = i;
+		return 0;
+	}
+	if (ctx->nr_owners == ctx->owners_cap) {
+		size_t cap = ctx->owners_cap ? ctx->owners_cap * 2 : 128;
+
+		owners = xrealloc(ctx->owners, cap * sizeof(*owners));
+		if (!owners)
+			return -1;
+		ctx->owners = owners;
+		ctx->owners_cap = cap;
+	}
+	ctx->owners[ctx->nr_owners] = (struct hot_memstore_owner) {
+		.fd = fd,
+		.map = MAP_FAILED,
+		.map_size = (size_t)st.st_size,
+		.created = created,
+		.dev = st.st_dev,
+		.ino = st.st_ino,
+	};
+	if (snprintf(ctx->owners[ctx->nr_owners].file,
+		     sizeof(ctx->owners[ctx->nr_owners].file), "%s", file) >=
+	    (int)sizeof(ctx->owners[ctx->nr_owners].file)) {
+		pr_err("DSA hot memstore backing path too long\n");
+		return -1;
+	}
+	*owner_out = ctx->nr_owners++;
+	return 0;
+}
+
+static int hot_memstore_owner_open_existing(struct hot_apply_ctx *ctx,
+					    const char *file, size_t *owner_out)
+{
+	int fd = open(file, O_RDWR | O_CLOEXEC);
+
+	if (fd < 0) {
+		pr_perror("DSA hot memstore can't open backing %s", file);
+		return -1;
+	}
+	if (hot_memstore_owner_add_fd(ctx, fd, file, false, owner_out)) {
+		close(fd);
+		return -1;
+	}
+	return 0;
+}
+
+static struct hot_memstore_owner *hot_memstore_owner_get(struct hot_apply_ctx *ctx,
+							 size_t index)
+{
+	if (index >= ctx->nr_owners) {
+		pr_err("DSA hot memstore invalid backing owner index=%zu count=%zu\n",
+		       index, ctx->nr_owners);
+		return NULL;
+	}
+	return &ctx->owners[index];
+}
+
+static void *hot_memstore_owner_map(struct hot_apply_ctx *ctx, size_t index)
+{
+	struct hot_memstore_owner *owner = hot_memstore_owner_get(ctx, index);
+
+	if (!owner)
+		return MAP_FAILED;
+	if (owner->map && owner->map != MAP_FAILED)
+		return owner->map;
+	owner->map = mmap(NULL, owner->map_size, PROT_READ, MAP_SHARED, owner->fd, 0);
+	if (owner->map == MAP_FAILED)
+		pr_perror("DSA hot memstore can't mmap backing %s", owner->file);
+	return owner->map;
+}
+
+static int hot_memstore_owner_make_writable(struct hot_apply_ctx *ctx, size_t index)
+{
+	struct hot_memstore_owner *owner = hot_memstore_owner_get(ctx, index);
+
+	if (!owner || hot_memstore_owner_map(ctx, index) == MAP_FAILED)
+		return -1;
+	if (owner->map_writable)
+		return 0;
+	if (mprotect(owner->map, owner->map_size, PROT_READ | PROT_WRITE)) {
+		pr_perror("DSA hot memstore can't make backing writable %s", owner->file);
+		return -1;
+	}
+	owner->map_writable = true;
+	if (ctx->profile)
+		ctx->profile_hot_mprotect_ops++;
+	return 0;
+}
+
+static int hot_memstore_load(struct hot_apply_ctx *ctx, const char *path,
+			     struct hot_memstore_seg **segs_out, size_t *nr_out)
 {
 	FILE *fp;
 	struct hot_memstore_seg *segs = NULL;
@@ -1899,27 +2419,33 @@ static int hot_memstore_load(const char *path, struct hot_memstore_seg **segs_ou
 
 	while (fgets(line, sizeof(line), fp)) {
 		struct hot_memstore_seg seg;
+		char file[PATH_MAX];
 		unsigned long long off;
 		int n;
 
 		memset(&seg, 0, sizeof(seg));
-		seg.fd = -1;
-		seg.map = MAP_FAILED;
 		n = sscanf(line, "seg %lu %lx %lu %4095s %llu",
-			   &seg.img_id, &seg.vaddr, &seg.len, seg.file, &off);
+			   &seg.img_id, &seg.vaddr, &seg.len, file, &off);
 		if (n != 5)
 			continue;
 		seg.off = (off_t)off;
+		if (!seg.len || seg.vaddr > ULONG_MAX - seg.len ||
+		    seg.vaddr & (PAGE_SIZE - 1) || seg.len & (PAGE_SIZE - 1) ||
+		    seg.off < 0 || (seg.off & (PAGE_SIZE - 1)) ||
+		    hot_memstore_owner_open_existing(ctx, file, &seg.owner))
+			goto err;
+		if ((uint64_t)seg.off > (uint64_t)ctx->owners[seg.owner].map_size ||
+		    seg.len > ctx->owners[seg.owner].map_size - (size_t)seg.off) {
+			pr_err("DSA hot memstore manifest extent exceeds backing %s\n", file);
+			goto err;
+		}
 
 		if (nr == cap) {
 			size_t new_cap = cap ? cap * 2 : 256;
 			void *new_segs = xrealloc(segs, new_cap * sizeof(segs[0]));
 
-			if (!new_segs) {
-				fclose(fp);
-				xfree(segs);
-				return -1;
-			}
+			if (!new_segs)
+				goto err;
 			segs = new_segs;
 			cap = new_cap;
 		}
@@ -1927,11 +2453,29 @@ static int hot_memstore_load(const char *path, struct hot_memstore_seg **segs_ou
 	}
 
 	fclose(fp);
-	if (nr)
+	if (nr) {
 		qsort(segs, nr, sizeof(segs[0]), hot_memstore_seg_cmp);
+		for (cap = 1; cap < nr; cap++) {
+			struct hot_memstore_seg *prev = &segs[cap - 1];
+			struct hot_memstore_seg *cur = &segs[cap];
+
+			if (prev->img_id == cur->img_id &&
+			    (prev->vaddr + prev->len < prev->vaddr ||
+			     prev->vaddr + prev->len > cur->vaddr)) {
+				pr_err("DSA hot memstore manifest has overlapping views\n");
+				xfree(segs);
+				return -1;
+			}
+		}
+	}
 	*segs_out = segs;
 	*nr_out = nr;
 	return 0;
+
+err:
+	fclose(fp);
+	xfree(segs);
+	return -1;
 }
 
 static int hot_memstore_emit_line_fd(int fd, unsigned long img_id,
@@ -1984,91 +2528,69 @@ static int hot_memstore_mkdir_image(struct hot_apply_ctx *ctx, char *dir,
 	return hot_apply_mkdir_root(dir);
 }
 
-static int hot_memstore_open_vma_segment(struct hot_apply_ctx *ctx,
-					 unsigned long start,
-					 unsigned long end,
-					 const char *reuse_file,
-					 off_t reuse_off,
-					 struct hot_vma_segment *seg)
+static int hot_memstore_create_vma_backing(struct hot_apply_ctx *ctx,
+					   unsigned long start, unsigned long end,
+					   size_t *owner_out)
 {
 	char dir[PATH_MAX];
 	char path[PATH_MAX];
 	unsigned long len = end - start;
 	int fd;
-
-	memset(seg, 0, sizeof(*seg));
-	seg->fd = -1;
-	seg->map = MAP_FAILED;
-	seg->start = start;
-	seg->end = end;
-	seg->off = reuse_off;
-	seg->reuses_parent = reuse_file && reuse_file[0];
-
-	if (reuse_file && reuse_file[0]) {
-		fd = open(reuse_file, O_RDWR | O_CLOEXEC);
-		if (fd < 0) {
-			pr_perror("DSA hot memstore can't reopen VMA segment %s", reuse_file);
-			return -1;
-		}
-		if (snprintf(seg->file, sizeof(seg->file), "%s", reuse_file) >=
-		    (int)sizeof(seg->file)) {
-			pr_err("DSA hot memstore reused VMA path too long\n");
-			close(fd);
-			return -1;
-		}
-		seg->fd = fd;
-		return 0;
-	}
+	unsigned int attempt;
 
 	if (hot_memstore_mkdir_image(ctx, dir, sizeof(dir)))
 		return -1;
-	if (snprintf(path, sizeof(path), "%s/vma-%lx-%lx.mem", dir, start, end) >=
-	    (int)sizeof(path)) {
-		pr_err("DSA hot memstore VMA segment path too long\n");
-		return -1;
+	for (attempt = 0; attempt < 1024; attempt++) {
+		if (snprintf(path, sizeof(path), "%s/vma-%lx-%lx-%lu.mem", dir,
+			     start, end, ctx->next_seq++) >= (int)sizeof(path)) {
+			pr_err("DSA hot memstore VMA backing path too long\n");
+			return -1;
+		}
+		fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
+		if (fd >= 0)
+			break;
+		if (errno != EEXIST) {
+			pr_perror("DSA hot memstore can't create VMA backing %s", path);
+			return -1;
+		}
 	}
-
-	fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
-	if (fd < 0) {
-		pr_perror("DSA hot memstore can't open VMA segment %s", path);
+	if (attempt == 1024) {
+		pr_err("DSA hot memstore couldn't allocate unique VMA backing\n");
 		return -1;
 	}
 	if (ftruncate(fd, len)) {
-		pr_perror("DSA hot memstore can't size VMA segment %s", path);
+		pr_perror("DSA hot memstore can't size VMA backing %s", path);
 		close(fd);
+		unlink(path);
 		return -1;
 	}
-
-	if (snprintf(seg->file, sizeof(seg->file), "%s", path) >=
-	    (int)sizeof(seg->file)) {
-		pr_err("DSA hot memstore VMA path too long\n");
+	if (hot_memstore_owner_add_fd(ctx, fd, path, true, owner_out)) {
 		close(fd);
+		unlink(path);
 		return -1;
 	}
-	seg->fd = fd;
-	seg->off = 0;
 	return 0;
 }
 
-static int hot_memstore_prefill_vma_from_old(struct hot_apply_ctx *ctx,
-					     struct hot_vma_segment *seg);
-
-static int hot_memstore_register_segment(struct hot_apply_ctx *ctx,
-					 unsigned long start,
-					 unsigned long end,
-					 const char *reuse_file,
-					 off_t reuse_off,
-					 bool prefill_old)
+static int hot_memstore_register_view(struct hot_apply_ctx *ctx,
+					  unsigned long start, unsigned long end,
+					  unsigned long vma_start, size_t owner, off_t off)
 {
 	struct hot_vma_segment seg;
 	void *new_segments;
 
-	if (hot_memstore_open_vma_segment(ctx, start, end, reuse_file,
-					  reuse_off, &seg))
+	if (start >= end || owner >= ctx->nr_owners || off < 0 ||
+	    (uint64_t)off > (uint64_t)ctx->owners[owner].map_size ||
+	    end - start > ctx->owners[owner].map_size - (size_t)off)
 		return -1;
-	if (prefill_old && hot_memstore_prefill_vma_from_old(ctx, &seg)) {
-		close(seg.fd);
-		return -1;
+	if (ctx->nr_vma_segments) {
+		struct hot_vma_segment *prev = &ctx->vma_segments[ctx->nr_vma_segments - 1];
+
+		if (prev->end == start && prev->vma_start == vma_start &&
+		    prev->owner == owner && prev->off + (off_t)(prev->end - prev->start) == off) {
+			prev->end = end;
+			return 0;
+		}
 	}
 
 	if (ctx->nr_vma_segments == ctx->vma_segments_cap) {
@@ -2076,13 +2598,18 @@ static int hot_memstore_register_segment(struct hot_apply_ctx *ctx,
 
 		new_segments = xrealloc(ctx->vma_segments,
 					new_cap * sizeof(ctx->vma_segments[0]));
-		if (!new_segments) {
-			close(seg.fd);
+		if (!new_segments)
 			return -1;
-		}
 		ctx->vma_segments = new_segments;
 		ctx->vma_segments_cap = new_cap;
 	}
+	seg = (struct hot_vma_segment) {
+		.start = start,
+		.end = end,
+		.vma_start = vma_start,
+		.off = off,
+		.owner = owner,
+	};
 	ctx->vma_segments[ctx->nr_vma_segments++] = seg;
 	return 0;
 }
@@ -2095,6 +2622,12 @@ static int hot_memstore_plan_segment(struct hot_apply_ctx *ctx,
 
 	if (start >= end || start & (PAGE_SIZE - 1) || end & (PAGE_SIZE - 1)) {
 		pr_err("DSA hot memstore has invalid VMA plan %lx-%lx\n", start, end);
+		return -1;
+	}
+	if (ctx->nr_vma_plans && start < ctx->vma_plans[ctx->nr_vma_plans - 1].end) {
+		pr_err("DSA hot memstore VMA plan is not ordered/non-overlapping prev=%lx-%lx next=%lx-%lx\n",
+		       ctx->vma_plans[ctx->nr_vma_plans - 1].start,
+		       ctx->vma_plans[ctx->nr_vma_plans - 1].end, start, end);
 		return -1;
 	}
 	if (ctx->nr_vma_plans == ctx->vma_plans_cap) {
@@ -2150,10 +2683,17 @@ static struct hot_memstore_seg *hot_memstore_find_old_cover(struct hot_apply_ctx
 	return NULL;
 }
 
-static int hot_memstore_materialize_vmas(struct hot_apply_ctx *ctx)
+static int hot_memstore_materialize_vmas(struct hot_apply_ctx *ctx,
+					 size_t *failure_index,
+					 unsigned long *failure_vaddr)
 {
 	size_t i;
+	size_t old_i = 0;
 
+	if (failure_index)
+		*failure_index = SIZE_MAX;
+	if (failure_vaddr)
+		*failure_vaddr = ULONG_MAX;
 	if (ctx->vmas_materialized)
 		return 0;
 	if (!ctx->nr_vma_plans) {
@@ -2161,7 +2701,7 @@ static int hot_memstore_materialize_vmas(struct hot_apply_ctx *ctx)
 		return -1;
 	}
 	if (!ctx->parent_view_loaded) {
-		if (hot_memstore_load(ctx->memory_manifest_path, &ctx->old_memstore,
+		if (hot_memstore_load(ctx, ctx->memory_manifest_path, &ctx->old_memstore,
 				       &ctx->nr_old_memstore))
 			return -1;
 		ctx->parent_view_loaded = true;
@@ -2169,50 +2709,84 @@ static int hot_memstore_materialize_vmas(struct hot_apply_ctx *ctx)
 
 	for (i = 0; i < ctx->nr_vma_plans; i++) {
 		struct hot_vma_plan *plan = &ctx->vma_plans[i];
-		struct hot_memstore_seg *old;
-		const char *reuse_file = NULL;
-		off_t reuse_off = 0;
+		unsigned long pos = plan->start;
+		size_t gap_owner = (size_t)-1;
 
-		old = hot_memstore_find_old_cover(ctx, plan->start, plan->end);
-		if (old) {
-			reuse_file = old->file;
-			reuse_off = old->off + (plan->start - old->vaddr);
+		while (old_i < ctx->nr_old_memstore &&
+		       (ctx->old_memstore[old_i].img_id < ctx->img_id ||
+			ctx->old_memstore[old_i].vaddr + ctx->old_memstore[old_i].len <= pos))
+			old_i++;
+		while (pos < plan->end) {
+			struct hot_memstore_seg *old = NULL;
+			unsigned long end;
+
+			if (old_i < ctx->nr_old_memstore &&
+			    ctx->old_memstore[old_i].img_id == ctx->img_id &&
+			    ctx->old_memstore[old_i].vaddr <= pos &&
+			    pos < ctx->old_memstore[old_i].vaddr + ctx->old_memstore[old_i].len)
+				old = &ctx->old_memstore[old_i];
+			if (old) {
+				end = old->vaddr + old->len;
+				if (end > plan->end)
+					end = plan->end;
+				if (hot_memstore_register_view(ctx, pos, end, plan->start,
+							      old->owner,
+							      old->off + (off_t)(pos - old->vaddr))) {
+					if (failure_index)
+						*failure_index = i;
+					if (failure_vaddr)
+						*failure_vaddr = plan->start;
+					return -1;
+				}
+				pos = end;
+				if (pos == old->vaddr + old->len)
+					old_i++;
+				continue;
+			}
+			end = plan->end;
+			if (old_i < ctx->nr_old_memstore &&
+			    ctx->old_memstore[old_i].img_id == ctx->img_id &&
+			    ctx->old_memstore[old_i].vaddr > pos &&
+			    ctx->old_memstore[old_i].vaddr < end)
+				end = ctx->old_memstore[old_i].vaddr;
+			if (gap_owner == (size_t)-1 &&
+			    hot_memstore_create_vma_backing(ctx, plan->start, plan->end,
+							     &gap_owner)) {
+				if (failure_index)
+					*failure_index = i;
+				if (failure_vaddr)
+					*failure_vaddr = plan->start;
+				return -1;
+			}
+			if (hot_memstore_register_view(ctx, pos, end, plan->start,
+						      gap_owner, (off_t)(pos - plan->start))) {
+				if (failure_index)
+					*failure_index = i;
+				if (failure_vaddr)
+					*failure_vaddr = plan->start;
+				return -1;
+			}
+			pos = end;
 		}
-		if (hot_memstore_register_segment(ctx, plan->start, plan->end,
-					  reuse_file, reuse_off, !old))
-			return -1;
 	}
 	ctx->vmas_materialized = true;
-	pr_info("DSA hot memstore VMA index materialized img_id=%lu segments=%zu old_segments=%zu\n",
-		ctx->img_id, ctx->nr_vma_segments, ctx->nr_old_memstore);
+	pr_info("DSA hot memstore VMA views materialized img_id=%lu views=%zu old_views=%zu owners=%zu\n",
+		ctx->img_id, ctx->nr_vma_segments, ctx->nr_old_memstore, ctx->nr_owners);
 	return 0;
 }
 
-static int hot_memstore_old_fd(struct hot_memstore_seg *old)
+static void *hot_memstore_old_map(struct hot_apply_ctx *ctx,
+					  const struct hot_memstore_seg *old)
 {
-	if (old->fd >= 0)
-		return old->fd;
+	struct hot_memstore_owner *owner = hot_memstore_owner_get(ctx, old->owner);
+	void *map;
 
-	old->fd = open(old->file, O_RDWR | O_CLOEXEC);
-	if (old->fd < 0)
-		pr_perror("DSA hot memstore can't open old segment %s", old->file);
-	return old->fd;
-}
-
-static void *hot_memstore_old_map(struct hot_memstore_seg *old)
-{
-	if (old->map && old->map != MAP_FAILED)
-		return old->map;
-
-	if (hot_memstore_old_fd(old) < 0)
+	if (!owner)
 		return MAP_FAILED;
-
-	old->map = mmap(NULL, old->len, PROT_READ, MAP_SHARED, old->fd, old->off);
-	if (old->map == MAP_FAILED)
-		pr_perror("DSA hot memstore can't mmap old segment %s", old->file);
-	else
-		old->map_size = old->len;
-	return old->map;
+	map = hot_memstore_owner_map(ctx, old->owner);
+	if (map == MAP_FAILED)
+		return MAP_FAILED;
+	return (char *)map + old->off;
 }
 
 static struct hot_apply_ctx *hot_apply_alloc_ctx(int fd_type,
@@ -2253,7 +2827,10 @@ static struct hot_apply_ctx *hot_apply_alloc_ctx(int fd_type,
 	ctx->memory_manifest_path = memory_manifest;
 	ctx->memory_next_path = memory_next;
 	ctx->memstore = hot_mode_is_memstore();
-	ctx->fine_grained = ctx->memstore && dsa_fine_grained_enabled();
+	/* Full-output control uses the same memstore transaction as fine output,
+	 * but it never creates PARENT/PATCH/FULL compare results. */
+	ctx->fine_grained = ctx->memstore &&
+		(dsa_fine_grained_enabled() || dsa_aligned_full_enabled());
 	ctx->profile = dsa_profile_enabled();
 	ctx->compare_breakdown = compare_breakdown == 1;
 	if (ctx->compare_breakdown && (!ctx->fine_grained || !ctx->profile)) {
@@ -2266,8 +2843,9 @@ static struct hot_apply_ctx *hot_apply_alloc_ctx(int fd_type,
 		return NULL;
 	}
 	if (ctx->compare_breakdown &&
-	    ctx->fg_compare_backend == HOT_FG_COMPARE_HYBRID_DEMAND) {
-		pr_err("DSA hybrid-demand backend cannot use the global-prefault compare breakdown mode\n");
+	    (ctx->fg_compare_backend == HOT_FG_COMPARE_HYBRID_DEMAND ||
+	     ctx->fg_compare_backend == HOT_FG_COMPARE_HYBRID_FAULT_SIMD)) {
+		pr_err("DSA hybrid demand/fault backend cannot use the global-prefault compare breakdown mode\n");
 		xfree(ctx);
 		return NULL;
 	}
@@ -2297,6 +2875,11 @@ int page_xfer_hot_prepare_before_freeze(unsigned long img_id)
 	u64 parent_bytes = 0;
 	u64 phase_start_us = 0;
 
+	/* In task-service mode CDP has already completed SESSION_PREPARE and the
+	 * service owns parent maps/WQ.  Recreating a local context here would both
+	 * duplicate PTE population and undermine the long-lived mapping. */
+	if (dsa_memory_service_client_fd() >= 0)
+		return 0;
 	if (!dsa_hot_apply_enabled() || !hot_mode_is_memstore() ||
 	    !dsa_fine_grained_enabled())
 		return 0;
@@ -2319,7 +2902,7 @@ int page_xfer_hot_prepare_before_freeze(unsigned long img_id)
 	 * map it now, but deliberately do not touch all mapped parent pages. */
 	if (ctx->profile)
 		phase_start_us = dsa_profile_wall_now_us();
-	if (hot_memstore_load(ctx->memory_manifest_path, &ctx->old_memstore,
+	if (hot_memstore_load(ctx, ctx->memory_manifest_path, &ctx->old_memstore,
 			       &ctx->nr_old_memstore))
 		goto err;
 	if (ctx->profile)
@@ -2328,7 +2911,7 @@ int page_xfer_hot_prepare_before_freeze(unsigned long img_id)
 	if (ctx->profile)
 		phase_start_us = dsa_profile_wall_now_us();
 	for (i = 0; i < ctx->nr_old_memstore; i++) {
-		if (hot_memstore_old_map(&ctx->old_memstore[i]) == MAP_FAILED)
+		if (hot_memstore_old_map(ctx, &ctx->old_memstore[i]) == MAP_FAILED)
 			goto err;
 		parent_bytes += ctx->old_memstore[i].len;
 	}
@@ -2374,96 +2957,6 @@ int page_xfer_hot_prepare_before_freeze(unsigned long img_id)
 	return -1;
 }
 
-static int copy_fd_range_loop(int src_fd, off_t src_off, int dst_fd,
-			      off_t dst_off, unsigned long len)
-{
-	char buf[PAGE_SIZE * 16];
-	unsigned long done = 0;
-
-	while (done < len) {
-		size_t chunk = len - done;
-		size_t curr = 0;
-
-		if (chunk > sizeof(buf))
-			chunk = sizeof(buf);
-		while (curr < chunk) {
-			size_t want = chunk - curr;
-			ssize_t ret;
-
-			if (want > sizeof(buf) - curr)
-				want = sizeof(buf) - curr;
-			ret = pread(src_fd, buf + curr, want,
-					    src_off + done + curr);
-
-			if (ret < 1) {
-				pr_perror("DSA hot memstore old segment read failed");
-				return -1;
-			}
-			curr += ret;
-		}
-
-		curr = 0;
-		while (curr < chunk) {
-			size_t want = chunk - curr;
-			ssize_t ret;
-
-			if (want > sizeof(buf) - curr)
-				want = sizeof(buf) - curr;
-			ret = pwrite(dst_fd, buf + curr, want,
-					     dst_off + done + curr);
-
-			if (ret < 1) {
-				pr_perror("DSA hot memstore VMA prefill write failed");
-				return -1;
-			}
-			curr += ret;
-		}
-		done += chunk;
-	}
-
-	return 0;
-}
-
-static int hot_memstore_prefill_vma_from_old(struct hot_apply_ctx *ctx,
-					     struct hot_vma_segment *seg)
-{
-	size_t i;
-
-	for (i = 0; i < ctx->nr_old_memstore; i++) {
-		struct hot_memstore_seg *old = &ctx->old_memstore[i];
-		unsigned long old_end;
-		unsigned long begin, end, len;
-		int old_fd;
-		int ret;
-
-		if (old->img_id != ctx->img_id)
-			continue;
-		old_end = old->vaddr + old->len;
-		if (old_end <= seg->start || old->vaddr >= seg->end)
-			continue;
-
-		begin = old->vaddr > seg->start ? old->vaddr : seg->start;
-		end = old_end < seg->end ? old_end : seg->end;
-		len = end - begin;
-		if (!len)
-			continue;
-
-		old_fd = open(old->file, O_RDONLY | O_CLOEXEC);
-		if (old_fd < 0) {
-			pr_perror("DSA hot memstore can't open old segment %s", old->file);
-			return -1;
-		}
-		ret = copy_fd_range_loop(old_fd, old->off + (begin - old->vaddr),
-					 seg->fd, seg->off + (begin - seg->start),
-					 len);
-		close(old_fd);
-		if (ret)
-			return -1;
-	}
-
-	return 0;
-}
-
 static struct hot_vma_segment *hot_memstore_find_vma_segment(struct hot_apply_ctx *ctx,
 							     unsigned long vaddr,
 							     unsigned long len)
@@ -2501,70 +2994,10 @@ static struct hot_vma_segment *hot_memstore_find_vma_segment(struct hot_apply_ct
 	return NULL;
 }
 
-static int hot_memstore_old_make_writable(struct hot_apply_ctx *ctx,
-					  struct hot_memstore_seg *old)
-{
-	if (!old->map || old->map == MAP_FAILED || !old->map_size)
-		return -1;
-	if (old->map_writable)
-		return 0;
-	if (mprotect(old->map, old->map_size, PROT_READ | PROT_WRITE)) {
-		pr_perror("DSA hot memstore can't make parent segment writable %s", old->file);
-		return -1;
-	}
-	old->map_writable = true;
-	if (ctx->profile)
-		ctx->profile_hot_mprotect_ops++;
-	return 0;
-}
-
 static int hot_memstore_map_segment_writable(struct hot_apply_ctx *ctx,
 					     struct hot_vma_segment *seg)
 {
-	if (!seg->map || seg->map == MAP_FAILED) {
-		seg->map_size = seg->end - seg->start;
-		seg->map = mmap(NULL, seg->map_size, PROT_READ, MAP_SHARED, seg->fd,
-				seg->off);
-		if (seg->map == MAP_FAILED) {
-			pr_perror("DSA hot memstore can't mmap current segment %s", seg->file);
-			return -1;
-		}
-	}
-	if (seg->map_writable)
-		return 0;
-	if (mprotect(seg->map, seg->map_size, PROT_READ | PROT_WRITE)) {
-		pr_perror("DSA hot memstore can't make current segment writable %s", seg->file);
-		return -1;
-	}
-	seg->map_writable = true;
-	if (ctx->profile)
-		ctx->profile_hot_mprotect_ops++;
-	return 0;
-}
-
-static int hot_memstore_write_to_old(struct hot_apply_ctx *ctx,
-				     struct hot_memstore_seg *old, const void *buf,
-				     unsigned long vaddr, unsigned long len)
-{
-	if (vaddr < old->vaddr || len > old->len ||
-	    vaddr - old->vaddr > old->len - len)
-		return -1;
-	if (hot_memstore_old_make_writable(ctx, old))
-		return -1;
-	memcpy((char *)old->map + vaddr - old->vaddr, buf, len);
-	if (ctx->profile)
-		ctx->profile_hot_memcpy_bytes += len;
-	return 0;
-}
-
-static bool hot_memstore_segment_reuses_old(const struct hot_vma_segment *seg,
-					      const struct hot_memstore_seg *old,
-					      unsigned long vaddr)
-{
-	if (!seg || !old || !seg->reuses_parent || strcmp(seg->file, old->file))
-		return false;
-	return seg->off + (off_t)(vaddr - seg->start) ==
-		old->off + (off_t)(vaddr - old->vaddr);
+	return hot_memstore_owner_make_writable(ctx, seg->owner);
 }
 
 static int hot_memstore_write_to_segments(struct hot_apply_ctx *ctx,
@@ -2591,7 +3024,8 @@ static int hot_memstore_write_to_segments(struct hot_apply_ctx *ctx,
 			chunk = len - done;
 		if (hot_memstore_map_segment_writable(ctx, seg))
 			return -1;
-		memcpy((char *)seg->map + cur - seg->start,
+		memcpy((char *)hot_memstore_owner_map(ctx, seg->owner) + seg->off +
+		       (cur - seg->start),
 		       (const char *)buf + done, chunk);
 		if (ctx->profile) {
 			ctx->profile_hot_memcpy_bytes += chunk;
@@ -2760,6 +3194,199 @@ out:
 	return ret;
 }
 
+/* The definition follows the shared batch sink.  Service mode consumes only
+ * the release-published result array; it never rebuilds a compare plan. */
+static int page_xfer_dsa_fg_write_sidecar_results(struct page_xfer *xfer,
+						  const void *shared_ptr);
+
+/* The frozen scanner leaves a compact VMA list in CRIU memory.  Service mode
+ * copies that small control plane into the reserved tail of the same arena as
+ * the raw capture, then places canonical results immediately after it.  Thus
+ * neither VMA topology nor classified pages need a second shared mapping. */
+static int dsa_memory_service_publish_vma_plan(struct page_xfer *xfer)
+{
+	const struct dsa_fg_vma_plan_record *plans = xfer->dsa_fg_vma_plan_local;
+	u32 base = xfer->dsa_fg_result_meta_base;
+	u64 bytes;
+	u32 result_base;
+
+	if (!xfer || !xfer->dsa_fg_service || !xfer->dsa_fg_shared ||
+	    !plans || !xfer->dsa_fg_vma_plan_count)
+		return -1;
+	bytes = (u64)xfer->dsa_fg_vma_plan_count * sizeof(*plans);
+	if (bytes > UINT_MAX || base > xfer->dsa_fg_result_meta_limit ||
+	    bytes > xfer->dsa_fg_result_meta_limit - base)
+		return -1;
+	result_base = (base + (u32)bytes + 7U) & ~7U;
+	if (result_base < base || result_base > xfer->dsa_fg_result_meta_limit ||
+	    xfer->dsa_fg_result_meta_limit - result_base <
+		sizeof(struct parasite_dsa_fg_result))
+		return -1;
+	memcpy((unsigned char *)xfer->dsa_fg_shared + base, plans, (size_t)bytes);
+	__atomic_thread_fence(__ATOMIC_RELEASE);
+	xfer->dsa_fg_vma_plan_base = base;
+	xfer->dsa_fg_vma_plan_head = base + (u32)bytes;
+	xfer->dsa_fg_vma_plan_limit = result_base;
+	xfer->dsa_fg_result_meta_base = result_base;
+	xfer->dsa_fg_result_meta_head = result_base;
+	return 0;
+}
+
+static int dsa_memory_service_compare(struct page_xfer *xfer)
+{
+	struct cdp_dsa_memory_service_msg msg = {
+		.op = CDP_DSA_MS_COMPARE_REQ,
+	};
+	u64 phase_start_us = 0;
+	bool profile = dsa_profile_enabled();
+	int exchange_ret;
+
+	if (profile)
+		phase_start_us = dsa_profile_wall_now_us();
+	if (dsa_memory_service_publish_vma_plan(xfer)) {
+		pr_err("DSA memory service cannot publish VMA plan into raw arena\n");
+		return -1;
+	}
+	if (profile) {
+		xfer->dsa_fg_profile_request_publish_us =
+			dsa_profile_delta_us(phase_start_us, dsa_profile_wall_now_us());
+		phase_start_us = dsa_profile_wall_now_us();
+	}
+	msg.desc_off = xfer->dsa_fg_desc_area_off;
+	msg.desc_head = xfer->dsa_fg_desc_head;
+	msg.raw_off = xfer->dsa_fg_raw_payload_base;
+	msg.raw_head = xfer->dsa_fg_raw_payload_head;
+	msg.vma_plan_off = xfer->dsa_fg_vma_plan_base;
+	msg.vma_plan_head = xfer->dsa_fg_vma_plan_head;
+	msg.vma_plan_count = xfer->dsa_fg_vma_plan_count;
+	msg.result_off = xfer->dsa_fg_result_meta_base;
+	msg.result_limit = xfer->dsa_fg_result_meta_limit;
+	exchange_ret = dsa_memory_service_client_exchange(
+		xfer, &msg, CDP_DSA_MS_COMPARE_DONE, &xfer->dsa_fg_service_diag);
+	if (profile)
+		xfer->dsa_fg_profile_ipc_compare_us =
+			dsa_profile_delta_us(phase_start_us, dsa_profile_wall_now_us());
+	if (exchange_ret) {
+		pr_perror("DSA memory service COMPARE request failed");
+		return -1;
+	}
+	if (msg.result_head < xfer->dsa_fg_result_meta_base ||
+	    msg.result_head > xfer->dsa_fg_result_meta_limit ||
+	    (msg.result_head - xfer->dsa_fg_result_meta_base) %
+		sizeof(struct parasite_dsa_fg_result)) {
+		pr_err("DSA memory service returned invalid compare result bounds\n");
+		return -1;
+	}
+	__atomic_thread_fence(__ATOMIC_ACQUIRE);
+	xfer->dsa_fg_result_meta_head = msg.result_head;
+	xfer->dsa_fg_service_profile = msg.profile;
+	return 0;
+}
+
+/* The frozen parasite has release-published descriptor and payload heads.
+ * This is a small control-plane acknowledgement, not a copy or a second
+ * scan: it makes the producer/consumer boundary explicit before post-thaw
+ * compare or full materialisation starts. */
+static int dsa_memory_service_raw_sealed(struct page_xfer *xfer)
+{
+	struct cdp_dsa_memory_service_msg msg = {
+		.op = CDP_DSA_MS_RAW_SEALED,
+		.desc_off = xfer->dsa_fg_desc_area_off,
+		.desc_head = xfer->dsa_fg_desc_head,
+		.raw_off = xfer->dsa_fg_raw_payload_base,
+		.raw_head = xfer->dsa_fg_raw_payload_head,
+	};
+
+	__atomic_thread_fence(__ATOMIC_RELEASE);
+	if (dsa_memory_service_client_exchange(xfer, &msg, CDP_DSA_MS_RAW_READY,
+					       &xfer->dsa_fg_service_diag)) {
+		pr_perror("DSA memory service RAW_SEALED request failed");
+		return -1;
+	}
+	return 0;
+}
+
+static int dsa_memory_service_full_apply(struct page_xfer *xfer)
+{
+	struct cdp_dsa_memory_service_msg msg = {
+		.op = CDP_DSA_MS_FULL_APPLY_REQ,
+	};
+	u64 phase_start_us = 0;
+	bool profile = dsa_profile_enabled();
+
+	if (dsa_memory_service_publish_vma_plan(xfer)) {
+		pr_err("DSA memory service cannot publish full-output VMA plan\n");
+		return -1;
+	}
+	msg.desc_off = xfer->dsa_fg_desc_area_off;
+	msg.desc_head = xfer->dsa_fg_desc_head;
+	msg.raw_off = xfer->dsa_fg_raw_payload_base;
+	msg.raw_head = xfer->dsa_fg_raw_payload_head;
+	msg.vma_plan_off = xfer->dsa_fg_vma_plan_base;
+	msg.vma_plan_head = xfer->dsa_fg_vma_plan_head;
+	msg.vma_plan_count = xfer->dsa_fg_vma_plan_count;
+	if (profile)
+		phase_start_us = dsa_profile_wall_now_us();
+	if (dsa_memory_service_client_exchange(xfer, &msg,
+					       CDP_DSA_MS_FULL_APPLY_DONE,
+					       &xfer->dsa_fg_service_diag)) {
+		pr_perror("DSA memory service FULL_APPLY request failed");
+		return -1;
+	}
+	if (profile) {
+		xfer->dsa_fg_profile_ipc_apply_us +=
+			dsa_profile_delta_us(phase_start_us, dsa_profile_wall_now_us());
+		xfer->dsa_fg_service_profile = msg.profile;
+	}
+	return 0;
+}
+
+static int dsa_memory_service_apply(struct page_xfer *xfer)
+{
+	struct cdp_dsa_memory_service_msg msg = {
+		.op = CDP_DSA_MS_APPLY_REQ,
+		.desc_off = xfer->dsa_fg_desc_area_off,
+		.desc_head = xfer->dsa_fg_desc_head,
+		.raw_off = xfer->dsa_fg_raw_payload_base,
+		.raw_head = xfer->dsa_fg_raw_payload_head,
+		.result_off = xfer->dsa_fg_result_meta_base,
+		.result_head = xfer->dsa_fg_result_meta_head,
+		.result_limit = xfer->dsa_fg_result_meta_limit,
+	};
+	u64 phase_start_us = 0;
+	bool profile = dsa_profile_enabled();
+	int exchange_ret;
+
+	msg.profile = xfer->dsa_fg_service_profile;
+	if (profile)
+		msg.result_count = (xfer->dsa_fg_result_meta_head -
+				    xfer->dsa_fg_result_meta_base) /
+				   sizeof(struct parasite_dsa_fg_result);
+	if (profile)
+		phase_start_us = dsa_profile_wall_now_us();
+	exchange_ret = dsa_memory_service_client_exchange(
+		xfer, &msg, CDP_DSA_MS_APPLY_DONE, &xfer->dsa_fg_service_diag);
+	if (profile) {
+		xfer->dsa_fg_profile_ipc_apply_us =
+			dsa_profile_delta_us(phase_start_us, dsa_profile_wall_now_us());
+		if (xfer->dsa_fg_service_diag.magic ==
+		    CDP_DSA_MEMORY_SERVICE_DIAG_MAGIC) {
+			msg.profile.hot_apply_us =
+				xfer->dsa_fg_service_diag.apply_total_wall_us;
+			msg.profile.hot_apply_cpu_us =
+				xfer->dsa_fg_service_diag.apply_total_cpu_us;
+			xfer->dsa_fg_service_profile = msg.profile;
+		}
+	}
+	if (exchange_ret) {
+		pr_perror("DSA memory service APPLY request failed");
+		return -1;
+	}
+	if (profile)
+		xfer->dsa_fg_service_profile = msg.profile;
+	return 0;
+}
+
 int page_xfer_dsa_fg_apply_records(struct page_xfer *xfer,
 				   const void *shared_ptr,
 				   u32 desc_area_off, u32 desc_head)
@@ -2913,7 +3540,7 @@ static int hot_memstore_splice_to_segments(struct hot_apply_ctx *ctx, int pipefd
 		chunk = seg->end - cur;
 		if (chunk > len - done)
 			chunk = len - done;
-		if (splice_exact_at(pipefd, seg->fd,
+		if (splice_exact_at(pipefd, ctx->owners[seg->owner].fd,
 				    seg->off + (cur - seg->start), chunk))
 			return -1;
 		done += chunk;
@@ -3942,20 +4569,14 @@ static void hot_apply_abort(struct page_xfer *xfer)
 		close(ctx->fg_idx_fd);
 	if (ctx->fg_dat_fd >= 0)
 		close(ctx->fg_dat_fd);
-	for (i = 0; i < ctx->nr_old_memstore; i++) {
-		if (ctx->old_memstore[i].map && ctx->old_memstore[i].map != MAP_FAILED)
-			munmap(ctx->old_memstore[i].map, ctx->old_memstore[i].map_size);
-		if (ctx->old_memstore[i].fd >= 0)
-			close(ctx->old_memstore[i].fd);
-	}
-	for (i = 0; i < ctx->nr_vma_segments; i++) {
-		if (ctx->vma_segments[i].map &&
-		    ctx->vma_segments[i].map != MAP_FAILED)
-			munmap(ctx->vma_segments[i].map, ctx->vma_segments[i].map_size);
-		if (ctx->vma_segments[i].fd >= 0)
-			close(ctx->vma_segments[i].fd);
+	for (i = 0; i < ctx->nr_owners; i++) {
+		if (ctx->owners[i].map && ctx->owners[i].map != MAP_FAILED)
+			munmap(ctx->owners[i].map, ctx->owners[i].map_size);
+		if (ctx->owners[i].fd >= 0)
+			close(ctx->owners[i].fd);
 	}
 
+	xfree(ctx->owners);
 	xfree(ctx->old_memstore);
 	xfree(ctx->vma_segments);
 	xfree(ctx->vma_plans);
@@ -3984,10 +4605,13 @@ static int hot_memstore_finish(struct hot_apply_ctx *ctx)
 
 	for (i = 0; i < ctx->nr_vma_segments; i++) {
 		struct hot_vma_segment *seg = &ctx->vma_segments[i];
+		struct hot_memstore_owner *owner = hot_memstore_owner_get(ctx, seg->owner);
 
+		if (!owner)
+			goto out;
 		if (hot_memstore_emit_line_fd(ctx->manifest_fd, ctx->img_id,
 					      seg->start, seg->end - seg->start,
-					      seg->file, seg->off))
+					      owner->file, seg->off))
 			goto out;
 	}
 
@@ -4023,13 +4647,19 @@ static int hot_apply_prepare_post_thaw(struct hot_apply_ctx *ctx)
 		pr_perror("DSA hot apply can't create pipe");
 		return -1;
 	}
-	if (ctx->profile)
-		materialize_start_us = dsa_profile_wall_now_us();
-	if (hot_memstore_materialize_vmas(ctx))
-		return -1;
-	if (ctx->profile)
-		ctx->profile_materialize_us += dsa_profile_delta_us(materialize_start_us,
-							      dsa_profile_wall_now_us());
+	/* Fine-grained output has a compare/sidecar barrier and materializes only
+	 * immediately before hot apply below.  Preserve the ordinary memstore
+	 * splice path, which needs its destination views before it can consume the
+	 * pipe. */
+	if (!ctx->fine_grained) {
+		if (ctx->profile)
+			materialize_start_us = dsa_profile_wall_now_us();
+		if (hot_memstore_materialize_vmas(ctx, NULL, NULL))
+			return -1;
+		if (ctx->profile)
+			ctx->profile_materialize_us += dsa_profile_delta_us(materialize_start_us,
+								      dsa_profile_wall_now_us());
+	}
 	if (ctx->fine_grained) {
 		if (hot_fg_open_sidecar(ctx))
 			return -1;
@@ -4148,6 +4778,249 @@ static void hot_profile_begin(struct hot_apply_ctx *ctx)
 	ctx->profile_total_start_us = dsa_profile_wall_now_us();
 }
 
+/*
+ * A task-scoped service reuses one hot_apply_ctx for every generation, unlike
+ * the legacy CRIU path which allocates a fresh context per dump.  Reset only
+ * generation-local accounting here; WQ mappings, parent mappings and PRQ perf
+ * fds are deliberately retained.
+ */
+static void hot_service_profile_reset_generation(struct hot_apply_ctx *ctx)
+{
+	if (!ctx || !ctx->profile)
+		return;
+
+	ctx->profile_started = false;
+	ctx->profile_emitted = false;
+	ctx->profile_total_start_us = 0;
+	ctx->profile_post_prepare_us = 0;
+	ctx->profile_materialize_us = 0;
+	ctx->profile_raw_index_us = 0;
+	ctx->profile_span_build_us = 0;
+	ctx->profile_compare_wall_us = 0;
+	ctx->profile_compare_cpu_us = 0;
+	ctx->profile_sidecar_emit_us = 0;
+	ctx->profile_compare_engine_wall_us = 0;
+	ctx->profile_compare_engine_cpu_us = 0;
+	ctx->profile_parent_prefault_wall_us = 0;
+	ctx->profile_parent_prefault_cpu_us = 0;
+	ctx->profile_compare_core_wall_us = 0;
+	ctx->profile_compare_core_cpu_us = 0;
+	ctx->profile_output_wall_us = 0;
+	ctx->profile_output_start_us = 0;
+	ctx->profile_hot_apply_us = 0;
+	ctx->profile_pagemap_us = 0;
+	ctx->profile_finish_us = 0;
+	ctx->profile_raw_pages = 0;
+	ctx->profile_raw_bytes = 0;
+	ctx->profile_capture_runs = 0;
+	ctx->profile_span_pages = 0;
+	ctx->profile_spans = 0;
+	ctx->profile_max_span_pages = 0;
+	ctx->profile_compare_enq_retries = 0;
+	ctx->profile_compare_poll_sweeps = 0;
+	ctx->profile_compare_not_ready = 0;
+	ctx->profile_compare_max_active = 0;
+	ctx->profile_completions_harvested = 0;
+	ctx->profile_completion_timeout_count = 0;
+	ctx->profile_max_completion_age_us = 0;
+	ctx->profile_write_units = 0;
+	ctx->profile_write_unit_max_us = 0;
+	ctx->profile_memcmp_calls = 0;
+	ctx->profile_memcmp_requested_bytes = 0;
+	ctx->profile_memcmp_scalar_bytes = 0;
+	ctx->profile_scalar64_calls = 0;
+	ctx->profile_scalar64_word_ops = 0;
+	ctx->profile_scalar64_refine_bytes = 0;
+	ctx->profile_scalar64_tail_bytes = 0;
+	ctx->profile_scalar64_bytes_examined = 0;
+	ctx->profile_simd_vector_ops = 0;
+	ctx->profile_simd_bytes_examined = 0;
+	ctx->profile_hybrid_dsa_claim_spans = 0;
+	ctx->profile_hybrid_dsa_claim_pages = 0;
+	ctx->profile_hybrid_cpu_claim_spans = 0;
+	ctx->profile_hybrid_cpu_claim_pages = 0;
+	ctx->profile_hybrid_cpu_waves = 0;
+	ctx->profile_hybrid_dsa_to_cpu_handoff_spans = 0;
+	ctx->profile_hybrid_dsa_to_cpu_handoff_pages = 0;
+	ctx->profile_hybrid_dsa_to_cpu_handoff_remaining_bytes = 0;
+	ctx->profile_hybrid_unclaimed_empty_count = 0;
+	ctx->profile_compare_nobof_faults = 0;
+	ctx->profile_compare_nobof_fault_source1 = 0;
+	ctx->profile_compare_nobof_fault_source2 = 0;
+	ctx->profile_compare_nobof_equal_prefix_bytes = 0;
+	ctx->profile_compare_fault_handoff_spans = 0;
+	ctx->profile_compare_fault_handoff_pages = 0;
+	ctx->profile_compare_fault_handoff_remaining_bytes = 0;
+	ctx->profile_compare_fault_queue_max = 0;
+	ctx->profile_compare_fresh_claim_throttles = 0;
+	ctx->profile_compare_cpu_fault_waves = 0;
+	ctx->profile_dsa_logical_progress_bytes = 0;
+	ctx->profile_simd_logical_progress_bytes = 0;
+	ctx->profile_normal_simd_logical_progress_bytes = 0;
+	ctx->profile_fault_simd_logical_progress_bytes = 0;
+	ctx->profile_dsa_fresh_submit_ops = 0;
+	ctx->profile_dsa_continuation_submit_ops = 0;
+	ctx->profile_dsa_submitted_bytes = 0;
+	ctx->profile_simd_progress_while_dsa_active_bytes = 0;
+	ctx->profile_simd_quanta_while_dsa_active = 0;
+	ctx->profile_dsa_fresh_claim_bytes = 0;
+	ctx->profile_dsa_active_zero_while_normal_cpu_work = 0;
+	ctx->profile_ready_completions_before_simd = 0;
+	ctx->profile_ready_completions_after_simd = 0;
+	ctx->profile_scheduler_iterations = 0;
+	ctx->profile_dsa_refill_samples = 0;
+	ctx->profile_post_refill_active_sum = 0;
+	ctx->profile_post_refill_active_lt_32 = 0;
+	ctx->profile_post_refill_active_lt_64 = 0;
+	ctx->profile_post_refill_active_lt_96 = 0;
+	ctx->profile_fresh_refill_spans = 0;
+	ctx->profile_fresh_refill_batches = 0;
+	ctx->profile_fresh_refill_blocked_fault_debt = 0;
+	ctx->profile_dsa_empty_with_claimable_fresh = 0;
+	ctx->profile_prq_pg_requests = 0;
+	ctx->profile_prq_thread_cpu_us = 0;
+	ctx->profile_prefault_spans = 0;
+	ctx->profile_prefault_pages = 0;
+	ctx->profile_parent_pages = 0;
+	ctx->profile_patch_ranges = 0;
+	ctx->profile_idx_writes = 0;
+	ctx->profile_dat_writes = 0;
+	ctx->profile_dat_writevs = 0;
+	ctx->profile_hot_pwrite_ops = 0;
+	ctx->profile_hot_pwrite_bytes = 0;
+	ctx->profile_hot_mprotect_ops = 0;
+	ctx->profile_hot_memcpy_bytes = 0;
+
+	ctx->fg_pages = 0;
+	ctx->fg_patch_pages = 0;
+	ctx->fg_full_pages = 0;
+	ctx->fg_patch_bytes = 0;
+	ctx->fg_compare_ops = 0;
+	ctx->fg_copy_ops = 0;
+	ctx->dsa_enqcmd = 0;
+}
+
+static void hot_service_profile_snapshot(
+	struct hot_apply_ctx *ctx, struct cdp_dsa_memory_service_profile *profile)
+{
+	if (!ctx || !profile)
+		return;
+
+	profile->enabled = ctx->profile ? 1 : 0;
+	profile->backend = ctx->fg_compare_backend;
+	profile->prq_profile_available = ctx->profile_prq_available ? 1 : 0;
+	profile->prq_profile_sources = ctx->profile_nr_prq_sources;
+	profile->prq_setup_errno = ctx->profile_prq_setup_errno;
+	if (!ctx->profile)
+		return;
+
+	profile->raw_index_us = ctx->profile_raw_index_us;
+	profile->span_build_us = ctx->profile_span_build_us;
+	profile->compare_wall_us = ctx->profile_compare_wall_us;
+	profile->compare_cpu_us = ctx->profile_compare_cpu_us;
+	profile->compare_engine_wall_us = ctx->profile_compare_engine_wall_us;
+	profile->compare_engine_cpu_us = ctx->profile_compare_engine_cpu_us;
+	profile->result_publish_us = ctx->profile_sidecar_emit_us;
+	profile->parent_prefault_wall_us = ctx->profile_parent_prefault_wall_us;
+	profile->parent_prefault_cpu_us = ctx->profile_parent_prefault_cpu_us;
+	profile->compare_core_wall_us = ctx->profile_compare_core_wall_us;
+	profile->compare_core_cpu_us = ctx->profile_compare_core_cpu_us;
+	profile->raw_pages = ctx->profile_raw_pages;
+	profile->raw_bytes = ctx->profile_raw_bytes;
+	profile->capture_runs = ctx->profile_capture_runs;
+	profile->spans = ctx->profile_spans;
+	profile->span_pages = ctx->profile_span_pages;
+	profile->max_span_pages = ctx->profile_max_span_pages;
+	profile->compare_ops = ctx->fg_compare_ops;
+	profile->enq_retries = ctx->profile_compare_enq_retries;
+	profile->poll_sweeps = ctx->profile_compare_poll_sweeps;
+	profile->not_ready = ctx->profile_compare_not_ready;
+	profile->max_active = ctx->profile_compare_max_active;
+	profile->completions_harvested = ctx->profile_completions_harvested;
+	profile->completion_timeout_count = ctx->profile_completion_timeout_count;
+	profile->max_completion_age_us = ctx->profile_max_completion_age_us;
+	profile->prefault_spans = ctx->profile_prefault_spans;
+	profile->prefault_pages = ctx->profile_prefault_pages;
+	profile->parent_pages = ctx->profile_parent_pages;
+	profile->patch_pages = ctx->fg_patch_pages;
+	profile->full_pages = ctx->fg_full_pages;
+	profile->patch_ranges = ctx->profile_patch_ranges;
+	profile->patch_bytes = ctx->fg_patch_bytes;
+	profile->prq_pg_requests = ctx->profile_prq_pg_requests;
+	profile->prq_thread_cpu_us = ctx->profile_prq_thread_cpu_us;
+	profile->memcmp_calls = ctx->profile_memcmp_calls;
+	profile->memcmp_requested_bytes = ctx->profile_memcmp_requested_bytes;
+	profile->memcmp_scalar_bytes = ctx->profile_memcmp_scalar_bytes;
+	profile->scalar64_calls = ctx->profile_scalar64_calls;
+	profile->scalar64_word_ops = ctx->profile_scalar64_word_ops;
+	profile->scalar64_refine_bytes = ctx->profile_scalar64_refine_bytes;
+	profile->scalar64_tail_bytes = ctx->profile_scalar64_tail_bytes;
+	profile->scalar64_bytes_examined = ctx->profile_scalar64_bytes_examined;
+	profile->simd_vector_ops = ctx->profile_simd_vector_ops;
+	profile->simd_bytes_examined = ctx->profile_simd_bytes_examined;
+	profile->hybrid_dsa_claim_spans = ctx->profile_hybrid_dsa_claim_spans;
+	profile->hybrid_dsa_claim_pages = ctx->profile_hybrid_dsa_claim_pages;
+	profile->hybrid_cpu_claim_spans = ctx->profile_hybrid_cpu_claim_spans;
+	profile->hybrid_cpu_claim_pages = ctx->profile_hybrid_cpu_claim_pages;
+	profile->hybrid_cpu_waves = ctx->profile_hybrid_cpu_waves;
+	profile->hybrid_dsa_to_cpu_handoff_spans =
+		ctx->profile_hybrid_dsa_to_cpu_handoff_spans;
+	profile->hybrid_dsa_to_cpu_handoff_pages =
+		ctx->profile_hybrid_dsa_to_cpu_handoff_pages;
+	profile->hybrid_dsa_to_cpu_handoff_remaining_bytes =
+		ctx->profile_hybrid_dsa_to_cpu_handoff_remaining_bytes;
+	profile->hybrid_unclaimed_empty_count =
+		ctx->profile_hybrid_unclaimed_empty_count;
+	profile->compare_nobof_faults = ctx->profile_compare_nobof_faults;
+	profile->compare_nobof_fault_source1 = ctx->profile_compare_nobof_fault_source1;
+	profile->compare_nobof_fault_source2 = ctx->profile_compare_nobof_fault_source2;
+	profile->compare_nobof_equal_prefix_bytes =
+		ctx->profile_compare_nobof_equal_prefix_bytes;
+	profile->compare_fault_handoff_spans = ctx->profile_compare_fault_handoff_spans;
+	profile->compare_fault_handoff_pages = ctx->profile_compare_fault_handoff_pages;
+	profile->compare_fault_handoff_remaining_bytes =
+		ctx->profile_compare_fault_handoff_remaining_bytes;
+	profile->compare_fault_queue_max = ctx->profile_compare_fault_queue_max;
+	profile->compare_fresh_claim_throttles =
+		ctx->profile_compare_fresh_claim_throttles;
+	profile->compare_cpu_fault_waves = ctx->profile_compare_cpu_fault_waves;
+	profile->dsa_logical_progress_bytes =
+		ctx->profile_dsa_logical_progress_bytes;
+	profile->simd_logical_progress_bytes =
+		ctx->profile_simd_logical_progress_bytes;
+	profile->normal_simd_logical_progress_bytes =
+		ctx->profile_normal_simd_logical_progress_bytes;
+	profile->fault_simd_logical_progress_bytes =
+		ctx->profile_fault_simd_logical_progress_bytes;
+	profile->dsa_fresh_submit_ops = ctx->profile_dsa_fresh_submit_ops;
+	profile->dsa_continuation_submit_ops =
+		ctx->profile_dsa_continuation_submit_ops;
+	profile->dsa_submitted_bytes = ctx->profile_dsa_submitted_bytes;
+	profile->simd_progress_while_dsa_active_bytes =
+		ctx->profile_simd_progress_while_dsa_active_bytes;
+	profile->simd_quanta_while_dsa_active =
+		ctx->profile_simd_quanta_while_dsa_active;
+	profile->dsa_fresh_claim_bytes = ctx->profile_dsa_fresh_claim_bytes;
+	profile->dsa_active_zero_while_normal_cpu_work =
+		ctx->profile_dsa_active_zero_while_normal_cpu_work;
+	profile->ready_completions_before_simd =
+		ctx->profile_ready_completions_before_simd;
+	profile->ready_completions_after_simd =
+		ctx->profile_ready_completions_after_simd;
+	profile->scheduler_iterations = ctx->profile_scheduler_iterations;
+	profile->dsa_refill_samples = ctx->profile_dsa_refill_samples;
+	profile->post_refill_active_sum = ctx->profile_post_refill_active_sum;
+	profile->post_refill_active_lt_32 = ctx->profile_post_refill_active_lt_32;
+	profile->post_refill_active_lt_64 = ctx->profile_post_refill_active_lt_64;
+	profile->post_refill_active_lt_96 = ctx->profile_post_refill_active_lt_96;
+	profile->fresh_refill_spans = ctx->profile_fresh_refill_spans;
+	profile->fresh_refill_batches = ctx->profile_fresh_refill_batches;
+	profile->fresh_refill_blocked_fault_debt =
+		ctx->profile_fresh_refill_blocked_fault_debt;
+	profile->dsa_empty_with_claimable_fresh =
+		ctx->profile_dsa_empty_with_claimable_fresh;
+}
+
 static void hot_profile_emit(struct hot_apply_ctx *ctx, int ret)
 {
 	const char *backend;
@@ -4234,6 +5107,123 @@ static void hot_profile_emit(struct hot_apply_ctx *ctx, int ret)
 		ctx->profile_pagemap_bytes, ctx->profile_pagemap_flushes);
 }
 
+static void dsa_memory_service_profile_emit(struct page_xfer *xfer, int ret)
+{
+	struct cdp_dsa_memory_service_profile *p;
+	enum hot_fg_compare_backend backend_id;
+	const char *backend;
+	u64 total_us;
+	u64 accounted_us;
+	u64 unaccounted_us;
+	u64 ipc_compare_overhead_us;
+	u64 ipc_apply_overhead_us;
+
+	if (!xfer || !xfer->dsa_fg_service || !dsa_profile_enabled() ||
+	    !xfer->dsa_fg_profile_total_start_us)
+		return;
+	p = &xfer->dsa_fg_service_profile;
+	backend_id = p->backend <= HOT_FG_COMPARE_VALIDATE ?
+		(enum hot_fg_compare_backend)p->backend : HOT_FG_COMPARE_DSA;
+	backend = hot_fg_compare_backend_name(backend_id);
+	total_us = dsa_profile_delta_us(xfer->dsa_fg_profile_total_start_us,
+					 dsa_profile_wall_now_us());
+	accounted_us = xfer->dsa_fg_profile_request_publish_us +
+		xfer->dsa_fg_profile_ipc_compare_us +
+		xfer->dsa_fg_profile_sidecar_us +
+		xfer->dsa_fg_profile_pagemap_us +
+		xfer->dsa_fg_profile_finish_us +
+		xfer->dsa_fg_profile_ipc_apply_us;
+	unaccounted_us = total_us >= accounted_us ? total_us - accounted_us : 0;
+	ipc_compare_overhead_us =
+		xfer->dsa_fg_profile_ipc_compare_us >= p->service_compare_wall_us ?
+		xfer->dsa_fg_profile_ipc_compare_us - p->service_compare_wall_us : 0;
+	ipc_apply_overhead_us =
+		xfer->dsa_fg_profile_ipc_apply_us >= p->hot_apply_us ?
+		xfer->dsa_fg_profile_ipc_apply_us - p->hot_apply_us : 0;
+
+	pr_info("DSA_POST_THAW_PROFILE_TIME: version=9 pages_id=%u backend=%s ret=%d service_enabled=1 service_profile_enabled=%u service_mapping_warm=%u total_us=%" PRIu64 " result_request_publish_us=%" PRIu64 " ipc_compare_us=%" PRIu64 " ipc_compare_overhead_us=%" PRIu64 " service_compare_wall_us=%" PRIu64 " service_compare_cpu_us=%" PRIu64 " service_hot_reconcile_us=%" PRIu64 " service_raw_index_us=%" PRIu64 " service_span_build_us=%" PRIu64 " raw_index_us=%" PRIu64 " span_build_us=%" PRIu64 " service_cold_prepare_us=0 compare_wall_us=%" PRIu64 " compare_thread_cpu_us=%" PRIu64 " compare_engine_wall_us=%" PRIu64 " compare_engine_cpu_us=%" PRIu64 " service_result_publish_us=%" PRIu64 " compare_breakdown=%u parent_prefault_wall_us=%" PRIu64 " parent_prefault_cpu_us=%" PRIu64 " compare_core_wall_us=%" PRIu64 " compare_core_cpu_us=%" PRIu64 " sidecar_us=%" PRIu64 " output_wall_us=%" PRIu64 " sidecar_preflight_us=%" PRIu64 " sidecar_serialize_us=%" PRIu64 " sidecar_idx_write_us=%" PRIu64 " sidecar_dat_write_us=%" PRIu64 " pagemap_us=%" PRIu64 " finish_us=%" PRIu64 " ipc_apply_us=%" PRIu64 " ipc_apply_overhead_us=%" PRIu64 " service_hot_apply_us=%" PRIu64 " service_hot_apply_cpu_us=%" PRIu64 " service_apply_validate_us=%" PRIu64 " service_apply_materialize_us=%" PRIu64 " service_apply_store_us=%" PRIu64 " service_apply_manifest_finish_us=%" PRIu64 " service_apply_manifest_close_us=%" PRIu64 " accounted_us=%" PRIu64 " unaccounted_us=%" PRIu64 " ledger_overrun=%u\n",
+		xfer->pages_id, backend, ret, p->enabled, p->mapping_warm, total_us,
+		xfer->dsa_fg_profile_request_publish_us,
+		xfer->dsa_fg_profile_ipc_compare_us,
+		ipc_compare_overhead_us,
+		p->service_compare_wall_us, p->service_compare_cpu_us,
+		p->hot_reconcile_us, p->raw_index_us, p->span_build_us,
+		p->raw_index_us, p->span_build_us,
+		p->compare_engine_wall_us, p->compare_engine_cpu_us,
+		p->compare_engine_wall_us, p->compare_engine_cpu_us,
+		p->result_publish_us,
+		dsa_compare_breakdown_mode() == 1 ? 1 : 0,
+		p->parent_prefault_wall_us, p->parent_prefault_cpu_us,
+		p->compare_core_wall_us, p->compare_core_cpu_us,
+		xfer->dsa_fg_profile_sidecar_us,
+		xfer->dsa_fg_profile_sidecar_us,
+		p->sidecar_preflight_us, p->sidecar_serialize_us,
+		p->sidecar_idx_write_us, p->sidecar_dat_write_us,
+		xfer->dsa_fg_profile_pagemap_us,
+		xfer->dsa_fg_profile_finish_us,
+		xfer->dsa_fg_profile_ipc_apply_us,
+		ipc_apply_overhead_us,
+		p->hot_apply_us, p->hot_apply_cpu_us,
+		xfer->dsa_fg_service_diag.apply_validate_wall_us,
+		xfer->dsa_fg_service_diag.apply_materialize_wall_us,
+		xfer->dsa_fg_service_diag.apply_store_wall_us,
+		xfer->dsa_fg_service_diag.apply_manifest_finish_wall_us,
+		xfer->dsa_fg_service_diag.apply_manifest_close_wall_us,
+		accounted_us, unaccounted_us, accounted_us > total_us ? 1 : 0);
+	pr_info("DSA_POST_THAW_PROFILE_COUNT: version=9 pages_id=%u backend=%s ret=%d service_enabled=1 service_profile_enabled=%u service_mapping_warm=%u raw_pages=%" PRIu64 " raw_bytes=%" PRIu64 " capture_runs=%" PRIu64 " spans=%" PRIu64 " span_pages=%" PRIu64 " max_span_pages=%" PRIu64 " compare_ops=%" PRIu64 " dsa_compare_ops=%" PRIu64 " memcmp_calls=%" PRIu64 " memcmp_requested_bytes=%" PRIu64 " memcmp_scalar_bytes=%" PRIu64 " scalar64_calls=%" PRIu64 " scalar64_word_ops=%" PRIu64 " scalar64_refine_bytes=%" PRIu64 " scalar64_tail_bytes=%" PRIu64 " scalar64_bytes_examined=%" PRIu64 " simd_vector_ops=%" PRIu64 " simd_bytes_examined=%" PRIu64 " hybrid_dsa_claim_spans=%" PRIu64 " hybrid_dsa_claim_pages=%" PRIu64 " hybrid_cpu_claim_spans=%" PRIu64 " hybrid_cpu_claim_pages=%" PRIu64 " hybrid_cpu_waves=%" PRIu64 " hybrid_dsa_to_cpu_handoff_spans=%" PRIu64 " hybrid_dsa_to_cpu_handoff_pages=%" PRIu64 " hybrid_dsa_to_cpu_handoff_remaining_bytes=%" PRIu64 " hybrid_unclaimed_empty_count=%" PRIu64 " compare_nobof_faults=%" PRIu64 " compare_nobof_fault_source1=%" PRIu64 " compare_nobof_fault_source2=%" PRIu64 " compare_nobof_equal_prefix_bytes=%" PRIu64 " compare_fault_handoff_spans=%" PRIu64 " compare_fault_handoff_pages=%" PRIu64 " compare_fault_handoff_remaining_bytes=%" PRIu64 " compare_fault_queue_max=%" PRIu64 " compare_fresh_claim_throttles=%" PRIu64 " compare_cpu_fault_waves=%" PRIu64 " dsa_logical_progress_bytes=%" PRIu64 " simd_logical_progress_bytes=%" PRIu64 " normal_simd_logical_progress_bytes=%" PRIu64 " fault_simd_logical_progress_bytes=%" PRIu64 " dsa_fresh_submit_ops=%" PRIu64 " dsa_continuation_submit_ops=%" PRIu64 " dsa_submitted_bytes=%" PRIu64 " simd_progress_while_dsa_active_bytes=%" PRIu64 " simd_quanta_while_dsa_active=%" PRIu64 " dsa_fresh_claim_bytes=%" PRIu64 " dsa_active_zero_while_normal_cpu_work=%" PRIu64 " ready_completions_before_simd=%" PRIu64 " ready_completions_after_simd=%" PRIu64 " scheduler_iterations=%" PRIu64 " dsa_refill_samples=%" PRIu64 " post_refill_active_sum=%" PRIu64 " post_refill_active_lt_32=%" PRIu64 " post_refill_active_lt_64=%" PRIu64 " post_refill_active_lt_96=%" PRIu64 " fresh_refill_spans=%" PRIu64 " fresh_refill_batches=%" PRIu64 " fresh_refill_blocked_fault_debt=%" PRIu64 " dsa_empty_with_claimable_fresh=%" PRIu64 " prq_profile_available=%u prq_profile_sources=%u prq_pg_requests=%" PRIu64 " prq_thread_cpu_us=%" PRIu64 " prq_setup_errno=%d enq_retries=%" PRIu64 " poll_sweeps=%" PRIu64 " not_ready=%" PRIu64 " max_active=%" PRIu64 " completions_harvested=%" PRIu64 " completion_timeout_count=%" PRIu64 " max_completion_age_us=%" PRIu64 " prefault_spans=%" PRIu64 " prefault_pages=%" PRIu64 " parent_pages=%" PRIu64 " patch_pages=%" PRIu64 " full_pages=%" PRIu64 " patch_ranges=%" PRIu64 " patch_bytes=%" PRIu64 " idx_write_calls=%" PRIu64 " idx_bytes=%" PRIu64 " dat_write_calls=%" PRIu64 " dat_writev_calls=%" PRIu64 " dat_bytes=%" PRIu64 " idx_write_syscalls=%" PRIu64 " dat_write_syscalls=%" PRIu64 " dat_writev_syscalls=%" PRIu64 " sidecar_lseek_syscalls=%" PRIu64 " pagemap_records=%" PRIu64 " pagemap_bytes=%" PRIu64 "\n",
+		xfer->pages_id, backend, ret, p->enabled, p->mapping_warm,
+		p->raw_pages, p->raw_bytes, p->capture_runs, p->spans,
+		p->span_pages, p->max_span_pages, p->compare_ops, p->compare_ops,
+		p->memcmp_calls, p->memcmp_requested_bytes, p->memcmp_scalar_bytes,
+		p->scalar64_calls, p->scalar64_word_ops, p->scalar64_refine_bytes,
+		p->scalar64_tail_bytes, p->scalar64_bytes_examined,
+		p->simd_vector_ops, p->simd_bytes_examined,
+		p->hybrid_dsa_claim_spans, p->hybrid_dsa_claim_pages,
+		p->hybrid_cpu_claim_spans, p->hybrid_cpu_claim_pages,
+		p->hybrid_cpu_waves, p->hybrid_dsa_to_cpu_handoff_spans,
+		p->hybrid_dsa_to_cpu_handoff_pages,
+		p->hybrid_dsa_to_cpu_handoff_remaining_bytes,
+		p->hybrid_unclaimed_empty_count,
+		p->compare_nobof_faults, p->compare_nobof_fault_source1,
+		p->compare_nobof_fault_source2, p->compare_nobof_equal_prefix_bytes,
+		p->compare_fault_handoff_spans, p->compare_fault_handoff_pages,
+		p->compare_fault_handoff_remaining_bytes, p->compare_fault_queue_max,
+		p->compare_fresh_claim_throttles, p->compare_cpu_fault_waves,
+		p->dsa_logical_progress_bytes, p->simd_logical_progress_bytes,
+		p->normal_simd_logical_progress_bytes,
+		p->fault_simd_logical_progress_bytes,
+		p->dsa_fresh_submit_ops, p->dsa_continuation_submit_ops,
+		p->dsa_submitted_bytes,
+		p->simd_progress_while_dsa_active_bytes,
+		p->simd_quanta_while_dsa_active,
+		p->dsa_fresh_claim_bytes,
+		p->dsa_active_zero_while_normal_cpu_work,
+		p->ready_completions_before_simd,
+		p->ready_completions_after_simd,
+		p->scheduler_iterations, p->dsa_refill_samples,
+		p->post_refill_active_sum,
+		p->post_refill_active_lt_32,
+		p->post_refill_active_lt_64,
+		p->post_refill_active_lt_96,
+		p->fresh_refill_spans, p->fresh_refill_batches,
+		p->fresh_refill_blocked_fault_debt,
+		p->dsa_empty_with_claimable_fresh,
+		p->prq_profile_available,
+		p->prq_profile_sources, p->prq_pg_requests,
+		p->prq_thread_cpu_us, p->prq_setup_errno, p->enq_retries,
+		p->poll_sweeps, p->not_ready, p->max_active,
+		p->completions_harvested, p->completion_timeout_count,
+		p->max_completion_age_us, p->prefault_spans, p->prefault_pages,
+		p->parent_pages, p->patch_pages, p->full_pages,
+		p->patch_ranges, p->patch_bytes, p->idx_write_calls,
+		p->idx_bytes, p->dat_write_calls, p->dat_writev_calls,
+		p->dat_bytes, p->idx_write_syscalls, p->dat_write_syscalls,
+		p->dat_writev_syscalls, p->sidecar_lseek_syscalls,
+		xfer->write_profile_pagemap_records,
+		xfer->write_profile_pagemap_bytes);
+	xfer->dsa_fg_profile_total_start_us = 0;
+}
+
 static int hot_apply_init_xfer(struct page_xfer *xfer, int fd_type,
 			       unsigned long img_id, u32 pages_id)
 {
@@ -4302,10 +5292,13 @@ int page_xfer_hot_set_vmas(struct page_xfer *xfer, struct vm_area_list *vmas)
 {
 	struct hot_apply_ctx *ctx = xfer->hot_apply;
 	struct vma_area *vma;
+	struct dsa_fg_vma_plan_record *records = NULL;
+	size_t nr = 0, cap = 0;
+	bool service_client = !ctx && dsa_memory_service_client_fd() >= 0;
 
-	if (!ctx || !ctx->memstore)
+	if ((!ctx || !ctx->memstore) && !service_client)
 		return 0;
-	if (ctx->fd_type != CR_FD_PAGEMAP)
+	if (ctx && ctx->fd_type != CR_FD_PAGEMAP)
 		return 0;
 
 	list_for_each_entry(vma, &vmas->h, list) {
@@ -4316,8 +5309,37 @@ int page_xfer_hot_set_vmas(struct page_xfer *xfer, struct vm_area_list *vmas)
 
 		start = vma->e->start;
 		end = vma->e->end;
-		if (hot_memstore_plan_segment(ctx, start, end))
+		if (ctx) {
+			if (hot_memstore_plan_segment(ctx, start, end))
+				return -1;
+		} else {
+			if (nr == cap) {
+				size_t new_cap = cap ? cap * 2 : 128;
+				void *new_records = xrealloc(records,
+							      new_cap * sizeof(*records));
+
+				if (!new_records) {
+					xfree(records);
+					return -1;
+				}
+				records = new_records;
+				cap = new_cap;
+			}
+			records[nr++] = (struct dsa_fg_vma_plan_record) {
+				.start = start,
+				.end = end,
+			};
+		}
+	}
+	if (service_client) {
+		if (!nr) {
+			pr_err("DSA memory service has no target VMA plan\n");
 			return -1;
+		}
+		xfree(xfer->dsa_fg_vma_plan_local);
+		xfer->dsa_fg_vma_plan_local = records;
+		xfer->dsa_fg_vma_plan_count = nr;
+		return 0;
 	}
 
 	pr_info("DSA hot memstore VMA plan ready img_id=%lu segments=%zu\n",
@@ -4687,16 +5709,81 @@ static int hot_fg_write_pages_loc(struct page_xfer *xfer, int p,
 				  unsigned long len,
 				  struct hot_apply_extent *pending_entry);
 
+#define DSA_ALIGNED_FULL_WRITE_BATCH (2U * 1024U * 1024U)
+
+static int dsa_aligned_full_flush(struct page_xfer *xfer)
+{
+	u32 off;
+
+	if (!xfer || !xfer->dsa_fg_shared ||
+	    xfer->dsa_fg_raw_emit_cursor != xfer->dsa_fg_raw_payload_head) {
+		errno = ERANGE;
+		return -1;
+	}
+	/* The sealed payload is contiguous even when its capture IOVs were not.
+	 * Write it in bounded chunks after the generic pagemap pass; this avoids
+	 * both replay-pipe syscalls and an otherwise pointless 64 MiB CPU copy. */
+	for (off = xfer->dsa_fg_raw_payload_base;
+	     off < xfer->dsa_fg_raw_payload_head;) {
+		u32 left = xfer->dsa_fg_raw_payload_head - off;
+		u32 chunk = left > DSA_ALIGNED_FULL_WRITE_BATCH ?
+			DSA_ALIGNED_FULL_WRITE_BATCH : left;
+
+		if (write_full_fd(img_raw_fd(xfer->pi),
+				  (const unsigned char *)xfer->dsa_fg_shared + off,
+				  chunk)) {
+			pr_perror("DSA aligned full raw write failed");
+			return -1;
+		}
+		if (xfer->write_profile_enabled)
+			xfer->write_profile_pages_emit_calls++;
+		off += chunk;
+	}
+	return 0;
+}
+
+static int dsa_aligned_full_write_pages(struct page_xfer *xfer,
+					 unsigned long len)
+{
+	if (!xfer || !xfer->dsa_fg_shared ||
+	    xfer->dsa_fg_raw_emit_cursor < xfer->dsa_fg_raw_payload_base ||
+	    xfer->dsa_fg_raw_emit_cursor > xfer->dsa_fg_raw_payload_head ||
+	    len > xfer->dsa_fg_raw_payload_head - xfer->dsa_fg_raw_emit_cursor) {
+		errno = ERANGE;
+		return -1;
+	}
+	/* Advancing the cursor validates that the ordinary pagemap traversal and
+	 * the raw capture have the same present-byte geometry; flush() then writes
+	 * contiguous chunks. */
+	xfer->dsa_fg_raw_emit_cursor += len;
+	return 0;
+}
+
 static int write_pages_loc(struct page_xfer *xfer, int p, unsigned long len)
 {
 	struct hot_apply_ctx *ctx = xfer->hot_apply;
+	int ret;
 	unsigned long curr = 0;
 	off_t append_offset;
 	uint64_t append_prepare_start_us;
 	struct hot_apply_extent *pending_entry = NULL;
 
-	if (!ctx)
-		return splice_exact(p, img_raw_fd(xfer->pi), len);
+	if (!ctx) {
+		if (xfer->dsa_fg_raw_capture && dsa_aligned_full_enabled()) {
+			if (dsa_aligned_full_write_pages(xfer, len))
+				return -1;
+			if (xfer->write_profile_enabled)
+				xfer->write_profile_pages_bytes += len;
+			return 0;
+		}
+		ret = splice_exact(p, img_raw_fd(xfer->pi), len);
+
+		if (!ret && xfer->write_profile_enabled) {
+			xfer->write_profile_pages_bytes += len;
+			xfer->write_profile_pages_emit_calls++;
+		}
+		return ret;
+	}
 
 	append_prepare_start_us = hot_now_us();
 	if (ctx->memstore) {
@@ -4769,6 +5856,10 @@ static int write_pages_loc(struct page_xfer *xfer, int p, unsigned long len)
 	}
 
 	ctx->pending.valid = false;
+	if (xfer->write_profile_enabled) {
+		xfer->write_profile_pages_bytes += len;
+		xfer->write_profile_pages_emit_calls++;
+	}
 	return 0;
 }
 
@@ -5004,6 +6095,10 @@ static int hot_fg_pagemap_emit(struct page_xfer *xfer)
 			goto out;
 		}
 		used += sizeof(size) + size;
+		if (xfer->write_profile_enabled) {
+			xfer->write_profile_pagemap_records++;
+			xfer->write_profile_pagemap_bytes += sizeof(size) + size;
+		}
 		if (ctx->profile) {
 			ctx->profile_pagemap_bytes += sizeof(size) + size;
 		}
@@ -5058,6 +6153,11 @@ static int write_pagemap_loc(struct page_xfer *xfer, struct iovec *iov, u32 flag
 
 	if (pb_write_one(xfer->pmi, &pe, PB_PAGEMAP) < 0)
 		return -1;
+	if (xfer->write_profile_enabled) {
+		xfer->write_profile_pagemap_records++;
+		xfer->write_profile_pagemap_bytes +=
+			sizeof(u32) + pagemap_entry__get_packed_size(&pe);
+	}
 
 	if (hot_apply_set_pending(xfer, iov, flags))
 		return -1;
@@ -5104,6 +6204,311 @@ static int hot_fg_writev_full_fd(int fd, struct iovec *iov, unsigned int nr)
 		}
 	}
 
+	return 0;
+}
+
+/* One sink owns the durable sidecar write mechanics.  The legacy raw-page
+ * path and the service canonical-result path differ only in how they expose
+ * one classified page; neither path owns a second payload buffer. */
+struct dsa_fg_sidecar_stats {
+	bool enabled;
+	u64 *idx_write_calls;
+	u64 *idx_bytes;
+	u64 *dat_write_calls;
+	u64 *dat_writev_calls;
+	u64 *dat_bytes;
+	u64 *write_units;
+	u64 *write_unit_max_us;
+	u64 *idx_write_syscalls;
+	u64 *dat_write_syscalls;
+	u64 *dat_writev_syscalls;
+	u64 *idx_write_us;
+	u64 *dat_write_us;
+};
+
+struct dsa_fg_sidecar_sink {
+	int idx_fd;
+	int dat_fd;
+	off_t dat_off;
+	struct dsa_fg_sidecar_stats stats;
+	struct dsa_fg_page_meta metas[HOT_FG_OUTPUT_META_MAX];
+	struct dsa_fg_patch_entry patches[HOT_FG_OUTPUT_META_MAX * DSA_FG_MAX_PATCHES];
+	struct iovec iov[HOT_FG_WRITEV_MAX];
+	struct iovec write_iov[HOT_FG_WRITEV_MAX];
+	unsigned int nr_metas;
+	unsigned int nr_patches;
+	unsigned int nr_iov;
+	unsigned int iov_head;
+	u64 chunk_dat_bytes;
+};
+
+static void dsa_fg_sidecar_stats_add(u64 *counter, u64 value)
+{
+	if (counter)
+		*counter += value;
+}
+
+static void dsa_fg_sidecar_sink_reset_chunk(struct dsa_fg_sidecar_sink *sink)
+{
+	sink->nr_metas = 0;
+	sink->nr_patches = 0;
+	sink->nr_iov = 0;
+	sink->iov_head = 0;
+	sink->chunk_dat_bytes = 0;
+}
+
+static int dsa_fg_sidecar_sink_append_iov(struct dsa_fg_sidecar_sink *sink,
+						 const void *base, size_t len)
+{
+	struct iovec *last;
+
+	if (!len)
+		return 0;
+	if (sink->nr_iov) {
+		last = &sink->iov[sink->nr_iov - 1];
+		if ((const char *)last->iov_base + last->iov_len == base) {
+			last->iov_len += len;
+			return 0;
+		}
+	}
+	if (sink->nr_iov == HOT_FG_WRITEV_MAX)
+		return -1;
+	sink->iov[sink->nr_iov].iov_base = (void *)base;
+	sink->iov[sink->nr_iov].iov_len = len;
+	sink->nr_iov++;
+	return 0;
+}
+
+static void dsa_fg_sidecar_sink_advance_iov(struct dsa_fg_sidecar_sink *sink,
+						      u64 bytes)
+{
+	while (bytes && sink->iov_head < sink->nr_iov) {
+		struct iovec *iov = &sink->iov[sink->iov_head];
+
+		if (bytes >= iov->iov_len) {
+			bytes -= iov->iov_len;
+			sink->iov_head++;
+		} else {
+			iov->iov_base = (char *)iov->iov_base + bytes;
+			iov->iov_len -= bytes;
+			bytes = 0;
+		}
+	}
+}
+
+static int dsa_fg_sidecar_sink_write_full(struct dsa_fg_sidecar_sink *sink,
+						  int fd, const void *buf, size_t len,
+						  u64 *syscalls)
+{
+	const char *p = buf;
+
+	while (len) {
+		ssize_t ret;
+
+		if (sink->stats.enabled)
+			dsa_fg_sidecar_stats_add(syscalls, 1);
+		ret = write(fd, p, len);
+		if (ret < 0) {
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+		if (ret == 0) {
+			errno = EIO;
+			return -1;
+		}
+		p += ret;
+		len -= ret;
+	}
+	return 0;
+}
+
+static int dsa_fg_sidecar_sink_writev_full(struct dsa_fg_sidecar_sink *sink,
+						   struct iovec *iov, unsigned int nr)
+{
+	unsigned int head = 0;
+
+	if (!nr || nr > HOT_FG_WRITEV_MAX) {
+		errno = EINVAL;
+		return -1;
+	}
+	while (head < nr) {
+		ssize_t ret;
+
+		if (sink->stats.enabled)
+			dsa_fg_sidecar_stats_add(sink->stats.dat_writev_syscalls, 1);
+		ret = writev(sink->dat_fd, &iov[head], nr - head);
+		if (ret < 0) {
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+		if (ret == 0) {
+			errno = EIO;
+			return -1;
+		}
+		while (head < nr && ret >= (ssize_t)iov[head].iov_len) {
+			ret -= iov[head].iov_len;
+			head++;
+		}
+		if (head < nr && ret) {
+			iov[head].iov_base = (char *)iov[head].iov_base + ret;
+			iov[head].iov_len -= ret;
+		}
+	}
+	return 0;
+}
+
+static int dsa_fg_sidecar_sink_flush(struct dsa_fg_sidecar_sink *sink)
+{
+	if (!sink->nr_metas)
+		return 0;
+	{
+		u64 start_us = sink->stats.enabled ? dsa_profile_wall_now_us() : 0;
+
+		if (dsa_fg_sidecar_sink_write_full(sink, sink->idx_fd, sink->metas,
+						   sink->nr_metas * sizeof(sink->metas[0]),
+						   sink->stats.idx_write_syscalls)) {
+			pr_perror("DSA fine-grained bounded index write failed");
+			return -1;
+		}
+		if (sink->stats.enabled)
+			dsa_fg_sidecar_stats_add(sink->stats.idx_write_us,
+						 dsa_profile_delta_us(start_us,
+								      dsa_profile_wall_now_us()));
+	}
+	if (sink->stats.enabled) {
+		dsa_fg_sidecar_stats_add(sink->stats.idx_write_calls, 1);
+		dsa_fg_sidecar_stats_add(sink->stats.idx_bytes,
+					 sink->nr_metas * sizeof(sink->metas[0]));
+		dsa_fg_sidecar_stats_add(sink->stats.write_units, 1);
+	}
+	while (sink->iov_head < sink->nr_iov) {
+		u64 bytes = 0;
+		u64 start_us = 0;
+		unsigned int nr = 0;
+		unsigned int i;
+
+		for (i = sink->iov_head; i < sink->nr_iov &&
+		     bytes < HOT_FG_OUTPUT_WRITE_BYTES; i++) {
+			u64 len = sink->iov[i].iov_len;
+
+			if (len > HOT_FG_OUTPUT_WRITE_BYTES - bytes)
+				len = HOT_FG_OUTPUT_WRITE_BYTES - bytes;
+			sink->write_iov[nr] = sink->iov[i];
+			sink->write_iov[nr].iov_len = len;
+			nr++;
+			bytes += len;
+		}
+		if (!nr) {
+			errno = EIO;
+			return -1;
+		}
+		if (sink->stats.enabled)
+			start_us = dsa_profile_wall_now_us();
+		if (dsa_fg_sidecar_sink_writev_full(sink, sink->write_iov, nr)) {
+			pr_perror("DSA fine-grained bounded data write failed");
+			return -1;
+		}
+		dsa_fg_sidecar_sink_advance_iov(sink, bytes);
+		if (sink->stats.enabled) {
+			u64 elapsed = dsa_profile_delta_us(start_us,
+							  dsa_profile_wall_now_us());
+
+			dsa_fg_sidecar_stats_add(sink->stats.dat_writev_calls, 1);
+			dsa_fg_sidecar_stats_add(sink->stats.write_units, 1);
+			dsa_fg_sidecar_stats_add(sink->stats.dat_write_us, elapsed);
+			if (sink->stats.write_unit_max_us &&
+			    elapsed > *sink->stats.write_unit_max_us)
+				*sink->stats.write_unit_max_us = elapsed;
+		}
+	}
+	dsa_fg_sidecar_sink_reset_chunk(sink);
+	return 0;
+}
+
+static int dsa_fg_sidecar_sink_append(struct dsa_fg_sidecar_sink *sink,
+					      const struct dsa_fg_page_meta *input,
+					      const struct dsa_fg_patch_entry *patches,
+					      const struct iovec *payload,
+					      unsigned int nr_payload)
+{
+	struct dsa_fg_page_meta *meta;
+	u64 data_len = input->data_len;
+	u64 payload_bytes = 0;
+	unsigned int needed_iov = nr_payload + (input->patch_count ? 1 : 0);
+	unsigned int i;
+
+	for (i = 0; i < nr_payload; i++) {
+		if (!payload[i].iov_len || payload[i].iov_len > UINT64_MAX - payload_bytes) {
+			errno = EINVAL;
+			return -1;
+		}
+		payload_bytes += payload[i].iov_len;
+	}
+	if (input->patch_count > DSA_FG_MAX_PATCHES ||
+	    (input->flags != DSA_FG_PAGE_PARENT &&
+	     input->flags != DSA_FG_PAGE_PATCH &&
+	     input->flags != DSA_FG_PAGE_FULL) ||
+	    (!input->patch_count && patches) ||
+	    (input->patch_count && !patches) ||
+	    nr_payload > DSA_FG_MAX_PATCHES ||
+	    needed_iov > HOT_FG_WRITEV_MAX ||
+	    data_len > HOT_FG_OUTPUT_LOGICAL_BYTES ||
+	    (input->flags == DSA_FG_PAGE_PATCH && !input->patch_count) ||
+	    (input->flags != DSA_FG_PAGE_PATCH && input->patch_count) ||
+	    (input->patch_count && nr_payload != input->patch_count) ||
+	    (!input->patch_count && input->flags != DSA_FG_PAGE_FULL && nr_payload) ||
+	    (input->flags == DSA_FG_PAGE_FULL && nr_payload != 1) ||
+	    (input->flags == DSA_FG_PAGE_PARENT && (data_len || nr_payload)) ||
+	    (input->flags == DSA_FG_PAGE_FULL &&
+	     (data_len != PAGE_SIZE || payload_bytes != PAGE_SIZE)) ||
+	    (input->flags == DSA_FG_PAGE_PATCH &&
+	     (payload_bytes > UINT64_MAX -
+		input->patch_count * sizeof(struct dsa_fg_patch_entry) ||
+	      data_len != input->patch_count * sizeof(struct dsa_fg_patch_entry) +
+		payload_bytes))) {
+		errno = EINVAL;
+		return -1;
+	}
+	if (sink->nr_metas &&
+	    (sink->nr_metas == HOT_FG_OUTPUT_META_MAX ||
+	     input->patch_count > HOT_FG_OUTPUT_META_MAX * DSA_FG_MAX_PATCHES - sink->nr_patches ||
+	     needed_iov > HOT_FG_WRITEV_MAX - sink->nr_iov ||
+	     data_len > HOT_FG_OUTPUT_LOGICAL_BYTES - sink->chunk_dat_bytes)) {
+		if (dsa_fg_sidecar_sink_flush(sink))
+			return -1;
+	}
+	if (input->patch_count > HOT_FG_OUTPUT_META_MAX * DSA_FG_MAX_PATCHES - sink->nr_patches ||
+	    needed_iov > HOT_FG_WRITEV_MAX - sink->nr_iov ||
+	    data_len > HOT_FG_OUTPUT_LOGICAL_BYTES - sink->chunk_dat_bytes ||
+	    sink->dat_off < 0 || data_len > (u64)LLONG_MAX - (u64)sink->dat_off) {
+		errno = EOVERFLOW;
+		return -1;
+	}
+
+	meta = &sink->metas[sink->nr_metas++];
+	*meta = *input;
+	meta->data_off = sink->dat_off;
+	if (input->patch_count) {
+		struct dsa_fg_patch_entry *chunk_patches = &sink->patches[sink->nr_patches];
+
+		memcpy(chunk_patches, patches, input->patch_count * sizeof(*patches));
+		sink->nr_patches += input->patch_count;
+		if (dsa_fg_sidecar_sink_append_iov(sink, chunk_patches,
+						       input->patch_count * sizeof(*patches)))
+			return -1;
+	}
+	for (i = 0; i < nr_payload; i++) {
+		if (!payload[i].iov_len ||
+		    dsa_fg_sidecar_sink_append_iov(sink, payload[i].iov_base,
+						       payload[i].iov_len))
+			return -1;
+	}
+	sink->dat_off += data_len;
+	sink->chunk_dat_bytes += data_len;
+	if (sink->stats.enabled)
+		dsa_fg_sidecar_stats_add(sink->stats.dat_bytes, data_len);
 	return 0;
 }
 
@@ -5218,7 +6623,7 @@ static int hot_fg_write_page(struct hot_apply_ctx *ctx, unsigned long vaddr,
 	if (!old)
 		return hot_fg_write_full(ctx, vaddr, cur);
 
-	old_map = hot_memstore_old_map(old);
+	old_map = hot_memstore_old_map(ctx, old);
 	if (old_map == MAP_FAILED)
 		return -1;
 
@@ -5269,6 +6674,10 @@ enum hot_fg_compare_owner {
 	HOT_FG_OWNER_NONE = 0,
 	HOT_FG_OWNER_DSA,
 	HOT_FG_OWNER_CPU,
+	/* A no-BOF completion transferred the remaining span to SIMD.  This is
+	 * intentionally distinct from a normal head/tail CPU claim so fault-debt
+	 * can limit only new speculative DSA claims. */
+	HOT_FG_OWNER_CPU_FAULT,
 };
 
 struct hot_fg_compare_span {
@@ -5297,15 +6706,7 @@ struct hot_fg_output_state {
 	struct hot_fg_raw_page *pages;
 	size_t nr_pages;
 	size_t next_page;
-	struct dsa_fg_page_meta metas[HOT_FG_OUTPUT_META_MAX];
-	struct iovec iov[HOT_FG_WRITEV_MAX];
-	struct iovec write_iov[HOT_FG_WRITEV_MAX];
-	unsigned int nr_metas;
-	unsigned int nr_iov;
-	unsigned int iov_head;
-	u64 chunk_dat_bytes;
-	bool flushing;
-	bool idx_written;
+	struct dsa_fg_sidecar_sink sink;
 };
 
 static int hot_fg_raw_pages_append(struct hot_apply_ctx *ctx,
@@ -5338,7 +6739,7 @@ static int hot_fg_raw_pages_append(struct hot_apply_ctx *ctx,
 		page->state = HOT_FG_RAW_FULL;
 		return 0;
 	}
-	old_map = hot_memstore_old_map(old);
+	old_map = hot_memstore_old_map(ctx, old);
 	if (old_map == MAP_FAILED)
 		return -1;
 	page->parent = (const unsigned char *)old_map + (vaddr - old->vaddr);
@@ -5391,279 +6792,375 @@ static int hot_fg_ready_queue_pop(struct hot_fg_ready_queue *queue,
 	return 0;
 }
 
-static bool hot_fg_output_done(const struct hot_fg_output_state *out)
-{
-	return out->next_page == out->nr_pages && !out->nr_metas &&
-	       !out->flushing;
-}
-
-static void hot_fg_output_reset_chunk(struct hot_fg_output_state *out)
-{
-	out->nr_metas = 0;
-	out->nr_iov = 0;
-	out->iov_head = 0;
-	out->chunk_dat_bytes = 0;
-	out->flushing = false;
-	out->idx_written = false;
-}
-
-static int hot_fg_output_append_iov(struct hot_fg_output_state *out,
-				    const void *base, size_t len)
-{
-	struct iovec *last;
-
-	if (!len)
-		return 0;
-	if (out->nr_iov) {
-		last = &out->iov[out->nr_iov - 1];
-		if ((const char *)last->iov_base + last->iov_len == base) {
-			last->iov_len += len;
-			return 0;
-		}
-	}
-	if (out->nr_iov >= HOT_FG_WRITEV_MAX)
-		return -1;
-	out->iov[out->nr_iov].iov_base = (void *)base;
-	out->iov[out->nr_iov].iov_len = len;
-	out->nr_iov++;
-	return 0;
-}
-
-static int hot_fg_output_append_page(struct hot_fg_output_state *out,
-				     bool *progress)
-{
-	struct hot_apply_ctx *ctx = out->ctx;
-	struct hot_fg_raw_page *page;
-	struct dsa_fg_page_meta *meta;
-	u64 data_len = 0;
-	unsigned int needed_iov = 0;
-	u16 i;
-
-	*progress = false;
-	if (out->next_page == out->nr_pages) {
-		if (out->nr_metas) {
-			out->flushing = true;
-			*progress = true;
-		}
-		return 0;
-	}
-	page = &out->pages[out->next_page];
-	if (page->state == HOT_FG_RAW_PENDING)
-		return 0;
-	if (page->state == HOT_FG_RAW_FULL) {
-		data_len = PAGE_SIZE;
-		needed_iov = 1;
-	} else if (page->state == HOT_FG_RAW_PATCH) {
-		data_len = page->patch_count * sizeof(page->patches[0]) +
-			page->patch_bytes;
-		needed_iov = 1 + page->patch_count;
-	} else if (page->state != HOT_FG_RAW_PARENT) {
-		pr_err("DSA fine-grained sidecar has invalid final page state=%u\n",
-		       page->state);
-		return -1;
-	}
-
-	if (out->nr_metas &&
-	    (out->nr_metas == HOT_FG_OUTPUT_META_MAX ||
-	     needed_iov > HOT_FG_WRITEV_MAX - out->nr_iov ||
-	     data_len > HOT_FG_OUTPUT_LOGICAL_BYTES - out->chunk_dat_bytes)) {
-		out->flushing = true;
-		*progress = true;
-		return 0;
-	}
-	if (needed_iov > HOT_FG_WRITEV_MAX ||
-	    data_len > HOT_FG_OUTPUT_LOGICAL_BYTES) {
-		pr_err("DSA fine-grained sidecar page exceeds output bounds vaddr=%lx iov=%u bytes=%" PRIu64 "\n",
-		       page->vaddr, needed_iov, data_len);
-		return -1;
-	}
-	if (ctx->fg_dat_off < 0 || data_len > (u64)LLONG_MAX -
-	    (u64)ctx->fg_dat_off) {
-		pr_err("DSA fine-grained sidecar data offset overflow off=%lld bytes=%" PRIu64 "\n",
-		       (long long)ctx->fg_dat_off, data_len);
-		return -1;
-	}
-	if (!ctx->profile_output_start_us && ctx->profile)
-		ctx->profile_output_start_us = dsa_profile_wall_now_us();
-	meta = &out->metas[out->nr_metas++];
-	memset(meta, 0, sizeof(*meta));
-	meta->vaddr = page->vaddr;
-	meta->data_off = ctx->fg_dat_off;
-	meta->data_len = data_len;
-	if (page->state == HOT_FG_RAW_FULL) {
-		meta->flags = DSA_FG_PAGE_FULL;
-		if (hot_fg_output_append_iov(out, page->raw, PAGE_SIZE))
-			return -1;
-	} else if (page->state == HOT_FG_RAW_PATCH) {
-		meta->flags = DSA_FG_PAGE_PATCH;
-		meta->patch_count = page->patch_count;
-		if (hot_fg_output_append_iov(out, page->patches,
-					     page->patch_count * sizeof(page->patches[0])))
-			return -1;
-		for (i = 0; i < page->patch_count; i++) {
-			if (hot_fg_output_append_iov(out,
-						     page->raw + page->patches[i].off,
-						     page->patches[i].len))
-				return -1;
-		}
-	} else {
-		meta->flags = DSA_FG_PAGE_PARENT;
-	}
-	ctx->fg_dat_off += data_len;
-	out->chunk_dat_bytes += data_len;
-	ctx->fg_pages++;
-	if (page->state == HOT_FG_RAW_FULL) {
-		ctx->fg_full_pages++;
-		ctx->fg_patch_bytes += PAGE_SIZE;
-	} else if (page->state == HOT_FG_RAW_PATCH) {
-		ctx->fg_patch_pages++;
-		ctx->fg_patch_bytes += page->patch_bytes;
-		if (ctx->profile)
-			ctx->profile_patch_ranges += page->patch_count;
-	} else if (ctx->profile) {
-		ctx->profile_parent_pages++;
-	}
-	out->next_page++;
-	if (out->nr_metas == HOT_FG_OUTPUT_META_MAX ||
-	    out->nr_iov == HOT_FG_WRITEV_MAX ||
-	    out->chunk_dat_bytes == HOT_FG_OUTPUT_LOGICAL_BYTES ||
-	    out->next_page == out->nr_pages)
-		out->flushing = true;
-	*progress = true;
-	return 0;
-}
-
-static void hot_fg_output_advance_iov(struct hot_fg_output_state *out,
-				      u64 bytes)
-{
-	while (bytes && out->iov_head < out->nr_iov) {
-		struct iovec *iov = &out->iov[out->iov_head];
-
-		if (bytes >= iov->iov_len) {
-			bytes -= iov->iov_len;
-			out->iov_head++;
-		} else {
-			iov->iov_base = (char *)iov->iov_base + bytes;
-			iov->iov_len -= bytes;
-			bytes = 0;
-		}
-	}
-}
-
-static int hot_fg_output_write_dat_unit(struct hot_fg_output_state *out,
-					bool *progress)
-{
-	struct hot_apply_ctx *ctx = out->ctx;
-	u64 bytes = 0;
-	u64 write_start_us = 0;
-	unsigned int nr = 0;
-	unsigned int i;
-
-	*progress = false;
-	for (i = out->iov_head; i < out->nr_iov &&
-	     bytes < HOT_FG_OUTPUT_WRITE_BYTES; i++) {
-		u64 len = out->iov[i].iov_len;
-
-		if (len > HOT_FG_OUTPUT_WRITE_BYTES - bytes)
-			len = HOT_FG_OUTPUT_WRITE_BYTES - bytes;
-		out->write_iov[nr] = out->iov[i];
-		out->write_iov[nr].iov_len = len;
-		nr++;
-		bytes += len;
-	}
-	if (!nr)
-		return 0;
-	if (ctx->profile)
-		write_start_us = dsa_profile_wall_now_us();
-	if (hot_fg_writev_full_fd(ctx->fg_dat_fd, out->write_iov, nr)) {
-		pr_perror("DSA fine-grained bounded data write failed");
-		return -1;
-	}
-	hot_fg_output_advance_iov(out, bytes);
-	if (ctx->profile) {
-		u64 elapsed = dsa_profile_delta_us(write_start_us,
-						 dsa_profile_wall_now_us());
-
-		ctx->profile_dat_writevs++;
-		ctx->profile_write_units++;
-		if (elapsed > ctx->profile_write_unit_max_us)
-			ctx->profile_write_unit_max_us = elapsed;
-	}
-	*progress = true;
-	return 0;
-}
-
-static int hot_fg_output_step(struct hot_fg_output_state *out,
-			      bool allow_write, bool *progress,
-			      bool *wrote)
-{
-	struct hot_apply_ctx *ctx = out->ctx;
-
-	*progress = false;
-	*wrote = false;
-	if (!out->flushing)
-		return hot_fg_output_append_page(out, progress);
-	if (!allow_write)
-		return 0;
-	if (!out->idx_written) {
-		size_t bytes = out->nr_metas * sizeof(out->metas[0]);
-		u64 write_start_us = 0;
-
-		if (ctx->profile)
-			write_start_us = dsa_profile_wall_now_us();
-		if (write_full_fd(ctx->fg_idx_fd, out->metas, bytes)) {
-			pr_perror("DSA fine-grained bounded index write failed");
-			return -1;
-		}
-		out->idx_written = true;
-		if (ctx->profile) {
-			u64 elapsed = dsa_profile_delta_us(write_start_us,
-							 dsa_profile_wall_now_us());
-
-			ctx->profile_idx_writes++;
-			ctx->profile_write_units++;
-			if (elapsed > ctx->profile_write_unit_max_us)
-				ctx->profile_write_unit_max_us = elapsed;
-		}
-		*progress = true;
-		*wrote = true;
-		if (!out->nr_iov)
-			hot_fg_output_reset_chunk(out);
-		return 0;
-	}
-	if (hot_fg_output_write_dat_unit(out, progress))
-		return -1;
-	if (*progress) {
-		*wrote = true;
-		if (out->iov_head == out->nr_iov)
-			hot_fg_output_reset_chunk(out);
-	}
-	return 0;
-}
-
 static int hot_fg_output_drain(struct hot_fg_output_state *out)
 {
-	while (!hot_fg_output_done(out)) {
-		bool progress;
-		bool wrote;
+	struct hot_apply_ctx *ctx = out->ctx;
 
-		if (hot_fg_output_step(out, true, &progress, &wrote))
-			return -1;
-		if (!progress) {
-			pr_err("DSA fine-grained output drain blocked at page=%zu/%zu state=%u\n",
-			       out->next_page, out->nr_pages,
-			       out->next_page < out->nr_pages ?
-			       out->pages[out->next_page].state : 0);
+	while (out->next_page < out->nr_pages) {
+		struct hot_fg_raw_page *page = &out->pages[out->next_page];
+		struct dsa_fg_page_meta meta = {};
+		struct iovec payload[DSA_FG_MAX_PATCHES];
+		unsigned int nr_payload = 0;
+		unsigned int i;
+
+		if (page->state == HOT_FG_RAW_PENDING) {
+			pr_err("DSA fine-grained output has pending page=%zu vaddr=%lx\n",
+			       out->next_page, page->vaddr);
 			return -1;
 		}
+		meta.vaddr = page->vaddr;
+		if (page->state == HOT_FG_RAW_FULL) {
+			meta.flags = DSA_FG_PAGE_FULL;
+			meta.data_len = PAGE_SIZE;
+			payload[nr_payload++] = (struct iovec) {
+				.iov_base = (void *)page->raw,
+				.iov_len = PAGE_SIZE,
+			};
+		} else if (page->state == HOT_FG_RAW_PATCH) {
+			if (!page->patch_count || page->patch_count > DSA_FG_MAX_PATCHES ||
+			    page->patch_bytes > DSA_FG_MAX_BYTES) {
+				pr_err("DSA fine-grained sidecar has invalid patch page vaddr=%lx\n",
+				       page->vaddr);
+				return -1;
+			}
+			meta.flags = DSA_FG_PAGE_PATCH;
+			meta.patch_count = page->patch_count;
+			meta.data_len = page->patch_count * sizeof(page->patches[0]) +
+				page->patch_bytes;
+			for (i = 0; i < page->patch_count; i++) {
+				payload[nr_payload++] = (struct iovec) {
+					.iov_base = (void *)(page->raw + page->patches[i].off),
+					.iov_len = page->patches[i].len,
+				};
+			}
+		} else if (page->state == HOT_FG_RAW_PARENT) {
+			meta.flags = DSA_FG_PAGE_PARENT;
+		} else {
+			pr_err("DSA fine-grained sidecar has invalid final page state=%u\n",
+			       page->state);
+			return -1;
+		}
+		if (!ctx->profile_output_start_us && ctx->profile)
+			ctx->profile_output_start_us = dsa_profile_wall_now_us();
+		if (dsa_fg_sidecar_sink_append(&out->sink, &meta,
+					       meta.patch_count ? page->patches : NULL,
+					       payload, nr_payload)) {
+			pr_perror("DSA fine-grained sidecar chunk append failed");
+			return -1;
+		}
+		ctx->fg_pages++;
+		if (page->state == HOT_FG_RAW_FULL) {
+			ctx->fg_full_pages++;
+			ctx->fg_patch_bytes += PAGE_SIZE;
+		} else if (page->state == HOT_FG_RAW_PATCH) {
+			ctx->fg_patch_pages++;
+			ctx->fg_patch_bytes += page->patch_bytes;
+			if (ctx->profile)
+				ctx->profile_patch_ranges += page->patch_count;
+		} else if (ctx->profile) {
+			ctx->profile_parent_pages++;
+		}
+		out->next_page++;
 	}
+	if (dsa_fg_sidecar_sink_flush(&out->sink))
+		return -1;
+	ctx->fg_dat_off = out->sink.dat_off;
 	return 0;
+}
+
+/* Validate the result against the frozen capture geometry before creating any
+ * durable sidecar file.  This is intentionally metadata-only: it neither
+ * rereads payload bytes nor reconstructs the legacy raw-page array. */
+static int dsa_fg_canonical_preflight(struct page_xfer *xfer,
+					     const unsigned char *shared,
+					     size_t *nr_results, u64 *dat_bytes)
+{
+	u32 desc_off;
+	u32 raw_off;
+	size_t result_index = 0;
+	size_t result_count;
+	u64 expected_dat = 0;
+	u64 previous_vaddr = 0;
+	bool have_previous = false;
+
+	if (!xfer || !shared || !nr_results || !dat_bytes ||
+	    !xfer->dsa_fg_result_meta_base ||
+	    xfer->dsa_fg_result_meta_head < xfer->dsa_fg_result_meta_base ||
+	    xfer->dsa_fg_result_meta_head > xfer->dsa_fg_result_meta_limit ||
+	    (xfer->dsa_fg_result_meta_head - xfer->dsa_fg_result_meta_base) %
+		sizeof(struct parasite_dsa_fg_result) ||
+	    xfer->dsa_fg_desc_head < xfer->dsa_fg_desc_area_off ||
+	    (xfer->dsa_fg_desc_head - xfer->dsa_fg_desc_area_off) %
+		sizeof(struct dsa_dump_descriptor) ||
+	    xfer->dsa_fg_raw_payload_head < xfer->dsa_fg_raw_payload_base) {
+		pr_err("DSA fine-grained canonical result bounds are invalid\n");
+		return -1;
+	}
+	result_count = (xfer->dsa_fg_result_meta_head -
+			xfer->dsa_fg_result_meta_base) /
+		sizeof(struct parasite_dsa_fg_result);
+	raw_off = xfer->dsa_fg_raw_payload_base;
+	for (desc_off = xfer->dsa_fg_desc_area_off;
+	     desc_off < xfer->dsa_fg_desc_head;
+	     desc_off += sizeof(struct dsa_dump_descriptor)) {
+		const struct dsa_dump_descriptor *desc =
+			(const struct dsa_dump_descriptor *)(shared + desc_off);
+		u32 page_off;
+
+		if (!desc->copy_len || desc->copy_len % PAGE_SIZE ||
+		    desc->src_addr & (PAGE_SIZE - 1) ||
+		    raw_off > xfer->dsa_fg_raw_payload_head ||
+		    desc->copy_len > xfer->dsa_fg_raw_payload_head - raw_off) {
+			pr_err("DSA fine-grained canonical descriptor is invalid off=%u\n",
+			       desc_off);
+			return -1;
+		}
+		for (page_off = 0; page_off < desc->copy_len; page_off += PAGE_SIZE) {
+			const struct parasite_dsa_fg_result *res;
+			u32 raw_page_off = raw_off + page_off;
+			u64 expected_vaddr = desc->src_addr + page_off;
+			u32 sum = 0;
+			u16 j;
+			u16 previous_end = 0;
+
+			if (result_index == result_count || expected_vaddr < desc->src_addr) {
+				pr_err("DSA fine-grained canonical result count/vaddr overflow\n");
+				return -1;
+			}
+			res = (const struct parasite_dsa_fg_result *)(shared +
+				xfer->dsa_fg_result_meta_base +
+				result_index * sizeof(*res));
+			if (res->vaddr != expected_vaddr ||
+			    (have_previous && res->vaddr <= previous_vaddr)) {
+				pr_err("DSA fine-grained canonical result order mismatch idx=%zu vaddr=%" PRIx64 " expected=%" PRIx64 "\n",
+				       result_index, res->vaddr, expected_vaddr);
+				return -1;
+			}
+			have_previous = true;
+			previous_vaddr = res->vaddr;
+			if (res->flags == DSA_FG_PAGE_PARENT) {
+				if (res->data_len || res->patch_count)
+					goto invalid;
+			} else if (res->flags == DSA_FG_PAGE_FULL) {
+				if (res->data_len != PAGE_SIZE || res->patch_count ||
+				    res->data_off != raw_page_off)
+					goto invalid;
+				if (expected_dat > UINT64_MAX - PAGE_SIZE)
+					goto invalid;
+				expected_dat += PAGE_SIZE;
+			} else if (res->flags == DSA_FG_PAGE_PATCH) {
+				u64 wire_len;
+
+				if (!res->patch_count || res->patch_count > DSA_FG_MAX_PATCHES ||
+				    res->data_len > DSA_FG_MAX_BYTES)
+					goto invalid;
+				for (j = 0; j < res->patch_count; j++) {
+					const struct parasite_dsa_fg_result_entry *entry =
+						&res->entries[j];
+
+					if (!entry->len || (u32)entry->off + entry->len > PAGE_SIZE ||
+					    (j && entry->off < previous_end) ||
+					    entry->data_off != raw_page_off + entry->off)
+						goto invalid;
+					previous_end = entry->off + entry->len;
+					sum += entry->len;
+				}
+				if (sum != res->data_len)
+					goto invalid;
+				wire_len = (u64)res->patch_count *
+					sizeof(struct dsa_fg_patch_entry) + res->data_len;
+				if (wire_len > UINT64_MAX - expected_dat)
+					goto invalid;
+				expected_dat += wire_len;
+			} else {
+				goto invalid;
+			}
+			result_index++;
+			continue;
+invalid:
+			pr_err("DSA fine-grained canonical result is invalid idx=%zu vaddr=%" PRIx64 " flags=%u\n",
+			       result_index, res->vaddr, res->flags);
+			return -1;
+		}
+		raw_off += desc->copy_len;
+	}
+	if (raw_off != xfer->dsa_fg_raw_payload_head || result_index != result_count) {
+		pr_err("DSA fine-grained canonical result/raw count mismatch results=%zu/%zu raw=%u/%u\n",
+		       result_index, result_count, raw_off,
+		       xfer->dsa_fg_raw_payload_head);
+		return -1;
+	}
+	*nr_results = result_count;
+	*dat_bytes = expected_dat;
+	return 0;
+}
+
+/* Service mode consumes only the release-published canonical result array.
+ * The common sink owns batching, partial-write handling and output offsets;
+ * the adapter below only converts its compact PATCH entries to wire entries. */
+static int page_xfer_dsa_fg_write_sidecar_results(struct page_xfer *xfer,
+						  const void *shared_ptr)
+{
+	char idx_path[64];
+	char dat_path[64];
+	const unsigned char *shared = shared_ptr;
+	struct dsa_fg_sidecar_sink *sink = NULL;
+	struct stat idx_st;
+	struct stat dat_st;
+	size_t nr_results;
+	u64 expected_dat;
+	size_t i;
+	int idx_fd = -1;
+	int dat_fd = -1;
+	int dfd = get_service_fd(IMG_FD_OFF);
+	int ret = -1;
+	bool profile;
+	u64 phase_start_us = 0;
+	u64 serialize_start_us = 0;
+
+	profile = xfer && xfer->dsa_fg_service_profile.enabled && dsa_profile_enabled();
+	if (profile)
+		phase_start_us = dsa_profile_wall_now_us();
+	if (dsa_fg_canonical_preflight(xfer, shared, &nr_results, &expected_dat))
+		return -1;
+	if (profile)
+		xfer->dsa_fg_service_profile.sidecar_preflight_us =
+			dsa_profile_delta_us(phase_start_us, dsa_profile_wall_now_us());
+	if (expected_dat > LLONG_MAX) {
+		pr_err("DSA fine-grained canonical dat size is too large=%" PRIu64 "\n",
+		       expected_dat);
+		return -1;
+	}
+	if (profile) {
+		xfer->dsa_fg_service_profile.idx_write_calls = 0;
+		xfer->dsa_fg_service_profile.idx_bytes = 0;
+		xfer->dsa_fg_service_profile.dat_write_calls = 0;
+		xfer->dsa_fg_service_profile.dat_writev_calls = 0;
+		xfer->dsa_fg_service_profile.dat_bytes = 0;
+		xfer->dsa_fg_service_profile.sidecar_serialize_us = 0;
+		xfer->dsa_fg_service_profile.sidecar_idx_write_us = 0;
+		xfer->dsa_fg_service_profile.sidecar_dat_write_us = 0;
+		xfer->dsa_fg_service_profile.idx_write_syscalls = 0;
+		xfer->dsa_fg_service_profile.dat_write_syscalls = 0;
+		xfer->dsa_fg_service_profile.dat_writev_syscalls = 0;
+		xfer->dsa_fg_service_profile.sidecar_lseek_syscalls = 0;
+	}
+	if (profile)
+		serialize_start_us = dsa_profile_wall_now_us();
+
+	snprintf(idx_path, sizeof(idx_path), "pages-fg-%u.idx", xfer->pages_id);
+	idx_fd = openat(dfd, idx_path, O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC,
+			CR_FD_PERM);
+	if (idx_fd < 0) {
+		pr_perror("DSA fine-grained can't open %s", idx_path);
+		goto out;
+	}
+	snprintf(dat_path, sizeof(dat_path), "pages-fg-%u.dat", xfer->pages_id);
+	dat_fd = openat(dfd, dat_path, O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC,
+			CR_FD_PERM);
+	if (dat_fd < 0) {
+		pr_perror("DSA fine-grained can't open %s", dat_path);
+		goto out;
+	}
+	sink = xzalloc(sizeof(*sink));
+	if (!sink)
+		goto out;
+	sink->idx_fd = idx_fd;
+	sink->dat_fd = dat_fd;
+	sink->stats = (struct dsa_fg_sidecar_stats) {
+		.enabled = profile,
+		.idx_write_calls = &xfer->dsa_fg_service_profile.idx_write_calls,
+		.idx_bytes = &xfer->dsa_fg_service_profile.idx_bytes,
+		.dat_write_calls = &xfer->dsa_fg_service_profile.dat_write_calls,
+		.dat_writev_calls = &xfer->dsa_fg_service_profile.dat_writev_calls,
+		.dat_bytes = &xfer->dsa_fg_service_profile.dat_bytes,
+		.idx_write_syscalls = &xfer->dsa_fg_service_profile.idx_write_syscalls,
+		.dat_write_syscalls = &xfer->dsa_fg_service_profile.dat_write_syscalls,
+		.dat_writev_syscalls = &xfer->dsa_fg_service_profile.dat_writev_syscalls,
+		.idx_write_us = &xfer->dsa_fg_service_profile.sidecar_idx_write_us,
+		.dat_write_us = &xfer->dsa_fg_service_profile.sidecar_dat_write_us,
+	};
+
+	for (i = 0; i < nr_results; i++) {
+		const struct parasite_dsa_fg_result *res =
+			(const struct parasite_dsa_fg_result *)(shared +
+				xfer->dsa_fg_result_meta_base + i * sizeof(*res));
+		struct dsa_fg_page_meta meta = {
+			.vaddr = res->vaddr,
+			.patch_count = res->patch_count,
+			.flags = res->flags,
+		};
+		struct dsa_fg_patch_entry patches[DSA_FG_MAX_PATCHES];
+		struct iovec payload[DSA_FG_MAX_PATCHES];
+		unsigned int nr_payload = 0;
+		u16 j;
+
+		if (res->flags == DSA_FG_PAGE_FULL) {
+			meta.data_len = PAGE_SIZE;
+			payload[nr_payload++] = (struct iovec) {
+				.iov_base = (void *)(shared + res->data_off),
+				.iov_len = PAGE_SIZE,
+			};
+		} else if (res->flags == DSA_FG_PAGE_PATCH) {
+			meta.data_len = res->patch_count * sizeof(patches[0]) +
+				res->data_len;
+			for (j = 0; j < res->patch_count; j++) {
+				patches[j] = (struct dsa_fg_patch_entry) {
+					.off = res->entries[j].off,
+					.len = res->entries[j].len,
+				};
+				payload[nr_payload++] = (struct iovec) {
+					.iov_base = (void *)(shared + res->entries[j].data_off),
+					.iov_len = res->entries[j].len,
+				};
+			}
+		}
+		if (dsa_fg_sidecar_sink_append(sink, &meta,
+					       res->flags == DSA_FG_PAGE_PATCH ? patches : NULL,
+					       payload, nr_payload)) {
+			pr_perror("DSA fine-grained canonical sidecar append failed");
+			goto out;
+		}
+	}
+	if (dsa_fg_sidecar_sink_flush(sink))
+		goto out;
+	if (fstat(idx_fd, &idx_st) || fstat(dat_fd, &dat_st)) {
+		pr_perror("DSA fine-grained canonical sidecar fstat failed");
+		goto out;
+	}
+	if ((u64)sink->dat_off != expected_dat ||
+	    (u64)idx_st.st_size != nr_results * sizeof(struct dsa_fg_page_meta) ||
+	    (u64)dat_st.st_size != expected_dat) {
+		pr_err("DSA fine-grained canonical sidecar size mismatch idx=%" PRIu64
+		       "/%zu dat=%" PRIu64 "/%" PRIu64 " cursor=%" PRIu64 "\n",
+		       (u64)idx_st.st_size, nr_results * sizeof(struct dsa_fg_page_meta),
+		       (u64)dat_st.st_size, expected_dat, (u64)sink->dat_off);
+		goto out;
+	}
+	if (profile) {
+		u64 elapsed = dsa_profile_delta_us(serialize_start_us,
+						  dsa_profile_wall_now_us());
+		u64 writes = xfer->dsa_fg_service_profile.sidecar_idx_write_us +
+			xfer->dsa_fg_service_profile.sidecar_dat_write_us;
+
+		xfer->dsa_fg_service_profile.sidecar_serialize_us =
+			elapsed >= writes ? elapsed - writes : 0;
+	}
+	ret = 0;
+out:
+	xfree(sink);
+	if (dat_fd >= 0 && close(dat_fd))
+		ret = -1;
+	if (idx_fd >= 0 && close(idx_fd))
+		ret = -1;
+	return ret;
 }
 
 static int hot_fg_compare_submit(struct hot_apply_ctx *ctx,
 				  struct hot_fg_compare_slot *slot,
 				  struct hot_fg_compare_span *span,
-				  u64 submit_sequence, u64 submit_ns)
+				  u64 submit_sequence, u64 submit_ns,
+				  bool no_bof)
 {
 	unsigned int wq_idx;
 	unsigned long portal_mask;
@@ -5690,7 +7187,9 @@ static int hot_fg_compare_submit(struct hot_apply_ctx *ctx,
 	slot->submit_ns = submit_ns;
 	slot->completion_deadline_ns = submit_ns + HOT_DSA_COMPLETION_TIMEOUT_NS;
 	slot->desc.opcode = DSA_OPCODE_COMPARE;
-	slot->desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR | IDXD_OP_FLAG_BOF;
+	slot->desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
+	if (!no_bof)
+		slot->desc.flags |= IDXD_OP_FLAG_BOF;
 	slot->desc.src_addr = (uint64_t)(unsigned long)(span->raw + span->cursor);
 	slot->desc.src2_addr = (uint64_t)(unsigned long)(span->parent + span->cursor);
 	slot->desc.xfer_size = slot->submitted_len;
@@ -5713,6 +7212,11 @@ static int hot_fg_compare_submit(struct hot_apply_ctx *ctx,
 		ctx->fg_compare_ops++;
 		ctx->dsa_enqcmd++;
 		ctx->profile_compare_enq_retries += retry;
+		ctx->profile_dsa_submitted_bytes += slot->submitted_len;
+		if (slot->submitted_cursor)
+			ctx->profile_dsa_continuation_submit_ops++;
+		else
+			ctx->profile_dsa_fresh_submit_ops++;
 	}
 	slot->active = true;
 	span->state = HOT_FG_SPAN_ACTIVE;
@@ -5765,6 +7269,49 @@ static int hot_fg_compare_complete(struct hot_fg_compare_slot *slot,
 		       slot->comp.bytes_completed, slot->submitted_len);
 		return -1;
 	}
+	*first_diff = slot->comp.bytes_completed;
+	return 0;
+}
+
+enum hot_fg_nobof_completion {
+	HOT_FG_NOBOF_NOT_READY = 0,
+	HOT_FG_NOBOF_EQUAL,
+	HOT_FG_NOBOF_DIFFERENT,
+	HOT_FG_NOBOF_PAGE_FAULT,
+};
+
+/* The caller has acquire-loaded status before using the rest of the record.
+ * A page fault completion has result=0; it is not an equal completion. */
+static int hot_fg_compare_complete_nobof(struct hot_fg_compare_slot *slot,
+					 enum hot_fg_nobof_completion *kind,
+					 u32 *first_diff)
+{
+	uint8_t status = __atomic_load_n(&slot->comp.status, __ATOMIC_ACQUIRE);
+	uint8_t code = (uint8_t)DSA_COMP_STATUS(status);
+
+	*kind = HOT_FG_NOBOF_NOT_READY;
+	if (status == 0 || code == DSA_COMP_NONE)
+		return 0;
+	if (code == DSA_COMP_PAGE_FAULT_NOBOF) {
+		*kind = HOT_FG_NOBOF_PAGE_FAULT;
+		return 0;
+	}
+	if (code != DSA_COMP_SUCCESS && code != DSA_COMP_SUCCESS_PRED) {
+		pr_err("DSA no-BOF compare completion failed status=%u code=%u\n",
+		       status, code);
+		return -1;
+	}
+	if (slot->comp.result == 0) {
+		*kind = HOT_FG_NOBOF_EQUAL;
+		*first_diff = slot->submitted_len;
+		return 0;
+	}
+	if (slot->comp.bytes_completed >= slot->submitted_len) {
+		pr_err("DSA no-BOF compare returned invalid first_diff=%u bytes=%u\n",
+		       slot->comp.bytes_completed, slot->submitted_len);
+		return -1;
+	}
+	*kind = HOT_FG_NOBOF_DIFFERENT;
 	*first_diff = slot->comp.bytes_completed;
 	return 0;
 }
@@ -6309,7 +7856,7 @@ static int hot_fg_wavefront_fill(struct hot_apply_ctx *ctx,
 			return -1;
 		}
 		if (hot_fg_compare_submit(ctx, &slots[i], span,
-					  ++*submit_sequence, submit_ns))
+				  ++*submit_sequence, submit_ns, false))
 			return -1;
 		(*active)++;
 	}
@@ -6550,12 +8097,12 @@ static int hot_fg_hybrid_validate_spans(struct hot_fg_raw_page *pages,
 		    span->length / PAGE_SIZE != span->page_count ||
 		    span->state != HOT_FG_SPAN_UNPREFAULTED ||
 		    span->owner != HOT_FG_OWNER_NONE) {
-			pr_err("DSA hybrid-demand has invalid initial span=%zu owner=%u state=%u length=%u\n",
+			pr_err("DSA hybrid compare has invalid initial span=%zu owner=%u state=%u length=%u\n",
 			       i, span->owner, span->state, span->length);
 			return -1;
 		}
 		if (have_previous && vaddr <= previous_vaddr) {
-			pr_err("DSA hybrid-demand spans are not strictly ordered: previous=%lx current=%lx\n",
+			pr_err("DSA hybrid compare spans are not strictly ordered: previous=%lx current=%lx\n",
 			       previous_vaddr, vaddr);
 			return -1;
 		}
@@ -6638,7 +8185,7 @@ static int hot_fg_hybrid_fill_dsa(struct hot_apply_ctx *ctx,
 			ctx->profile_hybrid_dsa_claim_pages += span->page_count;
 		}
 		if (hot_fg_compare_submit(ctx, &slots[i], span,
-					  ++*submit_sequence, submit_ns))
+				  ++*submit_sequence, submit_ns, false))
 			return -1;
 		(*active)++;
 	}
@@ -6697,7 +8244,8 @@ static int hot_fg_hybrid_cpu_page(struct hot_apply_ctx *ctx,
 		return -1;
 	span_idx = *cpu_current;
 	span = &spans[span_idx];
-	if (span->owner != HOT_FG_OWNER_CPU ||
+	if ((span->owner != HOT_FG_OWNER_CPU &&
+	     span->owner != HOT_FG_OWNER_CPU_FAULT) ||
 	    span->state != HOT_FG_SPAN_READY ||
 	    span->cursor >= span->length) {
 		pr_err("DSA hybrid-demand has invalid CPU span=%zu owner=%u state=%u cursor=%u length=%u\n",
@@ -6733,6 +8281,8 @@ static int hot_fg_hybrid_cpu_page(struct hot_apply_ctx *ctx,
 	}
 	if (ctx->profile)
 		ctx->profile_hybrid_cpu_waves++;
+	if (ctx->profile && span->owner == HOT_FG_OWNER_CPU_FAULT)
+		ctx->profile_compare_cpu_fault_waves++;
 
 	if (span->cursor == span->length) {
 		if (hot_fg_span_finalize(span, pages, span->length) ||
@@ -6984,43 +8534,541 @@ out:
 	return ret;
 }
 
+/* A no-BOF fault is a scheduling event only after the descriptor is no
+ * longer ACTIVE.  The remaining span moves one way to SIMD; do not touch a
+ * byte and resubmit a suffix, because that turns every cold page into a
+ * DSA->CPU->DSA round trip. */
+static int hot_fg_nobof_fault_to_cpu(struct hot_apply_ctx *ctx,
+				      struct hot_fg_raw_page *pages,
+				      struct hot_fg_compare_span *span,
+				      struct hot_fg_compare_slot *slot,
+				      struct hot_fg_ready_queue *cpu_fault_ready)
+{
+	u8 fault_info = slot->comp.fault_info;
+	u32 operand = (fault_info >> HOT_DSA_FAULT_OPERAND_SHIFT) &
+		HOT_DSA_FAULT_OPERAND_MASK;
+	u32 partial = slot->comp.bytes_completed;
+	u64 operand_addr;
+	u64 operand_end;
+	u64 fault_page;
+	u64 first_page;
+	u64 end_page;
+	const u64 page_mask = (u64)PAGE_SIZE - 1ULL;
+	u32 remaining;
+
+	if (slot->comp.result != 0 || (fault_info & HOT_DSA_FAULT_ADDR_MASKED) ||
+	    (operand != HOT_DSA_FAULT_OPERAND_SRC1 &&
+	     operand != HOT_DSA_FAULT_OPERAND_SRC2) ||
+	    partial >= slot->submitted_len ||
+	    slot->submitted_cursor != span->cursor) {
+		pr_err("DSA no-BOF compare fault has invalid metadata result=%u info=%u partial=%u submitted=%u cursor=%u\n",
+		       slot->comp.result, fault_info, partial, slot->submitted_len,
+		       span->cursor);
+		return -1;
+	}
+	operand_addr = operand == HOT_DSA_FAULT_OPERAND_SRC1 ?
+		slot->desc.src_addr : slot->desc.src2_addr;
+	/* bytes_completed is compare progress, whereas fault_addr identifies an
+	 * operand page whose translation failed.  DSA may have address requests
+	 * in flight beyond the retired compare prefix, so do not require the
+	 * fault page to equal operand_addr + partial.  The fault must still name
+	 * a page covered by this exact submitted descriptor. */
+	if (operand_addr > UINT64_MAX - slot->submitted_len) {
+		pr_err("DSA no-BOF compare fault submitted range overflow operand=%u base=%" PRIx64
+		       " len=%u\n", operand, operand_addr, slot->submitted_len);
+		return -1;
+	}
+	operand_end = operand_addr + slot->submitted_len;
+	if (operand_end > UINT64_MAX - page_mask) {
+		pr_err("DSA no-BOF compare fault page range overflow operand=%u end=%" PRIx64
+		       "\n", operand, operand_end);
+		return -1;
+	}
+	first_page = operand_addr & ~page_mask;
+	end_page = (operand_end + page_mask) & ~page_mask;
+	fault_page = slot->comp.fault_addr & ~page_mask;
+	if (fault_page < first_page || fault_page >= end_page) {
+		pr_err("DSA no-BOF compare fault outside submitted range operand=%u fault=%" PRIx64
+		       " range=[%" PRIx64 ",%" PRIx64 ") partial=%u len=%u\n",
+		       operand, fault_page, first_page, end_page, partial,
+		       slot->submitted_len);
+		return -1;
+	}
+
+	span->cursor += partial;
+	if (hot_fg_span_finalize(span, pages, span->cursor))
+		return -1;
+	if (span->cursor >= span->length) {
+		pr_err("DSA no-BOF compare fault consumed complete span cursor=%u length=%u\n",
+		       span->cursor, span->length);
+		return -1;
+	}
+	remaining = span->length - span->cursor;
+	span->owner = HOT_FG_OWNER_CPU_FAULT;
+	span->state = HOT_FG_SPAN_READY;
+	if (hot_fg_ready_queue_push(cpu_fault_ready, (size_t)(span - cpu_fault_ready->spans))) {
+		pr_err("DSA no-BOF compare CPU fault queue overflow\n");
+		return -1;
+	}
+	if (ctx->profile) {
+		ctx->profile_compare_nobof_faults++;
+		ctx->profile_compare_nobof_equal_prefix_bytes += partial;
+		if (operand == HOT_DSA_FAULT_OPERAND_SRC1)
+			ctx->profile_compare_nobof_fault_source1++;
+		else
+			ctx->profile_compare_nobof_fault_source2++;
+		ctx->profile_compare_fault_handoff_spans++;
+		ctx->profile_compare_fault_handoff_pages +=
+			span->page_count - span->finalized_pages;
+		ctx->profile_compare_fault_handoff_remaining_bytes += remaining;
+		if (cpu_fault_ready->nr > ctx->profile_compare_fault_queue_max)
+			ctx->profile_compare_fault_queue_max = cpu_fault_ready->nr;
+	}
+	return 0;
+}
+
+/* Refill a no-BOF hybrid continuously.  A continuation is already DSA-owned
+ * and therefore goes first.  Fresh spans leave the tail only when a slot can
+ * submit them immediately; no paired-wave backlog or byte budget exists. */
+static int hot_fg_hybrid_fault_fill_dsa(
+	struct hot_apply_ctx *ctx, struct hot_fg_compare_slot *slots,
+	struct hot_fg_compare_span *spans,
+	struct hot_fg_ready_queue *dsa_ready, size_t unclaimed_head,
+	size_t *unclaimed_tail, size_t fault_debt, size_t *active,
+	u64 *submit_sequence, u64 submit_ns)
+{
+	size_t i;
+	size_t fresh_claimed = 0;
+
+	for (i = 0; i < HOT_DSA_COMPARE_INFLIGHT &&
+	     *active < HOT_DSA_COMPARE_INFLIGHT; i++) {
+		struct hot_fg_compare_span *span;
+		size_t span_idx;
+
+		if (slots[i].active)
+			continue;
+		if (dsa_ready->nr) {
+			if (hot_fg_ready_queue_pop(dsa_ready, &span_idx))
+				return -1;
+			span = &spans[span_idx];
+			if (span->owner != HOT_FG_OWNER_DSA ||
+			    span->state != HOT_FG_SPAN_READY || span->cursor >= span->length) {
+				pr_err("DSA no-BOF continuation has invalid span=%zu owner=%u state=%u cursor=%u length=%u\n",
+				       span_idx, span->owner, span->state,
+				       span->cursor, span->length);
+				return -1;
+			}
+		} else {
+			if (unclaimed_head >= *unclaimed_tail)
+				break;
+			if (*active + fault_debt >= HOT_DSA_COMPARE_INFLIGHT) {
+				if (ctx->profile) {
+					ctx->profile_compare_fresh_claim_throttles++;
+					ctx->profile_fresh_refill_blocked_fault_debt++;
+				}
+				break;
+			}
+			span_idx = --*unclaimed_tail;
+			span = &spans[span_idx];
+			if (span->owner != HOT_FG_OWNER_NONE ||
+			    span->state != HOT_FG_SPAN_UNPREFAULTED) {
+				pr_err("DSA no-BOF fresh claim has invalid span=%zu owner=%u state=%u\n",
+				       span_idx, span->owner, span->state);
+				return -1;
+			}
+			span->owner = HOT_FG_OWNER_DSA;
+			span->state = HOT_FG_SPAN_READY;
+			if (ctx->profile) {
+				ctx->profile_hybrid_dsa_claim_spans++;
+				ctx->profile_hybrid_dsa_claim_pages += span->page_count;
+				ctx->profile_dsa_fresh_claim_bytes += span->length;
+				fresh_claimed++;
+			}
+		}
+		if (hot_fg_compare_submit(ctx, &slots[i], span,
+					  ++*submit_sequence, submit_ns, true))
+			return -1;
+		(*active)++;
+	}
+	if (ctx->profile && fresh_claimed) {
+		ctx->profile_fresh_refill_spans += fresh_claimed;
+		ctx->profile_fresh_refill_batches++;
+	}
+	return 0;
+}
+
+static size_t hot_fg_profile_ready_completions(
+	struct hot_fg_compare_slot *slots)
+{
+	size_t ready = 0;
+	size_t i;
+
+	for (i = 0; i < HOT_DSA_COMPARE_INFLIGHT; i++)
+		if (slots[i].active &&
+		    __atomic_load_n(&slots[i].comp.status, __ATOMIC_ACQUIRE))
+			ready++;
+	return ready;
+}
+
+static int hot_fg_hybrid_fault_claim_cpu(struct hot_apply_ctx *ctx,
+					 struct hot_fg_ready_queue *cpu_fault_ready,
+					 size_t *cpu_current)
+{
+	struct hot_fg_compare_span *span;
+	size_t span_idx;
+
+	if (*cpu_current != SIZE_MAX || !cpu_fault_ready->nr)
+		return 0;
+	if (hot_fg_ready_queue_pop(cpu_fault_ready, &span_idx))
+		return -1;
+	span = &cpu_fault_ready->spans[span_idx];
+	if (span->owner != HOT_FG_OWNER_CPU_FAULT ||
+	    span->state != HOT_FG_SPAN_READY || span->cursor >= span->length) {
+		pr_err("DSA no-BOF CPU fault claim has invalid span=%zu owner=%u state=%u cursor=%u length=%u\n",
+		       span_idx, span->owner, span->state, span->cursor, span->length);
+		return -1;
+	}
+	*cpu_current = span_idx;
+	return 0;
+}
+
+static int hot_fg_compare_hybrid_fault_simd(struct hot_apply_ctx *ctx,
+					     struct hot_fg_raw_page *pages,
+					     struct hot_fg_compare_span *spans,
+					     size_t nr_spans)
+{
+	struct hot_fg_compare_slot slots[HOT_DSA_COMPARE_INFLIGHT] = {};
+	struct hot_fg_ready_queue dsa_ready = {};
+	struct hot_fg_ready_queue cpu_fault_ready = {};
+	struct hot_fg_cpu_scan_stats cpu_stats = {};
+	size_t unclaimed_head = 0;
+	size_t unclaimed_tail = nr_spans;
+	size_t cpu_current = SIZE_MAX;
+	size_t done = 0;
+	size_t active = 0;
+	u64 submit_sequence = 0;
+	size_t i;
+	int ret = -1;
+
+	if (!nr_spans)
+		return 0;
+	if (hot_fg_hybrid_validate_spans(pages, spans, nr_spans) ||
+	    hot_fg_ready_queue_init(&dsa_ready, spans, nr_spans) ||
+	    hot_fg_ready_queue_init(&cpu_fault_ready, spans, nr_spans))
+		goto out;
+
+	/* A service created/restarted around an already committed parent has no
+	 * locally retained PTEs yet.  Prepare that one known-cold generation once;
+	 * normal generations do not call any prefault routine. */
+	if (!ctx->service_parent_mapping_warm) {
+		for (i = 0; i < nr_spans; i++) {
+			if (hot_fg_prefault_parent_span(&spans[i], i, "nobof-cold-attach"))
+				goto out;
+			if (ctx->profile) {
+				ctx->profile_prefault_spans++;
+				ctx->profile_prefault_pages += spans[i].length / PAGE_SIZE;
+			}
+		}
+	}
+
+	while (done < nr_spans) {
+		u64 now_ns = 1;
+		struct hot_fg_compare_slot *expired_slot = NULL;
+		size_t harvested = 0;
+		bool had_active;
+		bool refill_sample;
+		size_t fault_debt;
+
+		/* Do not add a clock read to a CPU-only tail.  A timestamp is needed
+		 * only while checking or creating device work. */
+		if (active || dsa_ready.nr || unclaimed_head < unclaimed_tail)
+			now_ns = hot_dsa_watchdog_now_ns();
+		had_active = active != 0;
+		if (!now_ns) {
+			if (active) {
+				for (i = 0; i < HOT_DSA_COMPARE_INFLIGHT; i++)
+					if (slots[i].active)
+						hot_fg_completion_timeout_fatal(&slots[i], active,
+							slots[i].completion_deadline_ns,
+							"nobof-scheduler-clock");
+			}
+			pr_perror("DSA no-BOF completion watchdog clock failed");
+			goto out;
+		}
+		if (ctx->profile)
+			ctx->profile_scheduler_iterations++;
+		if (had_active && ctx->profile) {
+			ctx->profile_compare_poll_sweeps++;
+			if (active > ctx->profile_compare_max_active)
+				ctx->profile_compare_max_active = active;
+		}
+
+		for (i = 0; i < HOT_DSA_COMPARE_INFLIGHT; i++) {
+			struct hot_fg_compare_slot *slot = &slots[i];
+			struct hot_fg_compare_span *span;
+			enum hot_fg_nobof_completion kind;
+			u32 old_cursor;
+			u32 progress;
+			u32 diff = 0;
+
+			if (!slot->active)
+				continue;
+			if (hot_fg_compare_complete_nobof(slot, &kind, &diff)) {
+				if (__atomic_load_n(&slot->comp.status, __ATOMIC_ACQUIRE)) {
+					slot->active = false;
+					active--;
+				}
+				goto out;
+			}
+			if (kind == HOT_FG_NOBOF_NOT_READY) {
+				if (ctx->profile)
+					ctx->profile_compare_not_ready++;
+				if (!expired_slot && now_ns >= slot->completion_deadline_ns)
+					expired_slot = slot;
+				continue;
+			}
+			span = slot->span;
+			if (!span || span->owner != HOT_FG_OWNER_DSA ||
+			    span->state != HOT_FG_SPAN_ACTIVE ||
+			    slot->submitted_cursor != span->cursor) {
+				pr_err("DSA no-BOF completion has stale span/cursor\n");
+				slot->active = false;
+				active--;
+				goto out;
+			}
+			/* Completion DMA is over before ownership changes. */
+			slot->active = false;
+			active--;
+			harvested++;
+			old_cursor = span->cursor;
+			if (ctx->profile && now_ns >= slot->submit_ns) {
+				u64 age_us = (now_ns - slot->submit_ns) / 1000ULL;
+
+				if (age_us > ctx->profile_max_completion_age_us)
+					ctx->profile_max_completion_age_us = age_us;
+			}
+			if (kind == HOT_FG_NOBOF_EQUAL) {
+				span->cursor += slot->submitted_len;
+				if (hot_fg_span_finalize(span, pages, span->cursor))
+					goto out;
+			} else if (kind == HOT_FG_NOBOF_DIFFERENT) {
+				if (hot_fg_span_record_diff(span, pages,
+						    slot->submitted_cursor + diff))
+					goto out;
+			} else if (hot_fg_nobof_fault_to_cpu(ctx, pages, span, slot,
+							    &cpu_fault_ready)) {
+				goto out;
+			}
+			progress = span->cursor - old_cursor;
+			if (ctx->profile)
+				ctx->profile_dsa_logical_progress_bytes += progress;
+
+			if (span->owner == HOT_FG_OWNER_CPU_FAULT) {
+				continue;
+			}
+			if (span->cursor == span->length) {
+				if (hot_fg_span_finalize(span, pages, span->length) ||
+				    span->finalized_pages != span->page_count) {
+					pr_err("DSA no-BOF span ended with unfinished pages\n");
+					goto out;
+				}
+				span->state = HOT_FG_SPAN_DONE;
+				done++;
+			} else {
+				span->state = HOT_FG_SPAN_READY;
+				if (hot_fg_ready_queue_push(&dsa_ready,
+							    (size_t)(span - spans))) {
+					pr_err("DSA no-BOF continuation queue overflow\n");
+					goto out;
+				}
+			}
+		}
+
+		if (expired_slot &&
+		    __atomic_load_n(&expired_slot->comp.status, __ATOMIC_ACQUIRE) == 0) {
+			if (ctx->profile)
+				ctx->profile_completion_timeout_count++;
+			hot_fg_completion_timeout_fatal(expired_slot, active, now_ns,
+						"nobof-compare");
+		}
+		if (had_active && ctx->profile)
+			ctx->profile_completions_harvested += harvested;
+
+		/* CPU ownership is admitted before fresh DSA work in this iteration.
+		 * Fault remainder wins whenever there is no current CPU span; current
+		 * ownership itself is never preempted mid-span. */
+		if (hot_fg_hybrid_fault_claim_cpu(ctx, &cpu_fault_ready,
+						   &cpu_current))
+			goto out;
+		if (hot_fg_hybrid_tail_handoff(ctx, spans, &dsa_ready,
+					       unclaimed_head, unclaimed_tail,
+					       &cpu_current))
+			goto out;
+		if (cpu_current == SIZE_MAX && unclaimed_head < unclaimed_tail) {
+			int claim = hot_fg_hybrid_claim_cpu(
+				ctx, spans, &unclaimed_head, unclaimed_tail,
+				&cpu_current);
+
+			if (claim < 0)
+				goto out;
+		}
+
+		fault_debt = cpu_fault_ready.nr;
+		if (cpu_current != SIZE_MAX &&
+		    spans[cpu_current].owner == HOT_FG_OWNER_CPU_FAULT)
+			fault_debt++;
+		refill_sample = ctx->profile &&
+			(dsa_ready.nr || unclaimed_head < unclaimed_tail);
+		if (hot_fg_hybrid_fault_fill_dsa(
+			    ctx, slots, spans, &dsa_ready, unclaimed_head,
+			    &unclaimed_tail, fault_debt, &active,
+			    &submit_sequence, now_ns))
+			goto out;
+		if (ctx->profile && refill_sample) {
+			ctx->profile_dsa_refill_samples++;
+			ctx->profile_post_refill_active_sum += active;
+			if (active < 32)
+				ctx->profile_post_refill_active_lt_32++;
+			if (active < 64)
+				ctx->profile_post_refill_active_lt_64++;
+			if (active < 96)
+				ctx->profile_post_refill_active_lt_96++;
+			if (!active && !dsa_ready.nr &&
+			    unclaimed_head < unclaimed_tail &&
+			    fault_debt < HOT_DSA_COMPARE_INFLIGHT)
+				ctx->profile_dsa_empty_with_claimable_fresh++;
+		}
+
+		if (cpu_current != SIZE_MAX) {
+			struct hot_fg_compare_span *cpu_span = &spans[cpu_current];
+			bool cpu_fault = cpu_span->owner == HOT_FG_OWNER_CPU_FAULT;
+			bool dsa_active = active != 0;
+			u32 old_cursor = cpu_span->cursor;
+			u64 progress;
+			size_t ready_before = 0;
+			size_t ready_after = 0;
+			bool cpu_done;
+
+			if (ctx->profile && dsa_active)
+				ready_before =
+					hot_fg_profile_ready_completions(slots);
+			if (hot_fg_hybrid_cpu_page(ctx, pages, spans, &cpu_current,
+						   &cpu_stats, &cpu_done))
+				goto out;
+			progress = cpu_span->cursor - old_cursor;
+			if (!progress || progress > PAGE_SIZE) {
+				pr_err("DSA no-BOF demand SIMD quantum made invalid progress=%" PRIu64 "\n",
+				       progress);
+				goto out;
+			}
+			if (ctx->profile) {
+				ctx->profile_simd_logical_progress_bytes += progress;
+				if (cpu_fault)
+					ctx->profile_fault_simd_logical_progress_bytes +=
+						progress;
+				else
+					ctx->profile_normal_simd_logical_progress_bytes +=
+						progress;
+				if (dsa_active) {
+					ctx->profile_simd_progress_while_dsa_active_bytes +=
+						progress;
+					ctx->profile_simd_quanta_while_dsa_active++;
+				} else if (!cpu_fault) {
+					ctx->profile_dsa_active_zero_while_normal_cpu_work++;
+				}
+			}
+			if (dsa_active && ctx->profile) {
+				ready_after = hot_fg_profile_ready_completions(slots);
+				ctx->profile_ready_completions_before_simd += ready_before;
+				ctx->profile_ready_completions_after_simd += ready_after;
+			}
+			if (cpu_done)
+				done++;
+		}
+		if (!active && !dsa_ready.nr && !cpu_fault_ready.nr &&
+		    cpu_current == SIZE_MAX && unclaimed_head == unclaimed_tail &&
+		    done < nr_spans) {
+			pr_err("DSA no-BOF compare lost work done=%zu total=%zu\n", done, nr_spans);
+			goto out;
+		}
+		if (active && cpu_current == SIZE_MAX)
+			hot_dsa_cpu_relax();
+	}
+
+	if (unclaimed_head != unclaimed_tail || cpu_current != SIZE_MAX ||
+	    dsa_ready.nr ||
+	    cpu_fault_ready.nr || active) {
+		pr_err("DSA no-BOF demand compare ended with live work head=%zu tail=%zu "
+		       "cpu=%zu dsa_ready=%zu fault_ready=%zu active=%zu\n",
+		       unclaimed_head, unclaimed_tail, cpu_current, dsa_ready.nr,
+		       cpu_fault_ready.nr, active);
+		goto out;
+	}
+	for (i = 0; i < nr_spans; i++) {
+		if (spans[i].state != HOT_FG_SPAN_DONE ||
+		    spans[i].owner == HOT_FG_OWNER_NONE ||
+		    spans[i].cursor != spans[i].length ||
+		    spans[i].finalized_pages != spans[i].page_count) {
+			pr_err("DSA no-BOF final span mismatch span=%zu owner=%u state=%u cursor=%u length=%u finalized=%zu pages=%zu\n",
+			       i, spans[i].owner, spans[i].state, spans[i].cursor,
+			       spans[i].length, spans[i].finalized_pages, spans[i].page_count);
+			goto out;
+		}
+	}
+	if (ctx->profile) {
+		if (ctx->profile_hybrid_dsa_claim_spans +
+		    ctx->profile_hybrid_cpu_claim_spans != nr_spans) {
+			pr_err("DSA no-BOF claim accounting mismatch dsa=%" PRIu64
+			       " cpu=%" PRIu64 " total=%zu\n",
+			       ctx->profile_hybrid_dsa_claim_spans,
+			       ctx->profile_hybrid_cpu_claim_spans, nr_spans);
+			goto out;
+		}
+		ctx->profile_simd_vector_ops += cpu_stats.vector_ops;
+		ctx->profile_simd_bytes_examined += cpu_stats.bytes_examined;
+		if (ctx->profile_dsa_fresh_submit_ops !=
+		    ctx->profile_hybrid_dsa_claim_spans ||
+		    ctx->fg_compare_ops != ctx->profile_dsa_fresh_submit_ops +
+			    ctx->profile_dsa_continuation_submit_ops) {
+			pr_err("DSA no-BOF demand submit accounting mismatch fresh=%" PRIu64
+			       " claims=%" PRIu64 " continuation=%" PRIu64
+			       " total=%" PRIu64 "\n",
+			       ctx->profile_dsa_fresh_submit_ops,
+			       ctx->profile_hybrid_dsa_claim_spans,
+			       ctx->profile_dsa_continuation_submit_ops,
+			       ctx->fg_compare_ops);
+			goto out;
+		}
+	}
+	ret = 0;
+out:
+	if (active && hot_fg_wavefront_drain_slots(slots, &active))
+		ret = -1;
+	hot_fg_ready_queue_fini(&cpu_fault_ready);
+	hot_fg_ready_queue_fini(&dsa_ready);
+	return ret;
+}
+
 static int hot_fg_apply_raw_page(struct hot_apply_ctx *ctx,
 				 struct hot_fg_raw_page *page)
 {
-	struct hot_memstore_seg *old;
-	struct hot_vma_segment *seg;
-	bool write_old;
 	u16 i;
 
 	if (page->state == HOT_FG_RAW_PARENT)
 		return 0;
-	old = hot_memstore_find_old_cover(ctx, page->vaddr, page->vaddr + PAGE_SIZE);
-	seg = hot_memstore_find_vma_segment(ctx, page->vaddr, PAGE_SIZE);
-	if (!seg) {
-		pr_err("DSA hot memstore can't find destination VMA for raw page %lx\n",
-		       page->vaddr);
-		return -1;
-	}
-	write_old = hot_memstore_segment_reuses_old(seg, old, page->vaddr);
 	if (page->state == HOT_FG_RAW_FULL) {
-		if ((write_old && hot_memstore_write_to_old(ctx, old, page->raw,
-						     page->vaddr, PAGE_SIZE)) ||
-		    (!write_old && hot_memstore_write_to_segments(ctx, page->raw,
-						      page->vaddr, PAGE_SIZE)))
+		if (hot_memstore_write_to_segments(ctx, page->raw,
+						  page->vaddr, PAGE_SIZE))
 			return -1;
 		if (ctx->profile)
 			ctx->memstore_bytes += PAGE_SIZE;
 		return 0;
 	}
 	for (i = 0; i < page->patch_count; i++) {
-		if ((write_old && hot_memstore_write_to_old(ctx, old,
-						     page->raw + page->patches[i].off,
-						     page->vaddr + page->patches[i].off,
-						     page->patches[i].len)) ||
-		    (!write_old && hot_memstore_write_to_segments(ctx,
-						      page->raw + page->patches[i].off,
-						      page->vaddr + page->patches[i].off,
-						      page->patches[i].len)))
+		if (hot_memstore_write_to_segments(ctx,
+						  page->raw + page->patches[i].off,
+						  page->vaddr + page->patches[i].off,
+						  page->patches[i].len))
 			return -1;
 		if (ctx->profile)
 			ctx->memstore_bytes += page->patches[i].len;
@@ -7028,9 +9076,293 @@ static int hot_fg_apply_raw_page(struct hot_apply_ctx *ctx,
 	return 0;
 }
 
+/* Publish the one canonical classification consumed by both the durable
+ * serializer and hot apply.  Payload offsets deliberately point back into
+ * the immutable raw capture; no second patch-data arena is created. */
+static int hot_fg_publish_results(struct page_xfer *xfer,
+				  const unsigned char *shared,
+				  const struct hot_fg_raw_page *pages, size_t nr)
+{
+	struct hot_apply_ctx *ctx = xfer ? xfer->hot_apply : NULL;
+	u32 head;
+	size_t i;
+
+	if (!xfer->dsa_fg_result_meta_base ||
+	    xfer->dsa_fg_result_meta_limit < xfer->dsa_fg_result_meta_base ||
+	    nr > (xfer->dsa_fg_result_meta_limit - xfer->dsa_fg_result_meta_base) /
+		 sizeof(struct parasite_dsa_fg_result)) {
+		pr_err("DSA fine-grained result metadata capacity is insufficient pages=%zu base=%u limit=%u\n",
+		       nr, xfer->dsa_fg_result_meta_base,
+		       xfer->dsa_fg_result_meta_limit);
+		return -1;
+	}
+	head = xfer->dsa_fg_result_meta_base +
+		nr * sizeof(struct parasite_dsa_fg_result);
+	for (i = 0; i < nr; i++) {
+		const struct hot_fg_raw_page *page = &pages[i];
+		struct parasite_dsa_fg_result *result;
+		u32 raw_off;
+		u16 j;
+
+		if (page->state == HOT_FG_RAW_PENDING || page->raw < shared ||
+		    (u64)(page->raw - shared) > UINT_MAX) {
+			pr_err("DSA fine-grained cannot publish incomplete result page=%zu\n", i);
+			return -1;
+		}
+		raw_off = page->raw - shared;
+		if (raw_off < xfer->dsa_fg_raw_payload_base ||
+		    raw_off > xfer->dsa_fg_raw_payload_head - PAGE_SIZE) {
+			pr_err("DSA fine-grained raw offset is outside capture payload page=%zu off=%u\n",
+			       i, raw_off);
+			return -1;
+		}
+		result = (struct parasite_dsa_fg_result *)(shared +
+			xfer->dsa_fg_result_meta_base +
+			i * sizeof(*result));
+		memset(result, 0, sizeof(*result));
+		result->vaddr = page->vaddr;
+		switch (page->state) {
+		case HOT_FG_RAW_PARENT:
+			result->flags = DSA_FG_PAGE_PARENT;
+			if (ctx && ctx->profile)
+				ctx->profile_parent_pages++;
+			break;
+		case HOT_FG_RAW_FULL:
+			result->flags = DSA_FG_PAGE_FULL;
+			result->data_off = raw_off;
+			result->data_len = PAGE_SIZE;
+			if (ctx && ctx->profile) {
+				ctx->fg_full_pages++;
+				ctx->fg_patch_bytes += PAGE_SIZE;
+			}
+			break;
+		case HOT_FG_RAW_PATCH:
+			if (!page->patch_count || page->patch_count > DSA_FG_MAX_PATCHES ||
+			    page->patch_bytes > DSA_FG_MAX_BYTES) {
+				pr_err("DSA fine-grained invalid patch result page=%zu ranges=%u bytes=%u\n",
+				       i, page->patch_count, page->patch_bytes);
+				return -1;
+			}
+			result->flags = DSA_FG_PAGE_PATCH;
+			result->patch_count = page->patch_count;
+			result->data_len = page->patch_bytes;
+			if (ctx && ctx->profile) {
+				ctx->fg_patch_pages++;
+				ctx->fg_patch_bytes += page->patch_bytes;
+				ctx->profile_patch_ranges += page->patch_count;
+			}
+			for (j = 0; j < page->patch_count; j++) {
+				if (!page->patches[j].len ||
+				    (u32)page->patches[j].off + page->patches[j].len > PAGE_SIZE) {
+					pr_err("DSA fine-grained invalid patch bounds page=%zu range=%u\n", i, j);
+					return -1;
+				}
+				result->entries[j].off = page->patches[j].off;
+				result->entries[j].len = page->patches[j].len;
+				result->entries[j].data_off = raw_off + page->patches[j].off;
+			}
+			break;
+		default:
+			pr_err("DSA fine-grained invalid result state=%u page=%zu\n", page->state, i);
+			return -1;
+		}
+		if (ctx && ctx->profile)
+			ctx->fg_pages++;
+	}
+	__atomic_thread_fence(__ATOMIC_RELEASE);
+	xfer->dsa_fg_result_meta_head = head;
+	((struct parasite_dsa_stream_hdr *)shared)->fg_result_meta_head = head;
+	return 0;
+}
+
+static int __attribute__((unused)) hot_fg_load_vma_plan(struct hot_apply_ctx *ctx,
+				const unsigned char *shared, u32 base, u32 head, u32 count)
+{
+	const struct dsa_fg_vma_plan_record *records;
+	struct hot_vma_plan *plans;
+	size_t bytes;
+	size_t i;
+
+	if (!ctx || !shared || head < base ||
+	    count > UINT32_MAX / sizeof(*records) ||
+	    (u64)head - base != (u64)count * sizeof(*records))
+		return -1;
+	bytes = (size_t)count * sizeof(*records);
+	if (!count || !bytes)
+		return -1;
+	records = (const struct dsa_fg_vma_plan_record *)(shared + base);
+	plans = xmalloc((size_t)count * sizeof(*plans));
+	if (!plans)
+		return -1;
+	for (i = 0; i < count; i++) {
+		if (records[i].start >= records[i].end ||
+		    (records[i].start & (PAGE_SIZE - 1)) ||
+		    (records[i].end & (PAGE_SIZE - 1)) ||
+		    (i && records[i - 1].end > records[i].start)) {
+			pr_err("DSA fine-grained service received invalid VMA plan index=%zu\n", i);
+			xfree(plans);
+			return -1;
+		}
+		plans[i].start = records[i].start;
+		plans[i].end = records[i].end;
+	}
+	/* The service owns this generation's VMA plan.  Old plans must never be
+	 * reused after a target VMA layout change. */
+	xfree(ctx->vma_plans);
+	ctx->vma_plans = plans;
+	ctx->nr_vma_plans = count;
+	ctx->vma_plans_cap = count;
+	(void)bytes;
+	return 0;
+}
+
+static int hot_fg_pages_from_results(struct page_xfer *xfer,
+				    struct hot_apply_ctx *ctx,
+				    const unsigned char *shared,
+				    struct hot_fg_raw_page **pages_out,
+				    size_t *nr_out,
+				    size_t *failure_index,
+				    unsigned long *failure_vaddr)
+{
+	struct hot_fg_raw_page *pages = NULL;
+	size_t nr = 0, cap = 0;
+	u32 desc_off;
+	u32 raw_off = xfer->dsa_fg_raw_payload_base;
+	size_t result_index = 0;
+	(void)ctx;
+
+	if (failure_index)
+		*failure_index = SIZE_MAX;
+	if (failure_vaddr)
+		*failure_vaddr = ULONG_MAX;
+	if (!xfer || !shared || xfer->dsa_fg_result_meta_head <
+	    xfer->dsa_fg_result_meta_base)
+		return -1;
+	for (desc_off = xfer->dsa_fg_desc_area_off;
+	     desc_off < xfer->dsa_fg_desc_head;
+	     desc_off += sizeof(struct dsa_dump_descriptor)) {
+		const struct dsa_dump_descriptor *desc =
+			(const struct dsa_dump_descriptor *)(shared + desc_off);
+		u32 page_off;
+
+		if (!desc->copy_len || desc->copy_len % PAGE_SIZE ||
+		    raw_off > xfer->dsa_fg_raw_payload_head ||
+		    desc->copy_len > xfer->dsa_fg_raw_payload_head - raw_off)
+			goto err;
+		for (page_off = 0; page_off < desc->copy_len; page_off += PAGE_SIZE) {
+			const struct parasite_dsa_fg_result *result;
+			struct hot_fg_raw_page *page;
+			u16 j;
+
+			if (failure_index)
+				*failure_index = result_index;
+			if (failure_vaddr)
+				*failure_vaddr =
+					(unsigned long)desc->src_addr + page_off;
+			if (result_index >= (xfer->dsa_fg_result_meta_head -
+				     xfer->dsa_fg_result_meta_base) / sizeof(*result))
+				goto err;
+			if (nr == cap) {
+				size_t new_cap = cap ? cap * 2 : 4096;
+				void *new_pages = xrealloc(pages, new_cap * sizeof(*pages));
+				if (!new_pages)
+					goto err;
+				pages = new_pages;
+				cap = new_cap;
+			}
+			result = (const struct parasite_dsa_fg_result *)(shared +
+				xfer->dsa_fg_result_meta_base +
+				result_index * sizeof(*result));
+			page = &pages[nr++];
+			memset(page, 0, sizeof(*page));
+			page->vaddr = (unsigned long)desc->src_addr + page_off;
+			page->raw = shared + raw_off + page_off;
+			if (result->vaddr != page->vaddr)
+				goto err;
+			if (result->flags == DSA_FG_PAGE_PARENT) {
+				if (result->data_len || result->patch_count)
+					goto err;
+				page->state = HOT_FG_RAW_PARENT;
+			} else if (result->flags == DSA_FG_PAGE_FULL) {
+				if (result->data_len != PAGE_SIZE || result->patch_count ||
+				    result->data_off != raw_off + page_off)
+					goto err;
+				page->state = HOT_FG_RAW_FULL;
+			} else if (result->flags == DSA_FG_PAGE_PATCH) {
+				u32 sum = 0;
+				if (!result->patch_count || result->patch_count > DSA_FG_MAX_PATCHES ||
+				    result->data_len > DSA_FG_MAX_BYTES)
+					goto err;
+				page->state = HOT_FG_RAW_PATCH;
+				page->patch_count = result->patch_count;
+				page->patch_bytes = result->data_len;
+				for (j = 0; j < result->patch_count; j++) {
+					const struct parasite_dsa_fg_result_entry *in = &result->entries[j];
+					if (!in->len || (u32)in->off + in->len > PAGE_SIZE ||
+					    in->data_off != raw_off + page_off + in->off)
+						goto err;
+					page->patches[j].off = in->off;
+					page->patches[j].len = in->len;
+					sum += in->len;
+				}
+				if (sum != page->patch_bytes)
+					goto err;
+			} else {
+				goto err;
+			}
+			result_index++;
+		}
+		raw_off += desc->copy_len;
+	}
+	if (raw_off != xfer->dsa_fg_raw_payload_head ||
+	    result_index * sizeof(struct parasite_dsa_fg_result) !=
+	    xfer->dsa_fg_result_meta_head - xfer->dsa_fg_result_meta_base)
+		goto err;
+	*pages_out = pages;
+	*nr_out = nr;
+	if (failure_index)
+		*failure_index = SIZE_MAX;
+	if (failure_vaddr)
+		*failure_vaddr = ULONG_MAX;
+	return 0;
+err:
+	pr_err("DSA fine-grained canonical result validation failed\n");
+	xfree(pages);
+	return -1;
+}
+
+/* Service-side APPLY consumes the exact result array returned by COMPARE.
+ * It intentionally reconstructs only lightweight page views; raw bytes stay
+ * in the arena and no result/payload is copied over the control socket. */
+static int __attribute__((unused)) hot_fg_apply_published_results(
+						       struct page_xfer *xfer,
+						       struct hot_apply_ctx *ctx,
+						       const unsigned char *shared)
+{
+	struct hot_fg_raw_page *pages = NULL;
+	size_t nr = 0;
+	size_t i;
+	int ret = -1;
+
+	if (hot_fg_pages_from_results(xfer, ctx, shared, &pages, &nr,
+				       NULL, NULL))
+		goto out;
+	if (hot_memstore_materialize_vmas(ctx, NULL, NULL))
+		goto out;
+	for (i = 0; i < nr; i++) {
+		if (hot_fg_apply_raw_page(ctx, &pages[i]))
+			goto out;
+	}
+	ret = 0;
+out:
+	xfree(pages);
+	return ret;
+}
+
 static int hot_fg_encode_raw_wavefront(struct page_xfer *xfer,
 				       struct hot_apply_ctx *ctx,
-				       const unsigned char *shared)
+				       const unsigned char *shared,
+				       bool publish_only)
 {
 	struct hot_fg_raw_page *pages = NULL;
 	struct hot_fg_compare_span *spans = NULL;
@@ -7053,6 +9385,7 @@ static int hot_fg_encode_raw_wavefront(struct page_xfer *xfer,
 	u64 prefault_cpu_start_us = 0;
 	u64 compare_core_wall_start_us = 0;
 	u64 compare_core_cpu_start_us = 0;
+	u64 result_publish_start_us = 0;
 
 	if (ctx->profile)
 		phase_start_us = dsa_profile_wall_now_us();
@@ -7224,6 +9557,10 @@ static int hot_fg_encode_raw_wavefront(struct page_xfer *xfer,
 			if (hot_fg_compare_hybrid_demand(ctx, pages, spans, nr_spans))
 				goto err;
 			break;
+		case HOT_FG_COMPARE_HYBRID_FAULT_SIMD:
+			if (hot_fg_compare_hybrid_fault_simd(ctx, pages, spans, nr_spans))
+				goto err;
+			break;
 		case HOT_FG_COMPARE_VALIDATE:
 			if (hot_fg_compare_wavefront(ctx, pages, spans, nr_spans) ||
 			    hot_fg_compare_cpu(ctx, validate_pages, validate_spans, nr_spans,
@@ -7257,14 +9594,36 @@ static int hot_fg_encode_raw_wavefront(struct page_xfer *xfer,
 			goto err;
 		}
 	}
-	output = xzalloc(sizeof(*output));
-	if (!output)
-		goto err;
-	output->ctx = ctx;
-	output->pages = pages;
-	output->nr_pages = nr;
-	if (hot_fg_output_drain(output))
-		goto err;
+	if (publish_only) {
+		if (ctx->profile)
+			result_publish_start_us = dsa_profile_wall_now_us();
+		if (hot_fg_publish_results(xfer, shared, pages, nr))
+			goto err;
+		if (ctx->profile)
+			ctx->profile_sidecar_emit_us +=
+				dsa_profile_delta_us(result_publish_start_us,
+						     dsa_profile_wall_now_us());
+	} else {
+		output = xzalloc(sizeof(*output));
+		if (!output)
+			goto err;
+		output->ctx = ctx;
+		output->pages = pages;
+		output->nr_pages = nr;
+		output->sink.idx_fd = ctx->fg_idx_fd;
+		output->sink.dat_fd = ctx->fg_dat_fd;
+		output->sink.dat_off = ctx->fg_dat_off;
+		output->sink.stats = (struct dsa_fg_sidecar_stats) {
+			.enabled = ctx->profile,
+			.idx_write_calls = &ctx->profile_idx_writes,
+			.dat_write_calls = &ctx->profile_dat_writes,
+			.dat_writev_calls = &ctx->profile_dat_writevs,
+			.write_units = &ctx->profile_write_units,
+			.write_unit_max_us = &ctx->profile_write_unit_max_us,
+		};
+		if (hot_fg_output_drain(output))
+			goto err;
+	}
 	if (ctx->profile) {
 		compare_cpu_end_us = dsa_profile_thread_now_us();
 		ctx->profile_compare_wall_us += dsa_profile_delta_us(phase_start_us,
@@ -7282,9 +9641,23 @@ static int hot_fg_encode_raw_wavefront(struct page_xfer *xfer,
 						     dsa_profile_wall_now_us());
 		phase_start_us = dsa_profile_wall_now_us();
 	}
-	for (i = 0; i < nr; i++) {
-		if (hot_fg_apply_raw_page(ctx, &pages[i]))
+	if (!publish_only) {
+		if (ctx->profile)
+			phase_start_us = dsa_profile_wall_now_us();
+		/* Current VMA coverage is not needed by COMPARE.  Delay gap backing
+		 * creation until the durable sidecar has been fully emitted, so a
+		 * compare/serializer failure cannot create or prefill a new VMA file. */
+		if (hot_memstore_materialize_vmas(ctx, NULL, NULL))
 			goto err;
+		if (ctx->profile)
+			ctx->profile_materialize_us += dsa_profile_delta_us(phase_start_us,
+								      dsa_profile_wall_now_us());
+		if (ctx->profile)
+			phase_start_us = dsa_profile_wall_now_us();
+		for (i = 0; i < nr; i++) {
+			if (hot_fg_apply_raw_page(ctx, &pages[i]))
+				goto err;
+		}
 	}
 	if (ctx->profile)
 		ctx->profile_hot_apply_us += dsa_profile_delta_us(phase_start_us,
@@ -7298,6 +9671,7 @@ static int hot_fg_encode_raw_wavefront(struct page_xfer *xfer,
 			ctx->fg_compare_ops, ctx->fg_copy_ops, nr_spans,
 			ctx->fg_compare_backend == HOT_FG_COMPARE_DSA ||
 			ctx->fg_compare_backend == HOT_FG_COMPARE_HYBRID_DEMAND ||
+			ctx->fg_compare_backend == HOT_FG_COMPARE_HYBRID_FAULT_SIMD ||
 			ctx->fg_compare_backend == HOT_FG_COMPARE_VALIDATE ?
 			HOT_DSA_COMPARE_INFLIGHT : 0, max_xfer);
 	xfree(validate_spans);
@@ -7380,7 +9754,7 @@ static int page_xfer_dsa_fg_encode_raw_capture(struct page_xfer *xfer)
 	}
 
 	shared = xfer->dsa_fg_shared;
-	return hot_fg_encode_raw_wavefront(xfer, ctx, shared);
+	return hot_fg_encode_raw_wavefront(xfer, ctx, shared, false);
 
 	/* Kept below temporarily as the old single-page implementation reference. */
 #if 0
@@ -7477,6 +9851,9 @@ static void close_page_xfer(struct page_xfer *xfer)
 	}
 	if (xfer->hot_apply)
 		hot_apply_abort(xfer);
+	xfree(xfer->dsa_fg_vma_plan_local);
+	xfer->dsa_fg_vma_plan_local = NULL;
+	xfer->dsa_fg_vma_plan_count = 0;
 	close_image(xfer->pi);
 	close_image(xfer->pmi);
 }
@@ -7561,6 +9938,10 @@ int open_page_xfer(struct page_xfer *xfer, int fd_type, unsigned long img_id)
 	xfer->transfer_lazy = true;
 	xfer->dsa_fine_grained = false;
 	xfer->hot_apply = NULL;
+	xfer->write_profile_enabled = false;
+	xfer->write_profile_emitted = false;
+	xfer->write_profile_target = !opts.use_page_server &&
+		dsa_page_xfer_profile_target(fd_type, img_id);
 
 	if (opts.use_page_server)
 		return open_page_server_xfer(xfer, fd_type, img_id);
@@ -7582,6 +9963,11 @@ int open_page_xfer_no_parent(struct page_xfer *xfer, int fd_type, unsigned long 
 	xfer->dsa_fine_grained = false;
 	xfer->parent = NULL;
 	xfer->hot_apply = NULL;
+	xfer->dsa_fg_service = false;
+	xfer->write_profile_enabled = false;
+	xfer->write_profile_emitted = false;
+	xfer->write_profile_target =
+		dsa_page_xfer_profile_target(fd_type, img_id);
 	xfer->pmi = open_image(fd_type, O_DUMP, img_id);
 	if (!xfer->pmi)
 		return -1;
@@ -7592,7 +9978,8 @@ int open_page_xfer_no_parent(struct page_xfer *xfer, int fd_type, unsigned long 
 		return -1;
 	}
 
-	if (hot_apply_init_xfer(xfer, fd_type, img_id, pages_id)) {
+	if (dsa_memory_service_client_init(xfer, img_id) ||
+	    (!xfer->dsa_fg_service && hot_apply_init_xfer(xfer, fd_type, img_id, pages_id))) {
 		close_image(xfer->pi);
 		close_image(xfer->pmi);
 		return -1;
@@ -8050,6 +10437,87 @@ err:
 	return -1;
 }
 
+static void page_xfer_write_profile_begin(struct page_xfer *xfer)
+{
+	if (!xfer || !xfer->write_profile_target || !dsa_profile_enabled() ||
+	    !dsa_page_xfer_dump_enabled())
+		return;
+
+	xfer->write_profile_enabled = true;
+	xfer->write_profile_emitted = false;
+	xfer->write_profile_start_wall_us = dsa_profile_wall_now_us();
+	xfer->write_profile_start_cpu_us = dsa_profile_thread_now_us();
+	xfer->write_profile_io_wall_us = 0;
+	xfer->write_profile_io_cpu_us = 0;
+	xfer->write_profile_input_pages = 0;
+	xfer->write_profile_input_bytes = 0;
+	xfer->write_profile_pagemap_records = 0;
+	xfer->write_profile_pagemap_bytes = 0;
+	xfer->write_profile_pages_bytes = 0;
+	xfer->write_profile_pages_emit_calls = 0;
+}
+
+static void page_xfer_write_profile_emit(struct page_xfer *xfer, int ret)
+{
+	const struct cdp_dsa_memory_service_profile *service;
+	const char *path;
+	u64 sidecar_idx_bytes = 0;
+	u64 sidecar_dat_bytes = 0;
+	u64 idx_write_syscalls = 0;
+	u64 dat_write_syscalls = 0;
+	u64 dat_writev_syscalls = 0;
+	u64 logical_output_bytes;
+	u64 total_wall_us;
+	u64 total_cpu_us;
+
+	if (!xfer || !xfer->write_profile_enabled ||
+	    xfer->write_profile_emitted)
+		return;
+	xfer->write_profile_emitted = true;
+	service = &xfer->dsa_fg_service_profile;
+	if (xfer->dsa_fg_raw_capture && dsa_aligned_full_enabled()) {
+		path = "dsa-full";
+	} else if (xfer->dsa_fg_service || xfer->dsa_fg_raw_capture ||
+		   xfer->dsa_fine_grained) {
+		path = "dsa-fg";
+		sidecar_idx_bytes = service->idx_bytes;
+		sidecar_dat_bytes = service->dat_bytes;
+		idx_write_syscalls = service->idx_write_syscalls;
+		dat_write_syscalls = service->dat_write_syscalls;
+		dat_writev_syscalls = service->dat_writev_syscalls;
+	} else {
+		path = "dsa-full";
+	}
+	logical_output_bytes = xfer->write_profile_pages_bytes +
+		sidecar_idx_bytes + sidecar_dat_bytes +
+		xfer->write_profile_pagemap_bytes;
+	total_wall_us = dsa_profile_delta_us(
+		xfer->write_profile_start_wall_us, dsa_profile_wall_now_us());
+	total_cpu_us = dsa_profile_delta_us(
+		xfer->write_profile_start_cpu_us, dsa_profile_thread_now_us());
+
+	pr_info("WRITE_PATH_PROFILE: version=1 path=%s output_mode=buffered "
+		"snapshot_ready_to_finish_us=%" PRIu64
+		" snapshot_ready_to_finish_thread_cpu_us=%" PRIu64
+		" io_emit_us=%" PRIu64 " io_emit_thread_cpu_us=%" PRIu64
+		" input_pages=%" PRIu64 " input_bytes=%" PRIu64
+		" pagemap_records=%" PRIu64 " pagemap_bytes=%" PRIu64
+		" pages_bytes=%" PRIu64 " sidecar_idx_bytes=%" PRIu64
+		" sidecar_dat_bytes=%" PRIu64 " logical_output_bytes=%" PRIu64
+		" pages_emit_calls=%" PRIu64 " idx_write_syscalls=%" PRIu64
+		" dat_write_syscalls=%" PRIu64 " dat_writev_syscalls=%" PRIu64
+		" ret=%d\n",
+		path, total_wall_us, total_cpu_us,
+		xfer->write_profile_io_wall_us, xfer->write_profile_io_cpu_us,
+		xfer->write_profile_input_pages, xfer->write_profile_input_bytes,
+		xfer->write_profile_pagemap_records,
+		xfer->write_profile_pagemap_bytes,
+		xfer->write_profile_pages_bytes, sidecar_idx_bytes,
+		sidecar_dat_bytes, logical_output_bytes,
+		xfer->write_profile_pages_emit_calls, idx_write_syscalls,
+		dat_write_syscalls, dat_writev_syscalls, ret);
+}
+
 int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 {
 	struct page_pipe_buf *ppb;
@@ -8057,8 +10525,15 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 	unsigned int cur_hole = 0;
 	int ret = -1;
 	u64 phase_start_us = 0;
+	u64 service_phase_start_us = 0;
+	u64 write_phase_start_us = 0;
+	u64 write_phase_start_cpu_us = 0;
+	bool service_profile = xfer->dsa_fg_service && dsa_profile_enabled();
 
+	page_xfer_write_profile_begin(xfer);
 	hot_profile_begin(profile_ctx);
+	if (service_profile)
+		xfer->dsa_fg_profile_total_start_us = dsa_profile_wall_now_us();
 
 	if (profile_ctx && profile_ctx->profile)
 		phase_start_us = dsa_profile_wall_now_us();
@@ -8070,8 +10545,55 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 								      dsa_profile_wall_now_us());
 
 	if (xfer->dsa_fg_raw_capture && !xfer->dsa_fg_materialized) {
-		if (page_xfer_dsa_fg_encode_raw_capture(xfer))
+		if (xfer->dsa_fg_service) {
+			uint64_t fg_start_us = hot_now_us();
+
+			if (dsa_memory_service_raw_sealed(xfer))
+				goto out;
+			if (dsa_aligned_full_enabled()) {
+				/* The generic transfer below emits ordinary PE_PRESENT
+				 * records and streams the same sealed raw bytes through the
+				 * bounded direct writer.  There is no delta classification. */
+				xfer->dsa_fg_materialized = true;
+				pr_info("DSA_ALIGNED_FULL_SEALED: pages_id=%u raw_bytes=%u\n",
+					xfer->pages_id, xfer->dsa_fg_raw_payload_head -
+					xfer->dsa_fg_raw_payload_base);
+			} else if (dsa_memory_service_compare(xfer)) {
+				goto out;
+			}
+			if (!dsa_aligned_full_enabled()) {
+			if (xfer->write_profile_enabled) {
+				write_phase_start_us = dsa_profile_wall_now_us();
+				write_phase_start_cpu_us = dsa_profile_thread_now_us();
+			}
+			if (service_profile)
+				service_phase_start_us = dsa_profile_wall_now_us();
+			if (page_xfer_dsa_fg_write_sidecar_results(
+				    xfer, xfer->dsa_fg_shared))
+				goto out;
+			if (xfer->write_profile_enabled) {
+				xfer->write_profile_io_wall_us += dsa_profile_delta_us(
+					write_phase_start_us, dsa_profile_wall_now_us());
+				xfer->write_profile_io_cpu_us += dsa_profile_delta_us(
+					write_phase_start_cpu_us,
+					dsa_profile_thread_now_us());
+			}
+			if (service_profile)
+				xfer->dsa_fg_profile_sidecar_us =
+					dsa_profile_delta_us(service_phase_start_us,
+							     dsa_profile_wall_now_us());
+			if (page_xfer_dsa_fg_enable(xfer))
+				goto out;
+			xfer->dsa_fg_materialized = true;
+			pr_info("DSA_FG_SERVICE_COMPARE: pages_id=%u result_pages=%zu sidecar_write_us=%" PRIu64 "\n",
+				xfer->pages_id,
+				(xfer->dsa_fg_result_meta_head - xfer->dsa_fg_result_meta_base) /
+				sizeof(struct parasite_dsa_fg_result),
+				hot_now_us() - fg_start_us);
+			}
+		} else if (page_xfer_dsa_fg_encode_raw_capture(xfer)) {
 			goto out;
+		}
 	} else if (xfer->dsa_fine_grained && !xfer->dsa_fg_materialized) {
 		uint64_t fg_start_us = hot_now_us();
 		uint64_t fg_sidecar_us;
@@ -8102,6 +10624,12 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 	pr_debug("Transferring pages:\n");
 	if (profile_ctx && profile_ctx->profile)
 		phase_start_us = dsa_profile_wall_now_us();
+	if (service_profile)
+		service_phase_start_us = dsa_profile_wall_now_us();
+	if (xfer->write_profile_enabled) {
+		write_phase_start_us = dsa_profile_wall_now_us();
+		write_phase_start_cpu_us = dsa_profile_thread_now_us();
+	}
 
 	list_for_each_entry(ppb, &pp->bufs, l) {
 		unsigned int i;
@@ -8121,6 +10649,10 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 			pr_debug("\tp %p - %p\n", iov.iov_base, iov.iov_base + iov.iov_len);
 
 			flags = page_xfer_effective_flags(xfer, ppb_xfer_flags(xfer, ppb));
+			if (xfer->write_profile_enabled && (flags & PE_PRESENT)) {
+				xfer->write_profile_input_pages += iov.iov_len / PAGE_SIZE;
+				xfer->write_profile_input_bytes += iov.iov_len;
+			}
 
 			if (xfer->write_pagemap(xfer, &iov, flags))
 				goto out;
@@ -8135,6 +10667,19 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 	ret = dump_holes(xfer, pp, &cur_hole, NULL);
 	if (ret)
 		goto out;
+	/* Full-control mode has emitted the ordinary pagemap above, while payload
+	 * bytes were accumulated directly from the sealed arena.  Flush only once
+	 * the page-pipe traversal has consumed exactly the frozen raw sequence. */
+	if (xfer->dsa_fg_raw_capture && dsa_aligned_full_enabled()) {
+		if (xfer->dsa_fg_raw_emit_cursor != xfer->dsa_fg_raw_payload_head) {
+			pr_err("DSA aligned full raw cursor mismatch cursor=%u head=%u\n",
+			       xfer->dsa_fg_raw_emit_cursor,
+			       xfer->dsa_fg_raw_payload_head);
+			goto out;
+		}
+		if (dsa_aligned_full_flush(xfer))
+			goto out;
+	}
 	if (profile_ctx && profile_ctx->profile)
 		profile_ctx->profile_pagemap_plan_us += dsa_profile_delta_us(phase_start_us,
 								    dsa_profile_wall_now_us());
@@ -8154,19 +10699,47 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 			profile_ctx->profile_pagemap_pack_us +=
 				dsa_profile_delta_us(phase_start_us, dsa_profile_wall_now_us());
 	}
+	if (xfer->write_profile_enabled) {
+		xfer->write_profile_io_wall_us += dsa_profile_delta_us(
+			write_phase_start_us, dsa_profile_wall_now_us());
+		xfer->write_profile_io_cpu_us += dsa_profile_delta_us(
+			write_phase_start_cpu_us, dsa_profile_thread_now_us());
+	}
+	if (service_profile)
+		xfer->dsa_fg_profile_pagemap_us =
+			dsa_profile_delta_us(service_phase_start_us,
+					     dsa_profile_wall_now_us());
 	if (profile_ctx && profile_ctx->profile)
 		profile_ctx->profile_pagemap_us += profile_ctx->profile_pagemap_plan_us +
 			profile_ctx->profile_parent_validate_us + profile_ctx->profile_pagemap_pack_us;
 	if (profile_ctx && profile_ctx->profile)
 		phase_start_us = dsa_profile_wall_now_us();
+	if (service_profile)
+		service_phase_start_us = dsa_profile_wall_now_us();
 	ret = hot_apply_finish(xfer);
+	if (service_profile)
+		xfer->dsa_fg_profile_finish_us =
+			dsa_profile_delta_us(service_phase_start_us,
+					     dsa_profile_wall_now_us());
+	/* The sidecar writer has closed its idx/dat fds and all pagemap records for
+	 * this transfer have been emitted.  The service is now allowed to update
+	 * its staged parent; CDP will still withhold TERMINAL_READY until it has
+	 * renamed the manifest and committed the generation. */
+	if (!ret && xfer->dsa_fg_service) {
+		if (dsa_aligned_full_enabled())
+			ret = dsa_memory_service_full_apply(xfer);
+		else
+			ret = dsa_memory_service_apply(xfer);
+	}
 	if (profile_ctx && profile_ctx->profile)
 		profile_ctx->profile_finish_us += dsa_profile_delta_us(phase_start_us,
 								      dsa_profile_wall_now_us());
 	goto out;
 
 out:
+	dsa_memory_service_profile_emit(xfer, ret);
 	hot_profile_emit(profile_ctx, ret);
+	page_xfer_write_profile_emit(xfer, ret);
 	return ret;
 }
 
@@ -8973,4 +11546,1043 @@ int page_server_start_read(void *buf, unsigned long nr, ps_async_read_complete c
 		return page_server_start_async_read(buf, nr, complete, priv);
 	else
 		return page_server_start_sync_read(buf, nr, complete, priv);
+}
+
+/* ------------------------------------------------------------------------- */
+/* Task-scoped DSA memory service                                             */
+
+static int dsa_ms_send(int fd, struct cdp_dsa_memory_service_msg *msg)
+{
+	ssize_t ret;
+
+	msg->magic = CDP_DSA_MEMORY_SERVICE_MAGIC;
+	msg->version = CDP_DSA_MEMORY_SERVICE_VERSION;
+	ret = send(fd, msg, sizeof(*msg), MSG_NOSIGNAL);
+	if (ret != sizeof(*msg)) {
+		if (ret >= 0)
+			errno = EPROTO;
+		return -1;
+	}
+	return 0;
+}
+
+static void dsa_ms_diag_init(struct cdp_dsa_memory_service_diag *diag,
+			     const struct cdp_dsa_memory_service_msg *req)
+{
+	memset(diag, 0, sizeof(*diag));
+	diag->magic = CDP_DSA_MEMORY_SERVICE_DIAG_MAGIC;
+	diag->version = CDP_DSA_MEMORY_SERVICE_DIAG_VERSION;
+	diag->size = sizeof(*diag);
+	diag->request_op = req->op;
+	diag->generation_id = req->generation_id;
+	diag->arena_epoch = req->arena_epoch;
+	diag->object_index = CDP_DSA_MS_DIAG_INVALID_OBJECT;
+	diag->object_vaddr = CDP_DSA_MS_DIAG_INVALID_OBJECT;
+	diag->expected_results = req->result_count;
+}
+
+static int dsa_ms_send_generation(
+	int fd, struct cdp_dsa_memory_service_msg *msg, bool profile,
+	struct cdp_dsa_memory_service_diag *diag)
+{
+	struct iovec iov[2];
+	struct msghdr hdr = {};
+	ssize_t ret;
+	size_t total;
+
+	if (!profile)
+		return dsa_ms_send(fd, msg);
+	if (!diag) {
+		errno = EINVAL;
+		return -1;
+	}
+	msg->magic = CDP_DSA_MEMORY_SERVICE_MAGIC;
+	msg->version = CDP_DSA_MEMORY_SERVICE_VERSION;
+	diag->reply_op = msg->op;
+	diag->service_status = msg->status;
+	iov[0] = (struct iovec) { .iov_base = msg, .iov_len = sizeof(*msg) };
+	iov[1] = (struct iovec) { .iov_base = diag, .iov_len = sizeof(*diag) };
+	hdr.msg_iov = iov;
+	hdr.msg_iovlen = ARRAY_SIZE(iov);
+	total = sizeof(*msg) + sizeof(*diag);
+	ret = sendmsg(fd, &hdr, MSG_NOSIGNAL);
+	if (ret != (ssize_t)total) {
+		if (ret >= 0)
+			errno = EPROTO;
+		return -1;
+	}
+	return 0;
+}
+
+static int dsa_ms_recv(int fd, struct cdp_dsa_memory_service_msg *msg)
+{
+	ssize_t ret;
+
+	ret = recv(fd, msg, sizeof(*msg), 0);
+	if (!ret)
+		return 1; /* clean peer EOF while IDLE */
+	if (ret != sizeof(*msg)) {
+		if (ret >= 0)
+			errno = EPROTO;
+		return -1;
+	}
+	if (msg->magic != CDP_DSA_MEMORY_SERVICE_MAGIC ||
+	    msg->version != CDP_DSA_MEMORY_SERVICE_VERSION)
+		return -1;
+	return 0;
+}
+
+/* SESSION_PREPARE travels over the worker-owned control socket and carries
+ * the service end of a fresh per-generation SOCK_SEQPACKET socket.  Keeping
+ * that fd out of the fixed wire record gives the service a precise EOF when
+ * CRIU dies, while the worker can still send READY only after its durable
+ * generation commit. */
+static int dsa_ms_recv_generation_fd(int fd,
+				     struct cdp_dsa_memory_service_msg *msg,
+				     int *generation_fd)
+{
+	char control[CMSG_SPACE(sizeof(int))] = {};
+	struct iovec iov = { .iov_base = msg, .iov_len = sizeof(*msg) };
+	struct msghdr hdr = {
+		.msg_iov = &iov,
+		.msg_iovlen = 1,
+		.msg_control = control,
+		.msg_controllen = sizeof(control),
+	};
+	struct cmsghdr *cmsg;
+	ssize_t ret;
+
+	*generation_fd = -1;
+	ret = recvmsg(fd, &hdr, 0);
+	if (!ret)
+		return 1;
+	if (ret != sizeof(*msg) || (hdr.msg_flags & (MSG_TRUNC | MSG_CTRUNC))) {
+		if (ret >= 0)
+			errno = EPROTO;
+		return -1;
+	}
+	if (msg->magic != CDP_DSA_MEMORY_SERVICE_MAGIC ||
+	    msg->version != CDP_DSA_MEMORY_SERVICE_VERSION ||
+	    msg->op != CDP_DSA_MS_SESSION_PREPARE) {
+		errno = EPROTO;
+		return -1;
+	}
+	cmsg = CMSG_FIRSTHDR(&hdr);
+	if (!cmsg || cmsg->cmsg_level != SOL_SOCKET ||
+	    cmsg->cmsg_type != SCM_RIGHTS ||
+	    cmsg->cmsg_len != CMSG_LEN(sizeof(int))) {
+		errno = EPROTO;
+		return -1;
+	}
+	memcpy(generation_fd, CMSG_DATA(cmsg), sizeof(*generation_fd));
+	if (*generation_fd < 0) {
+		errno = EPROTO;
+		return -1;
+	}
+	return 0;
+}
+
+static bool dsa_ms_range_valid(u32 off, u32 head, size_t arena_size)
+{
+	return head >= off && (u64)head <= (u64)arena_size;
+}
+
+static int dsa_ms_reply_error(int fd, const struct cdp_dsa_memory_service_msg *req,
+				      u32 status)
+{
+	struct cdp_dsa_memory_service_msg reply = *req;
+
+	reply.op = CDP_DSA_MS_ERROR;
+	reply.status = status;
+	return dsa_ms_send(fd, &reply);
+}
+
+static int dsa_ms_reply_generation_error(
+	int fd, const struct cdp_dsa_memory_service_msg *req, u32 status,
+	bool profile, u32 stage, int primary_errno,
+	struct cdp_dsa_memory_service_diag *diag)
+{
+	struct cdp_dsa_memory_service_msg reply = *req;
+	struct cdp_dsa_memory_service_diag local_diag;
+
+	if (!profile)
+		return dsa_ms_reply_error(fd, req, status);
+	if (!diag) {
+		dsa_ms_diag_init(&local_diag, req);
+		diag = &local_diag;
+	}
+	if (diag->failure_stage == CDP_DSA_MS_STAGE_NONE)
+		diag->failure_stage = stage;
+	if (!diag->primary_errno)
+		diag->primary_errno = primary_errno ? primary_errno :
+			dsa_ms_status_errno(status);
+	reply.op = CDP_DSA_MS_ERROR;
+	reply.status = status;
+	return dsa_ms_send_generation(fd, &reply, profile, diag);
+}
+
+/* The service never gives owners to a VMA view.  At READY we turn the staged
+ * views into the next committed parent index while retaining the same owner
+ * FDs and MAP_SHARED mappings.  This is the point that preserves PTEs across
+ * generations; rebuilding from the manifest here would defeat P27. */
+static int dsa_ms_promote_staged_views(struct hot_apply_ctx *ctx)
+{
+	struct hot_memstore_seg *next;
+	size_t i;
+
+	if (!ctx || !ctx->nr_vma_segments)
+		return -1;
+	next = xmalloc(ctx->nr_vma_segments * sizeof(*next));
+	if (!next)
+		return -1;
+	for (i = 0; i < ctx->nr_vma_segments; i++) {
+		const struct hot_vma_segment *view = &ctx->vma_segments[i];
+
+		next[i] = (struct hot_memstore_seg) {
+			.img_id = ctx->img_id,
+			.vaddr = view->start,
+			.len = view->end - view->start,
+			.off = view->off,
+			.owner = view->owner,
+		};
+	}
+	xfree(ctx->old_memstore);
+	ctx->old_memstore = next;
+	ctx->nr_old_memstore = ctx->nr_vma_segments;
+	ctx->old_memstore_cursor = 0;
+	ctx->nr_vma_segments = 0;
+	ctx->vmas_materialized = false;
+	ctx->nr_vma_plans = 0;
+	return 0;
+}
+
+static int dsa_ms_prepare_ctx(struct hot_apply_ctx **ctxp,
+			      const struct cdp_dsa_memory_service_msg *req)
+{
+	struct hot_apply_ctx *ctx = *ctxp;
+	size_t i;
+
+	if (ctx) {
+		/* A task owns exactly one root pagemap image.  Treat a changing image
+		 * id as an identity violation instead of silently aliasing mappings. */
+		return ctx->img_id == req->img_id ? 0 : -1;
+	}
+	ctx = hot_apply_alloc_ctx(CR_FD_PAGEMAP, req->img_id, 0);
+	if (!ctx || !ctx->memstore || !ctx->fine_grained)
+		goto err;
+	if (hot_memstore_load(ctx, ctx->memory_manifest_path, &ctx->old_memstore,
+			       &ctx->nr_old_memstore))
+		goto err;
+	ctx->parent_view_loaded = true;
+	for (i = 0; i < ctx->nr_old_memstore; i++) {
+		if (hot_memstore_old_map(ctx, &ctx->old_memstore[i]) == MAP_FAILED)
+			goto err;
+	}
+	if (hot_dsa_open(ctx))
+		goto err;
+	/* The service stages only hot-memory.<generation>.next.  CDP alone owns
+	 * latest.json and the durable READY commit, so generic CRIU cleanup must
+	 * never overwrite that committed manifest with a local "failed" marker. */
+	ctx->finished = true;
+	ctx->pre_freeze_ready = true;
+	*ctxp = ctx;
+	return 0;
+err:
+	if (ctx) {
+		struct page_xfer xfer = { .hot_apply = ctx };
+
+		hot_apply_abort(&xfer);
+	}
+	return -1;
+}
+
+static int dsa_ms_open_next_manifest(struct hot_apply_ctx *ctx, u64 generation)
+{
+	char path[PATH_MAX];
+	int fd;
+
+	if (!ctx || !ctx->hot_root || !ctx->hot_root[0] ||
+	    snprintf(path, sizeof(path), "%s/hot-memory.%" PRIu64 ".next",
+		     ctx->hot_root, generation) >= (int)sizeof(path))
+		return -1;
+	if (hot_apply_mkdir_root(ctx->hot_root))
+		return -1;
+	fd = open(path, O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, CR_FD_PERM);
+	if (fd < 0)
+		return -1;
+	ctx->manifest_fd = fd;
+	return 0;
+}
+
+static u64 dsa_ms_profile_phase_finish(bool profile, u64 start_us)
+{
+	if (!profile)
+		return 0;
+	return dsa_profile_delta_us(start_us, dsa_profile_wall_now_us());
+}
+
+static int dsa_ms_apply_generation_fast(
+	struct hot_apply_ctx *ctx, const unsigned char *shared,
+	bool already_applied, const struct cdp_dsa_memory_service_msg *req,
+	struct cdp_dsa_memory_service_msg *reply)
+{
+	struct page_xfer xfer = {};
+
+	*reply = *req;
+	if (already_applied || req->result_head < req->result_off ||
+	    req->result_head > req->result_limit ||
+	    dsa_ms_open_next_manifest(ctx, req->generation_id)) {
+		reply->op = CDP_DSA_MS_ERROR;
+		reply->status = CDP_DSA_MS_ESTATE;
+		return -1;
+	}
+	xfer.hot_apply = ctx;
+	xfer.dsa_fg_shared = shared;
+	xfer.dsa_fg_raw_capture = true;
+	xfer.dsa_fg_desc_area_off = req->desc_off;
+	xfer.dsa_fg_desc_head = req->desc_head;
+	xfer.dsa_fg_raw_payload_base = req->raw_off;
+	xfer.dsa_fg_raw_payload_head = req->raw_head;
+	xfer.dsa_fg_result_meta_base = req->result_off;
+	xfer.dsa_fg_result_meta_head = req->result_head;
+	xfer.dsa_fg_result_meta_limit = req->result_limit;
+	if (hot_fg_apply_published_results(&xfer, ctx, shared) ||
+	    hot_memstore_finish(ctx) || close(ctx->manifest_fd)) {
+		ctx->manifest_fd = -1;
+		reply->op = CDP_DSA_MS_ERROR;
+		reply->status = CDP_DSA_MS_EIO;
+		return -1;
+	}
+	ctx->manifest_fd = -1;
+	reply->op = CDP_DSA_MS_APPLY_DONE;
+	reply->status = CDP_DSA_MS_OK;
+	return 0;
+}
+
+static int dsa_ms_apply_generation(
+	struct hot_apply_ctx *ctx, const unsigned char *shared, size_t arena_size,
+	bool already_applied, const struct cdp_dsa_memory_service_msg *req,
+	struct cdp_dsa_memory_service_msg *reply,
+	struct cdp_dsa_memory_service_diag *diag)
+{
+	struct page_xfer xfer = {};
+	struct hot_fg_raw_page *pages = NULL;
+	size_t nr_pages = 0;
+	size_t failure_index = SIZE_MAX;
+	unsigned long failure_vaddr = ULONG_MAX;
+	const bool profile = ctx->profile;
+	u64 total_wall_start_us = 0;
+	u64 total_cpu_start_us = 0;
+	u64 phase_start_us = 0;
+	u64 result_bytes;
+	u32 failure_stage = CDP_DSA_MS_STAGE_NONE;
+	u32 failure_status = CDP_DSA_MS_EIO;
+	int primary_errno = 0;
+	int cleanup_errno = 0;
+	size_t i;
+
+	dsa_ms_diag_init(diag, req);
+	*reply = *req;
+	if (profile) {
+		total_wall_start_us = dsa_profile_wall_now_us();
+		total_cpu_start_us = dsa_profile_thread_now_us();
+	}
+
+	failure_stage = CDP_DSA_MS_STAGE_APPLY_PRECHECK;
+	failure_status = CDP_DSA_MS_ESTATE;
+	if (already_applied) {
+		primary_errno = EALREADY;
+		goto error;
+	}
+	if (!dsa_ms_range_valid(req->desc_off, req->desc_head, arena_size) ||
+	    !dsa_ms_range_valid(req->raw_off, req->raw_head, arena_size) ||
+	    !dsa_ms_range_valid(req->result_off, req->result_head, arena_size) ||
+	    req->result_head > req->result_limit ||
+	    !dsa_ms_range_valid(req->result_off, req->result_limit, arena_size)) {
+		failure_status = CDP_DSA_MS_EBOUNDS;
+		primary_errno = ERANGE;
+		goto error;
+	}
+	result_bytes = (u64)req->result_head - req->result_off;
+	if (result_bytes % sizeof(struct parasite_dsa_fg_result) ||
+	    req->result_count !=
+		result_bytes / sizeof(struct parasite_dsa_fg_result)) {
+		failure_status = CDP_DSA_MS_EBOUNDS;
+		primary_errno = EBADMSG;
+		goto error;
+	}
+
+	failure_status = CDP_DSA_MS_EIO;
+	failure_stage = CDP_DSA_MS_STAGE_APPLY_OPEN_MANIFEST;
+	errno = 0;
+	if (dsa_ms_open_next_manifest(ctx, req->generation_id)) {
+		primary_errno = errno ? errno : EIO;
+		goto error;
+	}
+
+	xfer.hot_apply = ctx;
+	xfer.dsa_fg_shared = shared;
+	xfer.dsa_fg_raw_capture = true;
+	xfer.dsa_fg_desc_area_off = req->desc_off;
+	xfer.dsa_fg_desc_head = req->desc_head;
+	xfer.dsa_fg_raw_payload_base = req->raw_off;
+	xfer.dsa_fg_raw_payload_head = req->raw_head;
+	xfer.dsa_fg_result_meta_base = req->result_off;
+	xfer.dsa_fg_result_meta_head = req->result_head;
+	xfer.dsa_fg_result_meta_limit = req->result_limit;
+
+	failure_stage = CDP_DSA_MS_STAGE_APPLY_RESULT_VALIDATE;
+	if (profile)
+		phase_start_us = dsa_profile_wall_now_us();
+	errno = 0;
+	if (hot_fg_pages_from_results(&xfer, ctx, shared, &pages, &nr_pages,
+				       &failure_index, &failure_vaddr)) {
+		diag->apply_validate_wall_us =
+			dsa_ms_profile_phase_finish(profile, phase_start_us);
+		primary_errno = errno ? errno : EBADMSG;
+		diag->object_index = failure_index == SIZE_MAX ?
+			CDP_DSA_MS_DIAG_INVALID_OBJECT : failure_index;
+		diag->object_vaddr = failure_vaddr == ULONG_MAX ?
+			CDP_DSA_MS_DIAG_INVALID_OBJECT : failure_vaddr;
+		goto error;
+	}
+	diag->apply_validate_wall_us =
+		dsa_ms_profile_phase_finish(profile, phase_start_us);
+	if (nr_pages != req->result_count) {
+		primary_errno = EBADMSG;
+		diag->completed_results = nr_pages;
+		goto error;
+	}
+
+	failure_stage = CDP_DSA_MS_STAGE_APPLY_VMA_MATERIALIZE;
+	if (profile)
+		phase_start_us = dsa_profile_wall_now_us();
+	errno = 0;
+	if (hot_memstore_materialize_vmas(ctx, &failure_index, &failure_vaddr)) {
+		diag->apply_materialize_wall_us =
+			dsa_ms_profile_phase_finish(profile, phase_start_us);
+		primary_errno = errno ? errno : EIO;
+		diag->object_index = failure_index == SIZE_MAX ?
+			CDP_DSA_MS_DIAG_INVALID_OBJECT : failure_index;
+		diag->object_vaddr = failure_vaddr == ULONG_MAX ?
+			CDP_DSA_MS_DIAG_INVALID_OBJECT : failure_vaddr;
+		goto error;
+	}
+	diag->apply_materialize_wall_us =
+		dsa_ms_profile_phase_finish(profile, phase_start_us);
+
+	failure_stage = CDP_DSA_MS_STAGE_APPLY_PAGE_STORE;
+	if (profile)
+		phase_start_us = dsa_profile_wall_now_us();
+	for (i = 0; i < nr_pages; i++) {
+		errno = 0;
+		if (hot_fg_apply_raw_page(ctx, &pages[i])) {
+			diag->apply_store_wall_us =
+				dsa_ms_profile_phase_finish(profile, phase_start_us);
+			primary_errno = errno ? errno : EIO;
+			diag->object_index = i;
+			diag->object_vaddr = pages[i].vaddr;
+			diag->completed_results = i;
+			goto error;
+		}
+	}
+	diag->apply_store_wall_us =
+		dsa_ms_profile_phase_finish(profile, phase_start_us);
+	diag->completed_results = nr_pages;
+
+	failure_stage = CDP_DSA_MS_STAGE_APPLY_MANIFEST_FINISH;
+	if (profile)
+		phase_start_us = dsa_profile_wall_now_us();
+	errno = 0;
+	if (hot_memstore_finish(ctx)) {
+		diag->apply_manifest_finish_wall_us =
+			dsa_ms_profile_phase_finish(profile, phase_start_us);
+		primary_errno = errno ? errno : EIO;
+		goto error;
+	}
+	diag->apply_manifest_finish_wall_us =
+		dsa_ms_profile_phase_finish(profile, phase_start_us);
+
+	failure_stage = CDP_DSA_MS_STAGE_APPLY_MANIFEST_CLOSE;
+	if (profile)
+		phase_start_us = dsa_profile_wall_now_us();
+	errno = 0;
+	if (close(ctx->manifest_fd)) {
+		diag->apply_manifest_close_wall_us =
+			dsa_ms_profile_phase_finish(profile, phase_start_us);
+		primary_errno = errno ? errno : EIO;
+		ctx->manifest_fd = -1;
+		goto error;
+	}
+	diag->apply_manifest_close_wall_us =
+		dsa_ms_profile_phase_finish(profile, phase_start_us);
+	ctx->manifest_fd = -1;
+	diag->failure_stage = CDP_DSA_MS_STAGE_NONE;
+	diag->apply_total_wall_us =
+		dsa_ms_profile_phase_finish(profile, total_wall_start_us);
+	if (profile)
+		diag->apply_total_cpu_us =
+			dsa_profile_delta_us(total_cpu_start_us,
+					     dsa_profile_thread_now_us());
+	reply->op = CDP_DSA_MS_APPLY_DONE;
+	reply->status = CDP_DSA_MS_OK;
+	reply->service_wall_us = diag->apply_total_wall_us;
+	reply->service_cpu_us = diag->apply_total_cpu_us;
+	reply->profile.hot_apply_us = diag->apply_total_wall_us;
+	reply->profile.hot_apply_cpu_us = diag->apply_total_cpu_us;
+	xfree(pages);
+	return 0;
+
+error:
+	diag->failure_stage = failure_stage;
+	diag->primary_errno = primary_errno ? primary_errno : EIO;
+	if (ctx->manifest_fd >= 0) {
+		if (close(ctx->manifest_fd))
+			cleanup_errno = errno ? errno : EIO;
+		ctx->manifest_fd = -1;
+	}
+	diag->cleanup_errno = cleanup_errno;
+	diag->apply_total_wall_us =
+		dsa_ms_profile_phase_finish(profile, total_wall_start_us);
+	if (profile)
+		diag->apply_total_cpu_us =
+			dsa_profile_delta_us(total_cpu_start_us,
+					     dsa_profile_thread_now_us());
+	reply->op = CDP_DSA_MS_ERROR;
+	reply->status = failure_status;
+	reply->service_wall_us = diag->apply_total_wall_us;
+	reply->service_cpu_us = diag->apply_total_cpu_us;
+	reply->profile.hot_apply_us = diag->apply_total_wall_us;
+	reply->profile.hot_apply_cpu_us = diag->apply_total_cpu_us;
+	xfree(pages);
+	return -1;
+}
+
+/* Full-control apply consumes the descriptor sequence directly.  Unlike fine
+ * apply there is no result array: every captured page is authoritative, so
+ * the service materialises the VMA plan and copies each raw descriptor into
+ * the staged parent view in raw order. */
+static int dsa_ms_full_apply_generation(
+	struct hot_apply_ctx *ctx, const unsigned char *shared, size_t arena_size,
+	bool already_applied, const struct cdp_dsa_memory_service_msg *req,
+	struct cdp_dsa_memory_service_msg *reply,
+	struct cdp_dsa_memory_service_diag *diag)
+{
+	u32 desc_off;
+	u32 raw_off;
+	size_t failure_index = SIZE_MAX;
+	unsigned long failure_vaddr = ULONG_MAX;
+	const bool profile = ctx->profile;
+	u64 total_wall_start_us = 0;
+	u64 total_cpu_start_us = 0;
+	u64 phase_start_us = 0;
+	u32 failure_stage = CDP_DSA_MS_STAGE_APPLY_PRECHECK;
+	u32 failure_status = CDP_DSA_MS_ESTATE;
+	int primary_errno = 0;
+	int cleanup_errno = 0;
+	size_t index = 0;
+
+	dsa_ms_diag_init(diag, req);
+	*reply = *req;
+	/* Full output has no compare request, so its generation-local service
+	 * counters must be reset here rather than in the compare dispatcher. */
+	hot_service_profile_reset_generation(ctx);
+	if (profile) {
+		total_wall_start_us = dsa_profile_wall_now_us();
+		total_cpu_start_us = dsa_profile_thread_now_us();
+	}
+	if (already_applied) {
+		primary_errno = EALREADY;
+		goto error;
+	}
+	if (!dsa_ms_range_valid(req->desc_off, req->desc_head, arena_size) ||
+	    !dsa_ms_range_valid(req->raw_off, req->raw_head, arena_size) ||
+	    !dsa_ms_range_valid(req->vma_plan_off, req->vma_plan_head, arena_size) ||
+	    (req->desc_head - req->desc_off) % sizeof(struct dsa_dump_descriptor) ||
+	    !req->vma_plan_count) {
+		failure_status = CDP_DSA_MS_EBOUNDS;
+		primary_errno = ERANGE;
+		goto error;
+	}
+
+	failure_stage = CDP_DSA_MS_STAGE_COMPARE_VMA_PLAN;
+	failure_status = CDP_DSA_MS_EIO;
+	errno = 0;
+	if (hot_fg_load_vma_plan(ctx, shared, req->vma_plan_off,
+				 req->vma_plan_head, req->vma_plan_count)) {
+		primary_errno = errno ? errno : EBADMSG;
+		goto error;
+	}
+	failure_stage = CDP_DSA_MS_STAGE_APPLY_OPEN_MANIFEST;
+	errno = 0;
+	if (dsa_ms_open_next_manifest(ctx, req->generation_id)) {
+		primary_errno = errno ? errno : EIO;
+		goto error;
+	}
+	failure_stage = CDP_DSA_MS_STAGE_APPLY_VMA_MATERIALIZE;
+	if (profile)
+		phase_start_us = dsa_profile_wall_now_us();
+	errno = 0;
+	if (hot_memstore_materialize_vmas(ctx, &failure_index, &failure_vaddr)) {
+		primary_errno = errno ? errno : EIO;
+		goto error;
+	}
+	if (profile)
+		diag->apply_materialize_wall_us =
+			dsa_profile_delta_us(phase_start_us, dsa_profile_wall_now_us());
+
+	failure_stage = CDP_DSA_MS_STAGE_APPLY_PAGE_STORE;
+	if (profile)
+		phase_start_us = dsa_profile_wall_now_us();
+	raw_off = req->raw_off;
+	for (desc_off = req->desc_off; desc_off < req->desc_head;
+	     desc_off += sizeof(struct dsa_dump_descriptor), index++) {
+		const struct dsa_dump_descriptor *desc =
+			(const struct dsa_dump_descriptor *)(shared + desc_off);
+
+		if (!desc->copy_len || desc->copy_len % PAGE_SIZE ||
+		    desc->src_addr & (PAGE_SIZE - 1) || raw_off > req->raw_head ||
+		    desc->copy_len > req->raw_head - raw_off) {
+			failure_status = CDP_DSA_MS_EBOUNDS;
+			primary_errno = EBADMSG;
+			failure_index = index;
+			failure_vaddr = desc->src_addr;
+			goto error;
+		}
+		if (hot_memstore_write_to_segments(ctx, shared + raw_off,
+					 (unsigned long)desc->src_addr,
+					 desc->copy_len)) {
+			primary_errno = errno ? errno : EIO;
+			failure_index = index;
+			failure_vaddr = desc->src_addr;
+			goto error;
+		}
+		raw_off += desc->copy_len;
+		diag->completed_results += desc->copy_len / PAGE_SIZE;
+	}
+	if (raw_off != req->raw_head) {
+		failure_status = CDP_DSA_MS_EBOUNDS;
+		primary_errno = EBADMSG;
+		goto error;
+	}
+	if (profile)
+		diag->apply_store_wall_us =
+			dsa_profile_delta_us(phase_start_us, dsa_profile_wall_now_us());
+
+	failure_stage = CDP_DSA_MS_STAGE_APPLY_MANIFEST_FINISH;
+	if (profile)
+		phase_start_us = dsa_profile_wall_now_us();
+	errno = 0;
+	if (hot_memstore_finish(ctx)) {
+		primary_errno = errno ? errno : EIO;
+		goto error;
+	}
+	if (profile)
+		diag->apply_manifest_finish_wall_us =
+			dsa_profile_delta_us(phase_start_us, dsa_profile_wall_now_us());
+
+	failure_stage = CDP_DSA_MS_STAGE_APPLY_MANIFEST_CLOSE;
+	if (profile)
+		phase_start_us = dsa_profile_wall_now_us();
+	if (close(ctx->manifest_fd)) {
+		primary_errno = errno ? errno : EIO;
+		ctx->manifest_fd = -1;
+		goto error;
+	}
+	ctx->manifest_fd = -1;
+	if (profile)
+		diag->apply_manifest_close_wall_us =
+			dsa_profile_delta_us(phase_start_us, dsa_profile_wall_now_us());
+	diag->failure_stage = CDP_DSA_MS_STAGE_NONE;
+	if (profile) {
+		diag->apply_total_wall_us =
+			dsa_profile_delta_us(total_wall_start_us, dsa_profile_wall_now_us());
+		diag->apply_total_cpu_us =
+			dsa_profile_delta_us(total_cpu_start_us, dsa_profile_thread_now_us());
+	}
+	reply->op = CDP_DSA_MS_FULL_APPLY_DONE;
+	reply->status = CDP_DSA_MS_OK;
+	hot_service_profile_snapshot(ctx, &reply->profile);
+	reply->service_wall_us = diag->apply_total_wall_us;
+	reply->service_cpu_us = diag->apply_total_cpu_us;
+	reply->profile.hot_apply_us = diag->apply_total_wall_us;
+	reply->profile.hot_apply_cpu_us = diag->apply_total_cpu_us;
+	return 0;
+
+error:
+	diag->failure_stage = failure_stage;
+	diag->primary_errno = primary_errno ? primary_errno : EIO;
+	diag->object_index = failure_index == SIZE_MAX ?
+		CDP_DSA_MS_DIAG_INVALID_OBJECT : failure_index;
+	diag->object_vaddr = failure_vaddr == ULONG_MAX ?
+		CDP_DSA_MS_DIAG_INVALID_OBJECT : failure_vaddr;
+	if (ctx->manifest_fd >= 0) {
+		if (close(ctx->manifest_fd))
+			cleanup_errno = errno ? errno : EIO;
+		ctx->manifest_fd = -1;
+	}
+	diag->cleanup_errno = cleanup_errno;
+	if (profile) {
+		diag->apply_total_wall_us =
+			dsa_profile_delta_us(total_wall_start_us, dsa_profile_wall_now_us());
+		diag->apply_total_cpu_us =
+			dsa_profile_delta_us(total_cpu_start_us, dsa_profile_thread_now_us());
+	}
+	reply->op = CDP_DSA_MS_ERROR;
+	reply->status = failure_status;
+	reply->service_wall_us = diag->apply_total_wall_us;
+	reply->service_cpu_us = diag->apply_total_cpu_us;
+	return -1;
+}
+
+/* This function is called by the dedicated `criu dsa-memory-service` command
+ * after the task worker has supplied one end of a SOCK_SEQPACKET pair.  The
+ * client wiring is intentionally kept outside this file: CRIU dump owns the
+ * two durable writer barriers, while this loop owns persistent WQ/PASID and
+ * hot mappings only. */
+int page_xfer_dsa_memory_service(int control_fd)
+{
+	const char *fd_value = getenv("CRIU_DSA_ARENA_FD");
+	const char *size_value = getenv("CRIU_DSA_ARENA_SIZE");
+	char *end = NULL;
+	unsigned long long parsed_fd;
+	unsigned long long parsed_size;
+	unsigned char *shared = MAP_FAILED;
+	struct hot_apply_ctx *ctx = NULL;
+	struct cdp_dsa_memory_service_msg active = {};
+	bool have_session = false;
+	bool applied = false;
+	bool raw_sealed = false;
+	int ret = -1;
+
+	if (control_fd < 0 || !fd_value || !size_value) {
+		pr_err("DSA memory service has no control or arena environment\n");
+		return -1;
+	}
+	errno = 0;
+	parsed_fd = strtoull(fd_value, &end, 10);
+	if (errno || !end || *end || parsed_fd > INT_MAX)
+		return -1;
+	errno = 0;
+	parsed_size = strtoull(size_value, &end, 10);
+	if (errno || !end || *end || !parsed_size || parsed_size > SIZE_MAX)
+		return -1;
+	shared = mmap(NULL, (size_t)parsed_size, PROT_READ | PROT_WRITE,
+		      MAP_SHARED, (int)parsed_fd, 0);
+	if (shared == MAP_FAILED) {
+		pr_perror("DSA memory service can't map raw arena");
+		return -1;
+	}
+
+	for (;;) {
+		struct cdp_dsa_memory_service_msg req;
+		struct cdp_dsa_memory_service_msg reply;
+		int generation_fd = -1;
+		int generation_ret = 0;
+		int rc = dsa_ms_recv_generation_fd(control_fd, &req, &generation_fd);
+
+		if (rc == 1) {
+			ret = have_session ? -1 : 0;
+			break;
+		}
+		if (rc < 0) {
+			pr_err("DSA memory service received malformed control message\n");
+			break;
+		}
+		if (have_session || dsa_ms_prepare_ctx(&ctx, &req)) {
+			if (generation_fd >= 0)
+				close(generation_fd);
+			(void)dsa_ms_reply_error(control_fd, &req, CDP_DSA_MS_EIDENTITY);
+			break;
+		}
+		active = req;
+		have_session = true;
+		applied = false;
+		raw_sealed = false;
+		reply = req;
+		reply.op = CDP_DSA_MS_PREPARED;
+		reply.status = CDP_DSA_MS_OK;
+		if (dsa_ms_send(control_fd, &reply)) {
+			close(generation_fd);
+			break;
+		}
+
+		/* CRIU owns this endpoint only during one dump.  It can issue compare
+		 * and apply requests, but never READY: that is deliberately retained
+		 * by the worker on the long-lived control channel. */
+		for (;;) {
+			struct page_xfer xfer = {};
+			struct cdp_dsa_memory_service_diag diag;
+
+			rc = dsa_ms_recv(generation_fd, &req);
+			if (rc == 1)
+				break;
+			if (rc < 0) {
+				generation_ret = -1;
+				break;
+			}
+			if (ctx->profile)
+				dsa_ms_diag_init(&diag, &req);
+			if (req.generation_id != active.generation_id ||
+			    req.parent_generation_id != active.parent_generation_id ||
+			    req.img_id != active.img_id || req.arena_id != active.arena_id ||
+			    req.arena_epoch != active.arena_epoch) {
+				(void)dsa_ms_reply_generation_error(
+					generation_fd, &req, CDP_DSA_MS_EIDENTITY,
+					ctx->profile, CDP_DSA_MS_STAGE_REQUEST_IDENTITY,
+					ESTALE, &diag);
+				generation_ret = -1;
+				break;
+			}
+
+			if (req.op == CDP_DSA_MS_RAW_SEALED) {
+				if (applied ||
+				    !dsa_ms_range_valid(req.desc_off, req.desc_head,
+							(size_t)parsed_size) ||
+				    !dsa_ms_range_valid(req.raw_off, req.raw_head,
+							(size_t)parsed_size) ||
+				    (req.desc_head - req.desc_off) %
+					sizeof(struct dsa_dump_descriptor)) {
+					(void)dsa_ms_reply_generation_error(
+						generation_fd, &req, CDP_DSA_MS_EBOUNDS,
+						ctx->profile, CDP_DSA_MS_STAGE_COMPARE_BOUNDS,
+						ERANGE, &diag);
+					generation_ret = -1;
+					break;
+				}
+				__atomic_thread_fence(__ATOMIC_ACQUIRE);
+				reply = req;
+				reply.op = CDP_DSA_MS_RAW_READY;
+				reply.status = CDP_DSA_MS_OK;
+				if ((ctx->profile && dsa_ms_send_generation(
+					     generation_fd, &reply, true, &diag)) ||
+				    (!ctx->profile && dsa_ms_send(generation_fd, &reply))) {
+					generation_ret = -1;
+					break;
+				}
+				raw_sealed = true;
+				continue;
+			}
+
+			if (req.op == CDP_DSA_MS_COMPARE_REQ) {
+			u64 service_wall_start_us = 0;
+			u64 service_cpu_start_us = 0;
+			u64 reconcile_start_us = 0;
+			u64 reconcile_us = 0;
+			bool mapping_warm;
+
+			if (!raw_sealed || applied || !dsa_ms_range_valid(req.desc_off, req.desc_head,
+						   (size_t)parsed_size) ||
+			    !dsa_ms_range_valid(req.raw_off, req.raw_head,
+						   (size_t)parsed_size) ||
+			    !dsa_ms_range_valid(req.vma_plan_off, req.vma_plan_head,
+						   (size_t)parsed_size) ||
+			    !dsa_ms_range_valid(req.result_off, req.result_limit,
+						   (size_t)parsed_size)) {
+				(void)dsa_ms_reply_generation_error(
+					generation_fd, &req, CDP_DSA_MS_EBOUNDS,
+					ctx->profile, CDP_DSA_MS_STAGE_COMPARE_BOUNDS,
+					ERANGE, &diag);
+				generation_ret = -1;
+				break;
+			}
+			/* parent_generation_id is an identity relation, not a residency
+			 * proof.  This becomes true only after this service has itself
+			 * promoted the previous staged views without dropping their maps. */
+			mapping_warm = ctx->service_parent_mapping_warm &&
+				ctx->nr_old_memstore != 0;
+			hot_service_profile_reset_generation(ctx);
+			if (ctx->profile) {
+				service_wall_start_us = dsa_profile_wall_now_us();
+				service_cpu_start_us = dsa_profile_thread_now_us();
+				reconcile_start_us = service_wall_start_us;
+			}
+			xfer.hot_apply = ctx;
+			xfer.pages_id = 0;
+			xfer.dsa_fg_raw_capture = true;
+			xfer.dsa_fg_shared = shared;
+			xfer.dsa_fg_desc_area_off = req.desc_off;
+			xfer.dsa_fg_desc_head = req.desc_head;
+			xfer.dsa_fg_raw_payload_base = req.raw_off;
+			xfer.dsa_fg_raw_payload_head = req.raw_head;
+			xfer.dsa_fg_result_meta_base = req.result_off;
+			xfer.dsa_fg_result_meta_limit = req.result_limit;
+			errno = 0;
+			if (hot_fg_load_vma_plan(ctx, shared, req.vma_plan_off,
+						 req.vma_plan_head, req.vma_plan_count)) {
+				int saved_errno = errno ? errno : EBADMSG;
+
+				(void)dsa_ms_reply_generation_error(
+					generation_fd, &req, CDP_DSA_MS_EHW,
+					ctx->profile, CDP_DSA_MS_STAGE_COMPARE_VMA_PLAN,
+					saved_errno, &diag);
+				generation_ret = -1;
+				break;
+			}
+			if (ctx->profile) {
+				reconcile_us = dsa_profile_delta_us(reconcile_start_us,
+							 dsa_profile_wall_now_us());
+			}
+			errno = 0;
+			if (hot_fg_encode_raw_wavefront(&xfer, ctx, shared, true)) {
+				int saved_errno = errno ? errno : EREMOTEIO;
+
+				(void)dsa_ms_reply_generation_error(
+					generation_fd, &req, CDP_DSA_MS_EHW,
+					ctx->profile, CDP_DSA_MS_STAGE_COMPARE_ENGINE,
+					saved_errno, &diag);
+				generation_ret = -1;
+				break;
+			}
+			reply = req;
+			reply.op = CDP_DSA_MS_COMPARE_DONE;
+			reply.status = CDP_DSA_MS_OK;
+			reply.result_head = xfer.dsa_fg_result_meta_head;
+			reply.result_count = (xfer.dsa_fg_result_meta_head -
+					      xfer.dsa_fg_result_meta_base) /
+					 sizeof(struct parasite_dsa_fg_result);
+			hot_service_profile_snapshot(ctx, &reply.profile);
+			reply.profile.mapping_warm = mapping_warm ? 1 : 0;
+			reply.profile.hot_reconcile_us = reconcile_us;
+			if (ctx->profile) {
+				reply.service_wall_us =
+					dsa_profile_delta_us(service_wall_start_us,
+							     dsa_profile_wall_now_us());
+				reply.service_cpu_us =
+					dsa_profile_delta_us(service_cpu_start_us,
+							     dsa_profile_thread_now_us());
+				reply.profile.service_compare_wall_us =
+					reply.service_wall_us;
+				reply.profile.service_compare_cpu_us =
+					reply.service_cpu_us;
+			}
+			if (dsa_ms_send_generation(generation_fd, &reply,
+						   ctx->profile, &diag)) {
+				generation_ret = -1;
+				break;
+			}
+			continue;
+			}
+
+			if (req.op == CDP_DSA_MS_APPLY_REQ) {
+				int apply_ret;
+
+				if (!raw_sealed) {
+					(void)dsa_ms_reply_generation_error(
+						generation_fd, &req, CDP_DSA_MS_ESTATE,
+						ctx->profile, CDP_DSA_MS_STAGE_APPLY_PRECHECK,
+						EPROTO, &diag);
+					generation_ret = -1;
+					break;
+				}
+				if (ctx->profile)
+					apply_ret = dsa_ms_apply_generation(
+						ctx, shared, (size_t)parsed_size, applied,
+						&req, &reply, &diag);
+				else
+					apply_ret = dsa_ms_apply_generation_fast(
+						ctx, shared, applied, &req, &reply);
+				if ((ctx->profile &&
+				     dsa_ms_send_generation(generation_fd, &reply, true,
+							    &diag)) ||
+				    (!ctx->profile && dsa_ms_send(generation_fd, &reply))) {
+					generation_ret = -1;
+					break;
+				}
+				if (apply_ret) {
+					generation_ret = -1;
+					break;
+				}
+				applied = true;
+				continue;
+			}
+
+			if (req.op == CDP_DSA_MS_FULL_APPLY_REQ) {
+				int apply_ret;
+
+				if (!raw_sealed) {
+					(void)dsa_ms_reply_generation_error(
+						generation_fd, &req, CDP_DSA_MS_ESTATE,
+						ctx->profile, CDP_DSA_MS_STAGE_APPLY_PRECHECK,
+						EPROTO, &diag);
+					generation_ret = -1;
+					break;
+				}
+				apply_ret = dsa_ms_full_apply_generation(
+					ctx, shared, (size_t)parsed_size, applied,
+					&req, &reply, &diag);
+				if ((ctx->profile && dsa_ms_send_generation(
+					     generation_fd, &reply, true, &diag)) ||
+				    (!ctx->profile && dsa_ms_send(generation_fd, &reply))) {
+					generation_ret = -1;
+					break;
+				}
+				if (apply_ret) {
+					generation_ret = -1;
+					break;
+				}
+				applied = true;
+				continue;
+			}
+			(void)dsa_ms_reply_generation_error(
+				generation_fd, &req, CDP_DSA_MS_ESTATE, ctx->profile,
+				CDP_DSA_MS_STAGE_APPLY_PRECHECK, EINVAL, &diag);
+			generation_ret = -1;
+			break;
+		}
+		close(generation_fd);
+		if (generation_ret < 0) {
+			ret = -1;
+			break;
+		}
+
+		/* Only the task worker can make the staged hot state visible. */
+		rc = dsa_ms_recv(control_fd, &req);
+		if (rc || req.generation_id != active.generation_id ||
+		    req.parent_generation_id != active.parent_generation_id ||
+		    req.img_id != active.img_id || req.arena_id != active.arena_id ||
+		    req.arena_epoch != active.arena_epoch) {
+			ret = -1;
+			break;
+		}
+		if (req.op == CDP_DSA_MS_TERMINAL_READY) {
+			if (!applied || dsa_ms_promote_staged_views(ctx)) {
+				(void)dsa_ms_reply_error(control_fd, &req, CDP_DSA_MS_ESTATE);
+				ret = -1;
+				break;
+			}
+			have_session = false;
+			applied = false;
+			raw_sealed = false;
+			ctx->service_parent_mapping_warm = true;
+			reply = req;
+			reply.status = CDP_DSA_MS_OK;
+			if (dsa_ms_send(control_fd, &reply)) {
+				ret = -1;
+				break;
+			}
+			continue;
+		}
+		if (req.op == CDP_DSA_MS_TERMINAL_ABORT) {
+			/* Aborting after APPLY would leave an unpublished staged parent.
+			 * Fail-stop and force CDP to rebuild instead of guessing. */
+			reply = req;
+			reply.status = applied ? CDP_DSA_MS_ESTATE : CDP_DSA_MS_OK;
+			(void)dsa_ms_send(control_fd, &reply);
+			ret = applied ? -1 : 0;
+			break;
+		}
+		(void)dsa_ms_reply_error(control_fd, &req, CDP_DSA_MS_ESTATE);
+		ret = -1;
+		break;
+	}
+
+	if (ctx) {
+		struct page_xfer xfer = { .hot_apply = ctx };
+
+		hot_apply_abort(&xfer);
+	}
+	if (shared != MAP_FAILED)
+		munmap(shared, (size_t)parsed_size);
+	return ret;
 }
