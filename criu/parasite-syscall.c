@@ -328,8 +328,7 @@ int parasite_dump_cgroup(struct parasite_ctl *ctl, struct parasite_dump_cgroup_a
 
 int parasite_dsa_dump_pages_seized(struct parasite_ctl *ctl, struct parasite_dsa_dump_pages_args *args,
 				   int shared_buf_fd,
-				   int *wq_fds, int wq_count,
-				   int *fg_old_fds, int fg_old_fd_count)
+				   int *wq_fds, int wq_count)
 {
 	int ret;
 	int sync_ret;
@@ -339,8 +338,7 @@ int parasite_dsa_dump_pages_seized(struct parasite_ctl *ctl, struct parasite_dsa
 	int have_path = 0;
 	int i;
 
-	if (!args || wq_count <= 0 || wq_count > DSA_DUMP_MAX_WQ ||
-	    fg_old_fd_count < 0 || fg_old_fd_count > DSA_FG_MAX_OLD_SEGMENTS)
+	if (!args || wq_count <= 0 || wq_count > DSA_DUMP_MAX_WQ)
 		return -EINVAL;
 
 	if (!wq_fds) {
@@ -368,7 +366,6 @@ int parasite_dsa_dump_pages_seized(struct parasite_ctl *ctl, struct parasite_dsa
 	pa->wq_count = wq_count;
 	pa->use_wq_fd = (wq_fds != NULL) ? 1 : 0;
 	pa->use_shared_buf_fd = (shared_buf_fd >= 0) ? 1 : 0;
-	pa->fg_old_seg_count = fg_old_fd_count;
 
 	/* If any FD has to be passed, use call + send_fd + sync flow. */
 	if (pa->use_wq_fd || pa->use_shared_buf_fd) {
@@ -403,25 +400,6 @@ int parasite_dsa_dump_pages_seized(struct parasite_ctl *ctl, struct parasite_dsa
 							pr_err("Failed to sync DSA RPC after send_fd error\n");
 						return -1;
 					}
-				}
-			}
-		}
-
-		if (pa->fg_enabled && fg_old_fd_count) {
-			for (i = 0; i < fg_old_fd_count; i++) {
-				if (fg_old_fds[i] < 0) {
-					pr_err("Invalid DSA fine-grained old fd %d\n", i);
-					sync_ret = compel_rpc_sync(PARASITE_CMD_DSA_DUMP_PAGES, ctl);
-					if (sync_ret)
-						pr_err("Failed to sync DSA RPC after invalid fg fd\n");
-					return -1;
-				}
-				if (send_fd(sk, NULL, 0, fg_old_fds[i]) < 0) {
-					pr_err("Can't send DSA fine-grained old fd %d to parasite\n", i);
-					sync_ret = compel_rpc_sync(PARASITE_CMD_DSA_DUMP_PAGES, ctl);
-					if (sync_ret)
-						pr_err("Failed to sync DSA RPC after fg fd send error\n");
-					return -1;
 				}
 			}
 		}

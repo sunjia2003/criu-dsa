@@ -38,9 +38,6 @@ extern int dsa_shared_mem_prepare_before_freeze(void);
 extern void dsa_shared_mem_cleanup_after_dump(void);
 extern int dsa_parent_coverage_prepare_before_freeze(unsigned long img_id);
 extern void dsa_parent_coverage_cleanup_after_dump(void);
-extern void temp_cdf_dump_begin(void);
-extern void temp_cdf_dump_finalize_log(void);
-extern void temp_cdf_dump_abort(void);
 extern void memdump_timeline_write_csv(void);
 
 #define PME_PRESENT	  (1ULL << 63)

@@ -103,7 +103,6 @@ declare -A SUM_WL_DSA_RPC_US
 declare -A SUM_WL_DSA_REPLAY_US
 declare -A SUM_WL_MISC_US
 
-declare -A CNT_DSA_MODE
 declare -A CASE_DSA_DEGRADE_TOTAL
 declare -A CASE_DSA_DEGRADE_SHARED
 declare -A CASE_DSA_DEGRADE_SUBMIT
@@ -124,12 +123,6 @@ declare -A SUM_DSA_PREFAULT_US
 declare -A SUM_DSA_SUBMIT_US
 declare -A SUM_DSA_POLL_US
 declare -A SUM_DSA_SUBMIT_POLL_US
-declare -A CASE_TEMP_CDF_DESC_SAMPLES
-declare -A CASE_TEMP_CDF_GAP_SAMPLES
-declare -A CASE_TEMP_CDF_RATIO_SAMPLES
-declare -A SUM_TEMP_CDF_DESC_SAMPLES
-declare -A SUM_TEMP_CDF_GAP_SAMPLES
-declare -A SUM_TEMP_CDF_RATIO_SAMPLES
 
 avg_kb() {
     local sum="$1"
@@ -426,10 +419,6 @@ record_case_timing() {
     dsa_submit_poll_us=$(( dsa_submit_us + dsa_poll_us ))
     dsa_mode_samples=0
 
-    temp_cdf_desc_samples=$($SUDO awk '/TEMP_CDF_SIZE:/{if (match($0, /n=([0-9]+)/, a)) v=a[1]} END{print v+0}' "$log_dump" 2>/dev/null || echo 0)
-    temp_cdf_gap_samples=$($SUDO awk '/TEMP_CDF_GAP:/{if (match($0, /n=([0-9]+)/, a)) v=a[1]} END{print v+0}' "$log_dump" 2>/dev/null || echo 0)
-    temp_cdf_ratio_samples=$($SUDO awk '/TEMP_CDF_RATIO_Q20:/{if (match($0, /n=([0-9]+)/, a)) v=a[1]} END{print v+0}' "$log_dump" 2>/dev/null || echo 0)
-
     CASE_DSA_DEGRADE_TOTAL["$name"]=$dsa_degrade_total
     CASE_DSA_DEGRADE_SHARED["$name"]=$dsa_degrade_shared
     CASE_DSA_DEGRADE_SUBMIT["$name"]=$dsa_degrade_submit
@@ -440,9 +429,6 @@ record_case_timing() {
     CASE_DSA_SUBMIT_US["$name"]=$dsa_submit_us
     CASE_DSA_POLL_US["$name"]=$dsa_poll_us
     CASE_DSA_SUBMIT_POLL_US["$name"]=$dsa_submit_poll_us
-    CASE_TEMP_CDF_DESC_SAMPLES["$name"]=$temp_cdf_desc_samples
-    CASE_TEMP_CDF_GAP_SAMPLES["$name"]=$temp_cdf_gap_samples
-    CASE_TEMP_CDF_RATIO_SAMPLES["$name"]=$temp_cdf_ratio_samples
 
     SUM_DSA_DEGRADE_TOTAL["$group"]=$(( ${SUM_DSA_DEGRADE_TOTAL[$group]:-0} + dsa_degrade_total ))
     SUM_DSA_DEGRADE_SHARED["$group"]=$(( ${SUM_DSA_DEGRADE_SHARED[$group]:-0} + dsa_degrade_shared ))
@@ -454,11 +440,7 @@ record_case_timing() {
     SUM_DSA_SUBMIT_US["$group"]=$(( ${SUM_DSA_SUBMIT_US[$group]:-0} + dsa_submit_us ))
     SUM_DSA_POLL_US["$group"]=$(( ${SUM_DSA_POLL_US[$group]:-0} + dsa_poll_us ))
     SUM_DSA_SUBMIT_POLL_US["$group"]=$(( ${SUM_DSA_SUBMIT_POLL_US[$group]:-0} + dsa_submit_poll_us ))
-    SUM_TEMP_CDF_DESC_SAMPLES["$group"]=$(( ${SUM_TEMP_CDF_DESC_SAMPLES[$group]:-0} + temp_cdf_desc_samples ))
-    SUM_TEMP_CDF_GAP_SAMPLES["$group"]=$(( ${SUM_TEMP_CDF_GAP_SAMPLES[$group]:-0} + temp_cdf_gap_samples ))
-    SUM_TEMP_CDF_RATIO_SAMPLES["$group"]=$(( ${SUM_TEMP_CDF_RATIO_SAMPLES[$group]:-0} + temp_cdf_ratio_samples ))
 
-    CNT_DSA_MODE["$group"]=$(( ${CNT_DSA_MODE[$group]:-0} + 1 ))
 }
 
 avg_us() {
@@ -935,19 +917,6 @@ print_metric_compare "memwrite(avg)" "$BASE_MEMWRITE_AVG" "$DSA_MEMWRITE_AVG"
 print_metric_compare "dsa_rpc(avg)" "$BASE_DSA_RPC_AVG" "$DSA_DSA_RPC_AVG"
 print_metric_compare "async_wait(avg)" "$BASE_ASYNC_WAIT_AVG" "$DSA_ASYNC_WAIT_AVG"
 print_metric_compare "memwrite_e2e(avg=memwrite+async_wait)" "$BASE_MEMWRITE_E2E_AVG" "$DSA_MEMWRITE_E2E_AVG"
-
-echo ""
-echo "=== TEMP CDF SUMMARY (dsa_live) ==="
-echo "  scope: per-dump global sample count from TEMP_CDF_SIZE/GAP/RATIO_Q20"
-
-DSA_MODE_CNT=${CNT_DSA_MODE[dsa_live]:-0}
-TEMP_CDF_DESC_AVG=$(avg_us "${SUM_TEMP_CDF_DESC_SAMPLES[dsa_live]:-}" "$DSA_MODE_CNT")
-TEMP_CDF_GAP_AVG=$(avg_us "${SUM_TEMP_CDF_GAP_SAMPLES[dsa_live]:-}" "$DSA_MODE_CNT")
-TEMP_CDF_RATIO_AVG=$(avg_us "${SUM_TEMP_CDF_RATIO_SAMPLES[dsa_live]:-}" "$DSA_MODE_CNT")
-
-echo "  dsa_live temp_cdf_desc_samples(avg): ${TEMP_CDF_DESC_AVG:-N/A}"
-echo "  dsa_live temp_cdf_gap_samples(avg): ${TEMP_CDF_GAP_AVG:-N/A}"
-echo "  dsa_live temp_cdf_ratio_samples(avg): ${TEMP_CDF_RATIO_AVG:-N/A}"
 
 echo ""
 echo "=== WORKLOAD COMPARE (base vs dsa_live) ==="

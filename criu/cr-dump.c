@@ -2492,7 +2492,6 @@ static int cr_dump_finish(int ret)
 			ret = cr_lazy_mem_dump();
 
 		if (arch_set_thread_regs(root_item, true) < 0) {
-			temp_cdf_dump_abort();
 			dsa_shared_mem_cleanup_after_dump();
 	dsa_parent_coverage_cleanup_after_dump();
 			ws_snapshot_ctx_destroy(&dump_ws_snapshot);
@@ -2511,11 +2510,6 @@ static int cr_dump_finish(int ret)
 		frozen_timeline_write_csv();
 		frozen_detail_write_csv(ret);
 		memdump_timeline_write_csv();
-
-		if (!ret)
-			temp_cdf_dump_finalize_log();
-		else
-			temp_cdf_dump_abort();
 
 		if (ws_snapshot_join_and_finalize(&dump_ws_snapshot) && !ret)
 			ret = -1;
@@ -2637,7 +2631,6 @@ static int cr_dump_finish(int ret)
 		ret = cr_lazy_mem_dump();
 
 	if (arch_set_thread_regs(root_item, true) < 0) {
-		temp_cdf_dump_abort();
 		dsa_shared_mem_cleanup_after_dump();
 		dsa_parent_coverage_cleanup_after_dump();
 		ws_snapshot_ctx_destroy(&dump_ws_snapshot);
@@ -2656,11 +2649,6 @@ static int cr_dump_finish(int ret)
 	frozen_timeline_write_csv();
 	frozen_detail_write_csv(ret || post_dump_ret);
 	memdump_timeline_write_csv();
-
-	if (!ret && !post_dump_ret && opts.final_state == TASK_ALIVE)
-		temp_cdf_dump_finalize_log();
-	else
-		temp_cdf_dump_abort();
 
 	if (ws_snapshot_join_and_finalize(&dump_ws_snapshot) && !ret)
 		ret = -1;
@@ -2711,7 +2699,6 @@ int cr_dump_tasks(pid_t pid)
 	ws_snapshot_ctx_destroy(&dump_ws_snapshot);
 
 	pr_info("========================================\n");
-	temp_cdf_dump_begin();
 	pr_info("Dumping processes (pid: %d comm: %s)\n", pid, __task_comm_info(pid));
 	pr_info("========================================\n");
 
@@ -2952,9 +2939,6 @@ int cr_dump_tasks(pid_t pid)
 err:
 	if (parent_ie)
 		inventory_entry__free_unpacked(parent_ie, NULL);
-
-	if (exit_code)
-		temp_cdf_dump_abort();
 
 	return cr_dump_finish(exit_code);
 }

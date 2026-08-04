@@ -11,7 +11,7 @@
 #include <stdint.h>
 
 #define CDP_DSA_MEMORY_SERVICE_MAGIC   0x4350444dU /* "CDPM" */
-#define CDP_DSA_MEMORY_SERVICE_VERSION 7U
+#define CDP_DSA_MEMORY_SERVICE_VERSION 8U
 #define CDP_DSA_MEMORY_SERVICE_DIAG_MAGIC 0x43445044U /* "CDPD" */
 #define CDP_DSA_MEMORY_SERVICE_DIAG_VERSION 1U
 #define CDP_DSA_MS_DIAG_INVALID_OBJECT UINT64_MAX
@@ -236,7 +236,6 @@ struct cdp_dsa_memory_service_msg {
 	uint64_t img_id;
 	uint64_t arena_id;
 	uint64_t arena_epoch;
-	uint64_t hot_parent_identity;
 	uint32_t desc_off;
 	uint32_t desc_head;
 	uint32_t raw_off;

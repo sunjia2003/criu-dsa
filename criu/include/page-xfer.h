@@ -136,6 +136,7 @@ struct vm_area_list;
 extern int page_xfer_dump_pages(struct page_xfer *, struct page_pipe *);
 extern int page_xfer_predump_pages(int pid, struct page_xfer *, struct page_pipe *);
 extern int page_xfer_hot_set_vmas(struct page_xfer *, struct vm_area_list *);
+extern size_t page_xfer_hot_vma_plan_count(struct vm_area_list *);
 /* Prepare only immutable fine-grained inputs before collect_pstree freezes the task. */
 extern int page_xfer_hot_prepare_before_freeze(unsigned long img_id);
 extern void page_xfer_hot_cleanup_before_freeze(void);
@@ -144,10 +145,6 @@ extern int connect_to_page_server_to_recv(int epfd);
 extern int disconnect_from_page_server(void);
 
 extern int check_parent_page_xfer(int fd_type, unsigned long id);
-
-extern int page_xfer_dsa_fg_apply_records(struct page_xfer *xfer,
-					  const void *shared,
-					  u32 desc_area_off, u32 desc_head);
 
 /* Entry point for the task-scoped DSA memory-service command.  It receives a
  * SOCK_SEQPACKET control fd whose peer is the CDP task worker/CRIU client. */
