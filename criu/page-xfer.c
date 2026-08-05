@@ -60,7 +60,6 @@
 #define HOT_DSA_MAX_POLL_RETRY 1000000U
 #define HOT_DSA_COMPLETION_TIMEOUT_NS (5ULL * 1000ULL * 1000ULL * 1000ULL)
 #define CDP_DSA_COMPLETION_TIMEOUT_EXIT 124
-#define HOT_FG_HYBRID_CHUNK_BYTES (2UL * 1024UL * 1024UL)
 #define HOT_FG_OUTPUT_META_MAX 256U
 #define HOT_FG_OUTPUT_LOGICAL_BYTES (2U * 1024U * 1024U)
 #define HOT_FG_OUTPUT_WRITE_BYTES (64U * 1024U)
@@ -82,8 +81,6 @@ enum hot_fg_compare_backend {
 	HOT_FG_COMPARE_SCALAR64,
 	HOT_FG_COMPARE_SIMD_AVX2,
 	HOT_FG_COMPARE_SIMD_AVX512,
-	HOT_FG_COMPARE_HYBRID_DEMAND,
-	HOT_FG_COMPARE_HYBRID_FAULT_SIMD,
 	HOT_FG_COMPARE_VALIDATE,
 };
 
@@ -1410,28 +1407,6 @@ static int hot_dsa_wq_supports_compare(const char *path)
 	return 0;
 }
 
-static int hot_dsa_wq_supports_demand_paging(const char *path)
-{
-	const char *name = strrchr(path, '/');
-	char sysfs[PATH_MAX];
-	char value[32];
-
-	if (!name || !name[1])
-		return -1;
-	name++;
-	if (snprintf(sysfs, sizeof(sysfs),
-		     "/sys/bus/dsa/devices/%s/block_on_fault", name) >=
-		    (int)sizeof(sysfs) ||
-	    hot_read_small_file(sysfs, value, sizeof(value)) || value[0] != '1')
-		return -1;
-	if (snprintf(sysfs, sizeof(sysfs),
-		     "/sys/bus/dsa/devices/%s/ats_disable", name) >=
-		    (int)sizeof(sysfs) ||
-	    hot_read_small_file(sysfs, value, sizeof(value)) || value[0] != '0')
-		return -1;
-	return 0;
-}
-
 /* no-BOF descriptors still require SVA/ATS so a source translation fault is
  * returned in the completion record.  Unlike the BOF baseline they do not
  * require the work queue to block on that fault. */
@@ -1497,15 +1472,10 @@ static int hot_dsa_open(struct hot_apply_ctx *ctx)
 			       paths[i]);
 			goto err;
 		}
-		if (ctx->fg_compare_backend == HOT_FG_COMPARE_HYBRID_DEMAND &&
-		    hot_dsa_wq_supports_demand_paging(paths[i])) {
-			pr_err("DSA hybrid-demand requires block_on_fault=1 and ats_disable=0: %s\n",
-			       paths[i]);
-			goto err;
-		}
-		if (ctx->fg_compare_backend == HOT_FG_COMPARE_HYBRID_FAULT_SIMD &&
+		if ((ctx->fg_compare_backend == HOT_FG_COMPARE_DSA ||
+		     ctx->fg_compare_backend == HOT_FG_COMPARE_VALIDATE) &&
 		    hot_dsa_wq_supports_ats(paths[i])) {
-			pr_err("DSA hybrid-fault-simd requires ats_disable=0: %s\n", paths[i]);
+			pr_err("DSA no-BOF compare requires ats_disable=0: %s\n", paths[i]);
 			goto err;
 		}
 		if (hot_dsa_wq_max_transfer(paths[i], &wq_max_xfer)) {
@@ -1803,10 +1773,6 @@ static const char *hot_fg_compare_backend_name(enum hot_fg_compare_backend backe
 		return "simd-avx2";
 	case HOT_FG_COMPARE_SIMD_AVX512:
 		return "simd-avx512";
-	case HOT_FG_COMPARE_HYBRID_DEMAND:
-		return "hybrid-demand";
-	case HOT_FG_COMPARE_HYBRID_FAULT_SIMD:
-		return "hybrid-fault-simd";
 	case HOT_FG_COMPARE_VALIDATE:
 		return "validate";
 	default:
@@ -1839,7 +1805,7 @@ static bool hot_fg_cpu_supports_avx512(void)
 static int hot_fg_select_compare_backend(struct hot_apply_ctx *ctx)
 {
 	const char *value = getenv("CRIU_DSA_FG_COMPARE_BACKEND");
-	enum hot_fg_compare_backend backend = HOT_FG_COMPARE_HYBRID_FAULT_SIMD;
+	enum hot_fg_compare_backend backend = HOT_FG_COMPARE_DSA;
 
 	if (value && value[0]) {
 		if (!strcasecmp(value, "dsa"))
@@ -1852,10 +1818,6 @@ static int hot_fg_select_compare_backend(struct hot_apply_ctx *ctx)
 			backend = HOT_FG_COMPARE_SIMD_AVX2;
 		else if (!strcasecmp(value, "simd-avx512"))
 			backend = HOT_FG_COMPARE_SIMD_AVX512;
-		else if (!strcasecmp(value, "hybrid-demand"))
-			backend = HOT_FG_COMPARE_HYBRID_DEMAND;
-		else if (!strcasecmp(value, "hybrid-fault-simd"))
-			backend = HOT_FG_COMPARE_HYBRID_FAULT_SIMD;
 		else if (!strcasecmp(value, "validate"))
 			backend = HOT_FG_COMPARE_VALIDATE;
 		else {
@@ -1868,9 +1830,8 @@ static int hot_fg_select_compare_backend(struct hot_apply_ctx *ctx)
 		pr_err("DSA fine-grained simd-avx2 backend requires AVX2\n");
 		return -1;
 	}
-	if ((backend == HOT_FG_COMPARE_SIMD_AVX512 ||
-	     backend == HOT_FG_COMPARE_HYBRID_DEMAND ||
-	     backend == HOT_FG_COMPARE_HYBRID_FAULT_SIMD ||
+	if ((backend == HOT_FG_COMPARE_DSA ||
+	     backend == HOT_FG_COMPARE_SIMD_AVX512 ||
 	     backend == HOT_FG_COMPARE_VALIDATE) && !hot_fg_cpu_supports_avx512()) {
 		pr_err("DSA fine-grained %s backend requires AVX-512F/BW/VL\n",
 		       hot_fg_compare_backend_name(backend));
@@ -2496,13 +2457,6 @@ static struct hot_apply_ctx *hot_apply_alloc_ctx(int fd_type,
 		return NULL;
 	}
 	if (ctx->fine_output && hot_fg_select_compare_backend(ctx)) {
-		xfree(ctx);
-		return NULL;
-	}
-	if (ctx->compare_breakdown &&
-	    (ctx->fg_compare_backend == HOT_FG_COMPARE_HYBRID_DEMAND ||
-	     ctx->fg_compare_backend == HOT_FG_COMPARE_HYBRID_FAULT_SIMD)) {
-		pr_err("DSA hybrid demand/fault backend cannot use the global-prefault compare breakdown mode\n");
 		xfree(ctx);
 		return NULL;
 	}
@@ -3579,7 +3533,7 @@ static void dsa_memory_service_profile_emit(struct page_xfer *xfer, int ret)
 		xfer->dsa_fg_profile_ipc_apply_us >= p->hot_apply_us ?
 		xfer->dsa_fg_profile_ipc_apply_us - p->hot_apply_us : 0;
 
-	pr_info("DSA_POST_THAW_PROFILE_TIME: version=9 pages_id=%u backend=%s ret=%d service_enabled=1 service_profile_enabled=%u service_mapping_warm=%u total_us=%" PRIu64 " result_request_publish_us=%" PRIu64 " ipc_compare_us=%" PRIu64 " ipc_compare_overhead_us=%" PRIu64 " service_compare_wall_us=%" PRIu64 " service_compare_cpu_us=%" PRIu64 " service_hot_reconcile_us=%" PRIu64 " service_raw_index_us=%" PRIu64 " service_span_build_us=%" PRIu64 " raw_index_us=%" PRIu64 " span_build_us=%" PRIu64 " service_cold_prepare_us=0 compare_wall_us=%" PRIu64 " compare_thread_cpu_us=%" PRIu64 " compare_engine_wall_us=%" PRIu64 " compare_engine_cpu_us=%" PRIu64 " service_result_publish_us=%" PRIu64 " compare_breakdown=%u parent_prefault_wall_us=%" PRIu64 " parent_prefault_cpu_us=%" PRIu64 " compare_core_wall_us=%" PRIu64 " compare_core_cpu_us=%" PRIu64 " sidecar_us=%" PRIu64 " output_wall_us=%" PRIu64 " sidecar_preflight_us=%" PRIu64 " sidecar_serialize_us=%" PRIu64 " sidecar_idx_write_us=%" PRIu64 " sidecar_dat_write_us=%" PRIu64 " pagemap_us=%" PRIu64 " finish_us=%" PRIu64 " ipc_apply_us=%" PRIu64 " ipc_apply_overhead_us=%" PRIu64 " service_hot_apply_us=%" PRIu64 " service_hot_apply_cpu_us=%" PRIu64 " service_apply_validate_us=%" PRIu64 " service_apply_materialize_us=%" PRIu64 " service_apply_store_us=%" PRIu64 " service_apply_manifest_finish_us=%" PRIu64 " service_apply_manifest_close_us=%" PRIu64 " accounted_us=%" PRIu64 " unaccounted_us=%" PRIu64 " ledger_overrun=%u\n",
+	pr_info("DSA_POST_THAW_PROFILE_TIME: version=13 pages_id=%u backend=%s ret=%d service_enabled=1 service_profile_enabled=%u service_mapping_warm=%u total_us=%" PRIu64 " result_request_publish_us=%" PRIu64 " ipc_compare_us=%" PRIu64 " ipc_compare_overhead_us=%" PRIu64 " service_compare_wall_us=%" PRIu64 " service_compare_cpu_us=%" PRIu64 " service_hot_reconcile_us=%" PRIu64 " service_raw_index_us=%" PRIu64 " service_span_build_us=%" PRIu64 " raw_index_us=%" PRIu64 " span_build_us=%" PRIu64 " service_cold_prepare_us=0 compare_wall_us=%" PRIu64 " compare_thread_cpu_us=%" PRIu64 " compare_engine_wall_us=%" PRIu64 " compare_engine_cpu_us=%" PRIu64 " service_result_publish_us=%" PRIu64 " compare_breakdown=%u parent_prefault_wall_us=%" PRIu64 " parent_prefault_cpu_us=%" PRIu64 " compare_core_wall_us=%" PRIu64 " compare_core_cpu_us=%" PRIu64 " sidecar_us=%" PRIu64 " output_wall_us=%" PRIu64 " sidecar_preflight_us=%" PRIu64 " sidecar_serialize_us=%" PRIu64 " sidecar_idx_write_us=%" PRIu64 " sidecar_dat_write_us=%" PRIu64 " pagemap_us=%" PRIu64 " finish_us=%" PRIu64 " ipc_apply_us=%" PRIu64 " ipc_apply_overhead_us=%" PRIu64 " service_hot_apply_us=%" PRIu64 " service_hot_apply_cpu_us=%" PRIu64 " service_apply_validate_us=%" PRIu64 " service_apply_materialize_us=%" PRIu64 " service_apply_store_us=%" PRIu64 " service_apply_manifest_finish_us=%" PRIu64 " service_apply_manifest_close_us=%" PRIu64 " accounted_us=%" PRIu64 " unaccounted_us=%" PRIu64 " ledger_overrun=%u\n",
 		xfer->pages_id, backend, ret, p->enabled, p->mapping_warm, total_us,
 		xfer->dsa_fg_profile_request_publish_us,
 		xfer->dsa_fg_profile_ipc_compare_us,
@@ -3608,7 +3562,7 @@ static void dsa_memory_service_profile_emit(struct page_xfer *xfer, int ret)
 		xfer->dsa_fg_service_diag.apply_manifest_finish_wall_us,
 		xfer->dsa_fg_service_diag.apply_manifest_close_wall_us,
 		accounted_us, unaccounted_us, accounted_us > total_us ? 1 : 0);
-	pr_info("DSA_POST_THAW_PROFILE_COUNT: version=9 pages_id=%u backend=%s ret=%d service_enabled=1 service_profile_enabled=%u service_mapping_warm=%u raw_pages=%" PRIu64 " raw_bytes=%" PRIu64 " capture_runs=%" PRIu64 " spans=%" PRIu64 " span_pages=%" PRIu64 " max_span_pages=%" PRIu64 " compare_ops=%" PRIu64 " dsa_compare_ops=%" PRIu64 " memcmp_calls=%" PRIu64 " memcmp_requested_bytes=%" PRIu64 " memcmp_scalar_bytes=%" PRIu64 " scalar64_calls=%" PRIu64 " scalar64_word_ops=%" PRIu64 " scalar64_refine_bytes=%" PRIu64 " scalar64_tail_bytes=%" PRIu64 " scalar64_bytes_examined=%" PRIu64 " simd_vector_ops=%" PRIu64 " simd_bytes_examined=%" PRIu64 " hybrid_dsa_claim_spans=%" PRIu64 " hybrid_dsa_claim_pages=%" PRIu64 " hybrid_cpu_claim_spans=%" PRIu64 " hybrid_cpu_claim_pages=%" PRIu64 " hybrid_cpu_waves=%" PRIu64 " hybrid_dsa_to_cpu_handoff_spans=%" PRIu64 " hybrid_dsa_to_cpu_handoff_pages=%" PRIu64 " hybrid_dsa_to_cpu_handoff_remaining_bytes=%" PRIu64 " hybrid_unclaimed_empty_count=%" PRIu64 " compare_nobof_faults=%" PRIu64 " compare_nobof_fault_source1=%" PRIu64 " compare_nobof_fault_source2=%" PRIu64 " compare_nobof_equal_prefix_bytes=%" PRIu64 " compare_fault_handoff_spans=%" PRIu64 " compare_fault_handoff_pages=%" PRIu64 " compare_fault_handoff_remaining_bytes=%" PRIu64 " compare_fault_queue_max=%" PRIu64 " compare_fresh_claim_throttles=%" PRIu64 " compare_cpu_fault_waves=%" PRIu64 " dsa_logical_progress_bytes=%" PRIu64 " simd_logical_progress_bytes=%" PRIu64 " normal_simd_logical_progress_bytes=%" PRIu64 " fault_simd_logical_progress_bytes=%" PRIu64 " dsa_fresh_submit_ops=%" PRIu64 " dsa_continuation_submit_ops=%" PRIu64 " dsa_submitted_bytes=%" PRIu64 " simd_progress_while_dsa_active_bytes=%" PRIu64 " simd_quanta_while_dsa_active=%" PRIu64 " dsa_fresh_claim_bytes=%" PRIu64 " dsa_active_zero_while_normal_cpu_work=%" PRIu64 " ready_completions_before_simd=%" PRIu64 " ready_completions_after_simd=%" PRIu64 " scheduler_iterations=%" PRIu64 " dsa_refill_samples=%" PRIu64 " post_refill_active_sum=%" PRIu64 " post_refill_active_lt_32=%" PRIu64 " post_refill_active_lt_64=%" PRIu64 " post_refill_active_lt_96=%" PRIu64 " fresh_refill_spans=%" PRIu64 " fresh_refill_batches=%" PRIu64 " fresh_refill_blocked_fault_debt=%" PRIu64 " dsa_empty_with_claimable_fresh=%" PRIu64 " prq_profile_available=%u prq_profile_sources=%u prq_pg_requests=%" PRIu64 " prq_thread_cpu_us=%" PRIu64 " prq_setup_errno=%d enq_retries=%" PRIu64 " poll_sweeps=%" PRIu64 " not_ready=%" PRIu64 " max_active=%" PRIu64 " completions_harvested=%" PRIu64 " completion_timeout_count=%" PRIu64 " max_completion_age_us=%" PRIu64 " prefault_spans=%" PRIu64 " prefault_pages=%" PRIu64 " parent_pages=%" PRIu64 " patch_pages=%" PRIu64 " full_pages=%" PRIu64 " patch_ranges=%" PRIu64 " patch_bytes=%" PRIu64 " idx_write_calls=%" PRIu64 " idx_bytes=%" PRIu64 " dat_write_calls=%" PRIu64 " dat_writev_calls=%" PRIu64 " dat_bytes=%" PRIu64 " idx_write_syscalls=%" PRIu64 " dat_write_syscalls=%" PRIu64 " dat_writev_syscalls=%" PRIu64 " sidecar_lseek_syscalls=%" PRIu64 " pagemap_records=%" PRIu64 " pagemap_bytes=%" PRIu64 "\n",
+	pr_info("DSA_POST_THAW_PROFILE_COUNT: version=13 pages_id=%u backend=%s ret=%d service_enabled=1 service_profile_enabled=%u service_mapping_warm=%u raw_pages=%" PRIu64 " raw_bytes=%" PRIu64 " capture_runs=%" PRIu64 " spans=%" PRIu64 " span_pages=%" PRIu64 " max_span_pages=%" PRIu64 " compare_ops=%" PRIu64 " dsa_compare_ops=%" PRIu64 " memcmp_calls=%" PRIu64 " memcmp_requested_bytes=%" PRIu64 " memcmp_scalar_bytes=%" PRIu64 " scalar64_calls=%" PRIu64 " scalar64_word_ops=%" PRIu64 " scalar64_refine_bytes=%" PRIu64 " scalar64_tail_bytes=%" PRIu64 " scalar64_bytes_examined=%" PRIu64 " simd_vector_ops=%" PRIu64 " simd_bytes_examined=%" PRIu64 " hybrid_dsa_claim_spans=%" PRIu64 " hybrid_dsa_claim_pages=%" PRIu64 " hybrid_cpu_claim_spans=%" PRIu64 " hybrid_cpu_claim_pages=%" PRIu64 " hybrid_cpu_waves=%" PRIu64 " hybrid_dsa_to_cpu_handoff_spans=%" PRIu64 " hybrid_dsa_to_cpu_handoff_pages=%" PRIu64 " hybrid_dsa_to_cpu_handoff_remaining_bytes=%" PRIu64 " hybrid_unclaimed_empty_count=%" PRIu64 " compare_nobof_faults=%" PRIu64 " compare_nobof_fault_source1=%" PRIu64 " compare_nobof_fault_source2=%" PRIu64 " compare_nobof_equal_prefix_bytes=%" PRIu64 " compare_fault_handoff_spans=%" PRIu64 " compare_fault_handoff_pages=%" PRIu64 " compare_fault_handoff_remaining_bytes=%" PRIu64 " compare_fault_queue_max=%" PRIu64 " compare_fresh_claim_throttles=%" PRIu64 " compare_cpu_fault_waves=%" PRIu64 " dsa_logical_progress_bytes=%" PRIu64 " simd_logical_progress_bytes=%" PRIu64 " normal_simd_logical_progress_bytes=%" PRIu64 " fault_simd_logical_progress_bytes=%" PRIu64 " dsa_fresh_submit_ops=%" PRIu64 " dsa_continuation_submit_ops=%" PRIu64 " dsa_submitted_bytes=%" PRIu64 " simd_progress_while_dsa_active_bytes=%" PRIu64 " simd_quanta_while_dsa_active=%" PRIu64 " dsa_fresh_claim_bytes=%" PRIu64 " dsa_active_zero_while_normal_cpu_work=%" PRIu64 " ready_completions_before_simd=%" PRIu64 " ready_completions_after_simd=%" PRIu64 " scheduler_iterations=%" PRIu64 " dsa_refill_samples=%" PRIu64 " post_refill_active_sum=%" PRIu64 " post_refill_active_lt_32=%" PRIu64 " post_refill_active_lt_64=%" PRIu64 " post_refill_active_lt_96=%" PRIu64 " fresh_refill_spans=%" PRIu64 " fresh_refill_batches=%" PRIu64 " fresh_refill_blocked_fault_debt=%" PRIu64 " dsa_empty_with_claimable_fresh=%" PRIu64 " prq_profile_available=%u prq_profile_sources=%u prq_pg_requests=%" PRIu64 " prq_thread_cpu_us=%" PRIu64 " prq_setup_errno=%d enq_retries=%" PRIu64 " poll_sweeps=%" PRIu64 " not_ready=%" PRIu64 " max_active=%" PRIu64 " completions_harvested=%" PRIu64 " completion_timeout_count=%" PRIu64 " max_completion_age_us=%" PRIu64 " prefault_spans=%" PRIu64 " prefault_pages=%" PRIu64 " parent_pages=%" PRIu64 " patch_pages=%" PRIu64 " full_pages=%" PRIu64 " patch_ranges=%" PRIu64 " patch_bytes=%" PRIu64 " idx_write_calls=%" PRIu64 " idx_bytes=%" PRIu64 " dat_write_calls=%" PRIu64 " dat_writev_calls=%" PRIu64 " dat_bytes=%" PRIu64 " idx_write_syscalls=%" PRIu64 " dat_write_syscalls=%" PRIu64 " dat_writev_syscalls=%" PRIu64 " sidecar_lseek_syscalls=%" PRIu64 " pagemap_records=%" PRIu64 " pagemap_bytes=%" PRIu64 "\n",
 		xfer->pages_id, backend, ret, p->enabled, p->mapping_warm,
 		p->raw_pages, p->raw_bytes, p->capture_runs, p->spans,
 		p->span_pages, p->max_span_pages, p->compare_ops, p->compare_ops,
@@ -5127,6 +5081,7 @@ static int hot_fg_write_page(struct hot_apply_ctx *ctx, unsigned long vaddr,
 
 enum hot_fg_raw_page_state {
 	HOT_FG_RAW_PENDING = 0,
+	HOT_FG_RAW_CPU_FAULT,
 	HOT_FG_RAW_PARENT,
 	HOT_FG_RAW_PATCH,
 	HOT_FG_RAW_FULL,
@@ -5136,7 +5091,6 @@ struct hot_fg_raw_page {
 	unsigned long vaddr;
 	const unsigned char *raw;
 	const unsigned char *parent;
-	u32 capture_run;
 	u32 cursor;
 	u32 patch_bytes;
 	u16 patch_count;
@@ -5164,16 +5118,6 @@ enum hot_fg_compare_span_state {
 	HOT_FG_SPAN_DONE,
 };
 
-enum hot_fg_compare_owner {
-	HOT_FG_OWNER_NONE = 0,
-	HOT_FG_OWNER_DSA,
-	HOT_FG_OWNER_CPU,
-	/* A no-BOF completion transferred the remaining span to SIMD.  This is
-	 * intentionally distinct from a normal head/tail CPU claim so fault-debt
-	 * can limit only new speculative DSA claims. */
-	HOT_FG_OWNER_CPU_FAULT,
-};
-
 struct hot_fg_compare_span {
 	const unsigned char *raw;
 	const unsigned char *parent;
@@ -5183,7 +5127,6 @@ struct hot_fg_compare_span {
 	u32 cursor;
 	size_t finalized_pages;
 	u8 state;
-	u8 owner;
 };
 
 struct hot_fg_ready_queue {
@@ -5206,7 +5149,7 @@ struct hot_fg_output_state {
 static int hot_fg_raw_pages_append(struct hot_apply_ctx *ctx,
 				   struct hot_fg_raw_page **pages, size_t *nr,
 				   size_t *cap, unsigned long vaddr,
-				   const unsigned char *raw, u32 capture_run)
+				   const unsigned char *raw)
 {
 	struct hot_fg_raw_page *page;
 	struct hot_memstore_seg *old;
@@ -5225,7 +5168,6 @@ static int hot_fg_raw_pages_append(struct hot_apply_ctx *ctx,
 	memset(page, 0, sizeof(*page));
 	page->vaddr = vaddr;
 	page->raw = raw;
-	page->capture_run = capture_run;
 	page->state = HOT_FG_RAW_PENDING;
 
 	old = hot_memstore_find_old_cover(ctx, vaddr, vaddr + PAGE_SIZE);
@@ -5297,9 +5239,11 @@ static int hot_fg_output_drain(struct hot_fg_output_state *out)
 		unsigned int nr_payload = 0;
 		unsigned int i;
 
-		if (page->state == HOT_FG_RAW_PENDING) {
-			pr_err("DSA fine-grained output has pending page=%zu vaddr=%lx\n",
-			       out->next_page, page->vaddr);
+		if (page->state != HOT_FG_RAW_PARENT &&
+		    page->state != HOT_FG_RAW_PATCH &&
+		    page->state != HOT_FG_RAW_FULL) {
+			pr_err("DSA fine-grained output has incomplete page=%zu vaddr=%lx state=%u\n",
+			       out->next_page, page->vaddr, page->state);
 			return -1;
 		}
 		meta.vaddr = page->vaddr;
@@ -5710,8 +5654,7 @@ out:
 static int hot_fg_compare_submit(struct hot_apply_ctx *ctx,
 				  struct hot_fg_compare_slot *slot,
 				  struct hot_fg_compare_span *span,
-				  u64 submit_sequence, u64 submit_ns,
-				  bool no_bof)
+				  u64 submit_sequence, u64 submit_ns)
 {
 	unsigned int wq_idx;
 	unsigned long portal_mask;
@@ -5739,8 +5682,6 @@ static int hot_fg_compare_submit(struct hot_apply_ctx *ctx,
 	slot->completion_deadline_ns = submit_ns + HOT_DSA_COMPLETION_TIMEOUT_NS;
 	slot->desc.opcode = DSA_OPCODE_COMPARE;
 	slot->desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
-	if (!no_bof)
-		slot->desc.flags |= IDXD_OP_FLAG_BOF;
 	slot->desc.src_addr = (uint64_t)(unsigned long)(span->raw + span->cursor);
 	slot->desc.src2_addr = (uint64_t)(unsigned long)(span->parent + span->cursor);
 	slot->desc.xfer_size = slot->submitted_len;
@@ -5795,34 +5736,6 @@ hot_fg_completion_timeout_fatal(const struct hot_fg_compare_slot *slot,
 	_exit(CDP_DSA_COMPLETION_TIMEOUT_EXIT);
 }
 
-static int hot_fg_compare_complete(struct hot_fg_compare_slot *slot,
-				   bool *complete, bool *equal, u32 *first_diff)
-{
-	uint8_t status = __atomic_load_n(&slot->comp.status, __ATOMIC_ACQUIRE);
-	uint8_t code = (uint8_t)DSA_COMP_STATUS(status);
-
-	*complete = false;
-	if (status == 0 || code == DSA_COMP_NONE)
-		return 0;
-	if (code != DSA_COMP_SUCCESS && code != DSA_COMP_SUCCESS_PRED) {
-		pr_err("DSA fine-grained compare wavefront completion failed status=%u code=%u\n",
-		       status, code);
-		return -1;
-	}
-	*complete = true;
-	*equal = slot->comp.result == 0;
-	if (*equal) {
-		*first_diff = slot->submitted_len;
-		return 0;
-	}
-	if (slot->comp.bytes_completed >= slot->submitted_len) {
-		pr_err("DSA fine-grained compare wavefront returned invalid first_diff=%u bytes=%u\n",
-		       slot->comp.bytes_completed, slot->submitted_len);
-		return -1;
-	}
-	*first_diff = slot->comp.bytes_completed;
-	return 0;
-}
 
 enum hot_fg_nobof_completion {
 	HOT_FG_NOBOF_NOT_READY = 0,
@@ -5883,8 +5796,38 @@ static int hot_fg_span_finalize(struct hot_fg_compare_span *span,
 			 page->state != HOT_FG_RAW_PATCH &&
 			 page->state != HOT_FG_RAW_PARENT)
 			return -1;
+		/* page->cursor is transient compare progress, but every finalized
+		 * page has one canonical terminal value.  CPU whole-span scans may
+		 * otherwise leave it at the end of the last patch while fault-page
+		 * SIMD reaches PAGE_SIZE explicitly, causing semantically identical
+		 * results to fail strict backend validation. */
+		page->cursor = PAGE_SIZE;
 		span->finalized_pages++;
 	}
+	return 0;
+}
+
+static int hot_fg_page_record_diff(struct hot_fg_raw_page *page, u32 page_off)
+{
+	u32 patch_len;
+
+	if (!page || page_off >= PAGE_SIZE || page->cursor > page_off)
+		return -1;
+	patch_len = PAGE_SIZE - page_off;
+	if (patch_len > DSA_FG_PATCH_SIZE)
+		patch_len = DSA_FG_PATCH_SIZE;
+
+	if (page->patch_count >= DSA_FG_MAX_PATCHES ||
+	    page->patch_bytes + patch_len > DSA_FG_MAX_BYTES) {
+		page->state = HOT_FG_RAW_FULL;
+		page->cursor = PAGE_SIZE;
+		return 0;
+	}
+	page->patches[page->patch_count].off = page_off;
+	page->patches[page->patch_count].len = patch_len;
+	page->patch_bytes += patch_len;
+	page->patch_count++;
+	page->cursor = page_off + patch_len;
 	return 0;
 }
 
@@ -5894,7 +5837,6 @@ static int hot_fg_span_record_diff(struct hot_fg_compare_span *span,
 	size_t page_idx;
 	struct hot_fg_raw_page *page;
 	u32 page_off;
-	u32 patch_len;
 
 	if (diff >= span->length || diff < span->cursor)
 		return -1;
@@ -5904,21 +5846,9 @@ static int hot_fg_span_record_diff(struct hot_fg_compare_span *span,
 	page_idx = diff / PAGE_SIZE;
 	page = &pages[span->first_page + page_idx];
 	page_off = diff % PAGE_SIZE;
-	patch_len = PAGE_SIZE - page_off;
-	if (patch_len > DSA_FG_PATCH_SIZE)
-		patch_len = DSA_FG_PATCH_SIZE;
-
-	if (page->patch_count >= DSA_FG_MAX_PATCHES ||
-	    page->patch_bytes + patch_len > DSA_FG_MAX_BYTES) {
-		page->state = HOT_FG_RAW_FULL;
-		span->cursor = (page_idx + 1) * PAGE_SIZE;
-		return hot_fg_span_finalize(span, pages, span->cursor);
-	}
-	page->patches[page->patch_count].off = page_off;
-	page->patches[page->patch_count].len = patch_len;
-	page->patch_bytes += patch_len;
-	page->patch_count++;
-	span->cursor = diff + patch_len;
+	if (hot_fg_page_record_diff(page, page_off))
+		return -1;
+	span->cursor = page_idx * PAGE_SIZE + page->cursor;
 	return hot_fg_span_finalize(span, pages, span->cursor);
 }
 
@@ -6319,15 +6249,43 @@ static int hot_fg_validate_compare_metadata(const struct hot_fg_raw_page *dsa_pa
 	for (i = 0; i < nr_pages; i++) {
 		const struct hot_fg_raw_page *dsa = &dsa_pages[i];
 		const struct hot_fg_raw_page *simd = &simd_pages[i];
+		bool ranges_equal = dsa->patch_count == simd->patch_count &&
+			!memcmp(dsa->patches, simd->patches,
+				dsa->patch_count * sizeof(dsa->patches[0]));
 
 		if (dsa->state != simd->state || dsa->cursor != simd->cursor ||
 		    dsa->patch_bytes != simd->patch_bytes ||
-		    dsa->patch_count != simd->patch_count ||
-		    memcmp(dsa->patches, simd->patches,
-			   dsa->patch_count * sizeof(dsa->patches[0]))) {
-			pr_err("DSA fine-grained validate page metadata mismatch page=%zu vaddr=%lx dsa_state=%u simd_state=%u dsa_ranges=%u simd_ranges=%u\n",
+		    !ranges_equal) {
+			size_t range_idx = SIZE_MAX;
+			size_t common = dsa->patch_count < simd->patch_count ?
+				dsa->patch_count : simd->patch_count;
+			size_t j;
+			u32 dsa_off = UINT_MAX, dsa_len = UINT_MAX;
+			u32 simd_off = UINT_MAX, simd_len = UINT_MAX;
+
+			for (j = 0; j < common; j++) {
+				if (dsa->patches[j].off != simd->patches[j].off ||
+				    dsa->patches[j].len != simd->patches[j].len) {
+					range_idx = j;
+					break;
+				}
+			}
+			if (range_idx == SIZE_MAX && dsa->patch_count != simd->patch_count)
+				range_idx = common;
+			if (range_idx < dsa->patch_count) {
+				dsa_off = dsa->patches[range_idx].off;
+				dsa_len = dsa->patches[range_idx].len;
+			}
+			if (range_idx < simd->patch_count) {
+				simd_off = simd->patches[range_idx].off;
+				simd_len = simd->patches[range_idx].len;
+			}
+			pr_err("DSA fine-grained validate page metadata mismatch page=%zu vaddr=%lx dsa_state=%u simd_state=%u dsa_cursor=%u simd_cursor=%u dsa_patch_bytes=%u simd_patch_bytes=%u dsa_ranges=%u simd_ranges=%u first_range=%zu dsa_off=%u dsa_len=%u simd_off=%u simd_len=%u\n",
 			       i, dsa->vaddr, dsa->state, simd->state,
-			       dsa->patch_count, simd->patch_count);
+			       dsa->cursor, simd->cursor,
+			       dsa->patch_bytes, simd->patch_bytes,
+			       dsa->patch_count, simd->patch_count,
+			       range_idx, dsa_off, dsa_len, simd_off, simd_len);
 			return -1;
 		}
 	}
@@ -6340,37 +6298,6 @@ static int hot_fg_validate_compare_metadata(const struct hot_fg_raw_page *dsa_pa
 		    dsa->state != simd->state) {
 			pr_err("DSA fine-grained validate span metadata mismatch span=%zu dsa_cursor=%u simd_cursor=%u dsa_state=%u simd_state=%u\n",
 			       i, dsa->cursor, simd->cursor, dsa->state, simd->state);
-			return -1;
-		}
-	}
-	return 0;
-}
-
-static int hot_fg_wavefront_prefault(struct hot_apply_ctx *ctx,
-				     struct hot_fg_ready_queue *ready,
-				     size_t *next_unprefaulted,
-				     size_t active)
-{
-	while (active + ready->nr < HOT_DSA_COMPARE_INFLIGHT &&
-	       *next_unprefaulted < ready->capacity) {
-		size_t span_idx = (*next_unprefaulted)++;
-		struct hot_fg_compare_span *span = &ready->spans[span_idx];
-
-		if (span->state != HOT_FG_SPAN_UNPREFAULTED) {
-			pr_err("DSA fine-grained compare invalid prefault state=%u span=%zu\n",
-			       span->state, span_idx);
-			return -1;
-		}
-		if (hot_fg_prefault_parent_span(span, span_idx, "dsa-wavefront"))
-			return -1;
-		if (ctx->profile) {
-			ctx->profile_prefault_spans++;
-			ctx->profile_prefault_pages += span->length / PAGE_SIZE;
-		}
-		span->state = HOT_FG_SPAN_READY;
-		if (hot_fg_ready_queue_push(ready, span_idx)) {
-			pr_err("DSA fine-grained compare ready queue push failed span=%zu\n",
-			       span_idx);
 			return -1;
 		}
 	}
@@ -6394,9 +6321,8 @@ static int hot_fg_wavefront_fill(struct hot_apply_ctx *ctx,
 			continue;
 		if (!ready->nr)
 			break;
-		if (hot_fg_ready_queue_pop(ready, &span_idx)) {
+		if (hot_fg_ready_queue_pop(ready, &span_idx))
 			return -1;
-		}
 		span = &ready->spans[span_idx];
 		if (span->state != HOT_FG_SPAN_READY) {
 			pr_err("DSA fine-grained compare ready queue state=%u span=%zu\n",
@@ -6404,7 +6330,7 @@ static int hot_fg_wavefront_fill(struct hot_apply_ctx *ctx,
 			return -1;
 		}
 		if (hot_fg_compare_submit(ctx, &slots[i], span,
-				  ++*submit_sequence, submit_ns, false))
+					  ++*submit_sequence, submit_ns))
 			return -1;
 		(*active)++;
 	}
@@ -6450,648 +6376,18 @@ static int hot_fg_wavefront_drain_slots(struct hot_fg_compare_slot *slots,
 	return 0;
 }
 
-static int hot_fg_compare_wavefront(struct hot_apply_ctx *ctx,
-				    struct hot_fg_raw_page *pages,
-				    struct hot_fg_compare_span *spans, size_t nr_spans)
+/*
+ * A no-BOF fault does not change ownership of the extent.  DSA has proved the
+ * bytes_completed prefix equal; AVX-512 resolves and classifies only the page
+ * containing the next unprocessed byte, then the page-aligned suffix returns
+ * to the ordinary DSA ready FIFO.
+ */
+static int hot_fg_compare_fault_page_simd(struct hot_apply_ctx *ctx,
+					  struct hot_fg_raw_page *pages,
+					  struct hot_fg_compare_span *span,
+					  struct hot_fg_compare_slot *slot)
 {
-	struct hot_fg_compare_slot slots[HOT_DSA_COMPARE_INFLIGHT] = {};
-	struct hot_fg_ready_queue ready;
-	size_t next_unprefaulted = 0;
-	size_t done = 0;
-	size_t active = 0;
-	u64 submit_sequence = 0;
-	size_t i;
-	int ret = -1;
-
-	if (!nr_spans)
-		return 0;
-	if (hot_fg_ready_queue_init(&ready, spans, nr_spans))
-		return -1;
-	if (ctx->compare_breakdown) {
-		for (i = 0; i < nr_spans; i++) {
-			if (spans[i].state != HOT_FG_SPAN_READY ||
-			    hot_fg_ready_queue_push(&ready, i)) {
-				pr_err("DSA compare breakdown has non-ready span=%zu state=%u\n",
-				       i, spans[i].state);
-				goto out;
-			}
-		}
-		next_unprefaulted = nr_spans;
-	}
-
-	while (done < nr_spans) {
-		u64 now_ns = hot_dsa_watchdog_now_ns();
-		struct hot_fg_compare_slot *expired_slot = NULL;
-		size_t harvested = 0;
-		bool had_active = active != 0;
-
-		if (!now_ns) {
-			if (active) {
-				for (i = 0; i < HOT_DSA_COMPARE_INFLIGHT; i++) {
-					if (slots[i].active)
-						hot_fg_completion_timeout_fatal(&slots[i], active,
-							slots[i].completion_deadline_ns,
-							"scheduler-clock");
-				}
-			}
-			pr_perror("DSA fine-grained completion watchdog clock failed");
-			goto out;
-		}
-		if (had_active && ctx->profile) {
-			ctx->profile_compare_poll_sweeps++;
-			if (active > ctx->profile_compare_max_active)
-				ctx->profile_compare_max_active = active;
-		}
-
-		for (i = 0; i < HOT_DSA_COMPARE_INFLIGHT; i++) {
-			struct hot_fg_compare_slot *slot = &slots[i];
-			struct hot_fg_compare_span *span;
-			bool complete, equal;
-			u32 diff;
-
-			if (!slot->active)
-				continue;
-			if (hot_fg_compare_complete(slot, &complete, &equal, &diff)) {
-				/* A non-zero status means DMA to this completion record is over,
-				 * even when the operation itself failed. */
-				if (__atomic_load_n(&slot->comp.status, __ATOMIC_ACQUIRE)) {
-					slot->active = false;
-					active--;
-				}
-				goto out;
-			}
-			if (!complete) {
-				if (ctx->profile)
-					ctx->profile_compare_not_ready++;
-				if (!expired_slot && now_ns >= slot->completion_deadline_ns)
-					expired_slot = slot;
-				continue;
-			}
-			span = slot->span;
-			if (!span || span->state != HOT_FG_SPAN_ACTIVE ||
-			    slot->submitted_cursor != span->cursor) {
-				pr_err("DSA fine-grained compare span completion has stale cursor\n");
-				slot->active = false;
-				active--;
-				goto out;
-			}
-			slot->active = false;
-			active--;
-			harvested++;
-			if (ctx->profile && now_ns >= slot->submit_ns) {
-				u64 age_us = (now_ns - slot->submit_ns) / 1000ULL;
-
-				if (age_us > ctx->profile_max_completion_age_us)
-					ctx->profile_max_completion_age_us = age_us;
-			}
-			if (equal) {
-				span->cursor += slot->submitted_len;
-				if (hot_fg_span_finalize(span, pages, span->cursor))
-					goto out;
-			} else {
-				diff += slot->submitted_cursor;
-				if (hot_fg_span_record_diff(span, pages, diff))
-					goto out;
-			}
-			if (span->cursor == span->length) {
-				if (hot_fg_span_finalize(span, pages, span->length))
-					goto out;
-				if (span->finalized_pages != span->page_count) {
-					pr_err("DSA fine-grained compare span ended with unfinished pages\n");
-					goto out;
-				}
-				span->state = HOT_FG_SPAN_DONE;
-				done++;
-			} else {
-				span->state = HOT_FG_SPAN_READY;
-				if (hot_fg_ready_queue_push(&ready,
-							(size_t)(span - spans))) {
-					pr_err("DSA fine-grained compare ready queue overflow\n");
-					goto out;
-				}
-			}
-		}
-
-		/* All visible completions are harvested before an expired ACTIVE slot
-		 * is declared stuck.  This prevents a delayed scheduler return
-		 * from turning an already completed descriptor into a false timeout. */
-		if (expired_slot &&
-		    __atomic_load_n(&expired_slot->comp.status, __ATOMIC_ACQUIRE) == 0) {
-			if (ctx->profile)
-				ctx->profile_completion_timeout_count++;
-			hot_fg_completion_timeout_fatal(expired_slot, active, now_ns,
-						"compare");
-		}
-
-		if (had_active && ctx->profile)
-			ctx->profile_completions_harvested += harvested;
-
-		if (hot_fg_wavefront_fill(ctx, slots, &ready, &active,
-					  &submit_sequence, now_ns) ||
-		    hot_fg_wavefront_prefault(ctx, &ready, &next_unprefaulted,
-					      active))
-			goto out;
-		/* Prefault may block on residency work.  Timestamp the descriptors
-		 * created from that new READY batch after prefault, not before it. */
-		if (ready.nr && active < HOT_DSA_COMPARE_INFLIGHT) {
-			u64 refill_ns = hot_dsa_watchdog_now_ns();
-
-			if (!refill_ns) {
-				if (active) {
-					for (i = 0; i < HOT_DSA_COMPARE_INFLIGHT; i++) {
-						if (slots[i].active)
-							hot_fg_completion_timeout_fatal(&slots[i], active,
-								slots[i].completion_deadline_ns,
-								"refill-clock");
-					}
-				}
-				pr_perror("DSA fine-grained refill watchdog clock failed");
-				goto out;
-			}
-			if (hot_fg_wavefront_fill(ctx, slots, &ready, &active,
-						  &submit_sequence, refill_ns))
-				goto out;
-		}
-		if (!active && done < nr_spans) {
-			pr_err("DSA fine-grained compare lost pending descriptors done=%zu ready=%zu next=%zu total=%zu\n",
-			       done, ready.nr, next_unprefaulted, nr_spans);
-			goto out;
-		}
-		if (active)
-			hot_dsa_cpu_relax();
-	}
-	ret = 0;
-out:
-	if (active && hot_fg_wavefront_drain_slots(slots, &active))
-		ret = -1;
-	hot_fg_ready_queue_fini(&ready);
-	return ret;
-}
-
-static int hot_fg_hybrid_validate_spans(struct hot_fg_raw_page *pages,
-					struct hot_fg_compare_span *spans,
-					size_t nr_spans)
-{
-	unsigned long previous_vaddr = 0;
-	bool have_previous = false;
-	size_t i;
-
-	for (i = 0; i < nr_spans; i++) {
-		struct hot_fg_compare_span *span = &spans[i];
-		unsigned long vaddr = pages[span->first_page].vaddr;
-
-		if (!span->parent || !span->length || !span->page_count ||
-		    span->length % PAGE_SIZE ||
-		    span->length / PAGE_SIZE != span->page_count ||
-		    span->state != HOT_FG_SPAN_UNPREFAULTED ||
-		    span->owner != HOT_FG_OWNER_NONE) {
-			pr_err("DSA hybrid compare has invalid initial span=%zu owner=%u state=%u length=%u\n",
-			       i, span->owner, span->state, span->length);
-			return -1;
-		}
-		if (have_previous && vaddr <= previous_vaddr) {
-			pr_err("DSA hybrid compare spans are not strictly ordered: previous=%lx current=%lx\n",
-			       previous_vaddr, vaddr);
-			return -1;
-		}
-		previous_vaddr = vaddr;
-		have_previous = true;
-	}
-	return 0;
-}
-
-static int hot_fg_hybrid_claim_cpu(struct hot_apply_ctx *ctx,
-				   struct hot_fg_compare_span *spans,
-				   size_t *unclaimed_head,
-				   size_t unclaimed_tail,
-				   size_t *cpu_current)
-{
-	struct hot_fg_compare_span *span;
-	size_t span_idx;
-
-	if (*cpu_current != SIZE_MAX)
-		return 0;
-	if (*unclaimed_head >= unclaimed_tail)
-		return 1;
-
-	span_idx = (*unclaimed_head)++;
-	span = &spans[span_idx];
-	if (span->owner != HOT_FG_OWNER_NONE ||
-	    span->state != HOT_FG_SPAN_UNPREFAULTED) {
-		pr_err("DSA hybrid-demand CPU claim has invalid span=%zu owner=%u state=%u\n",
-		       span_idx, span->owner, span->state);
-		return -1;
-	}
-	span->owner = HOT_FG_OWNER_CPU;
-	span->state = HOT_FG_SPAN_READY;
-	*cpu_current = span_idx;
-	if (ctx->profile) {
-		ctx->profile_hybrid_cpu_claim_spans++;
-		ctx->profile_hybrid_cpu_claim_pages += span->page_count;
-	}
-	return 0;
-}
-
-static int hot_fg_hybrid_fill_dsa(struct hot_apply_ctx *ctx,
-				  struct hot_fg_compare_slot *slots,
-				  struct hot_fg_compare_span *spans,
-				  struct hot_fg_ready_queue *dsa_ready,
-				  size_t unclaimed_head,
-				  size_t *unclaimed_tail,
-				  size_t *active,
-				  u64 *submit_sequence, u64 submit_ns)
-{
-	size_t i;
-
-	/* Already-started first-difference chains always retain priority. */
-	if (hot_fg_wavefront_fill(ctx, slots, dsa_ready, active,
-				  submit_sequence, submit_ns))
-		return -1;
-
-	/* A new span leaves the shared deque only when a free slot can submit it
-	 * immediately.  There is no private backlog of unstarted DSA work. */
-	for (i = 0; i < HOT_DSA_COMPARE_INFLIGHT &&
-	     *active < HOT_DSA_COMPARE_INFLIGHT &&
-	     unclaimed_head < *unclaimed_tail; i++) {
-		struct hot_fg_compare_span *span;
-		size_t span_idx;
-
-		if (slots[i].active)
-			continue;
-		span_idx = --*unclaimed_tail;
-		span = &spans[span_idx];
-		if (span->owner != HOT_FG_OWNER_NONE ||
-		    span->state != HOT_FG_SPAN_UNPREFAULTED) {
-			pr_err("DSA hybrid-demand DSA claim has invalid span=%zu owner=%u state=%u\n",
-			       span_idx, span->owner, span->state);
-			return -1;
-		}
-		span->owner = HOT_FG_OWNER_DSA;
-		span->state = HOT_FG_SPAN_READY;
-		if (ctx->profile) {
-			ctx->profile_hybrid_dsa_claim_spans++;
-			ctx->profile_hybrid_dsa_claim_pages += span->page_count;
-		}
-		if (hot_fg_compare_submit(ctx, &slots[i], span,
-				  ++*submit_sequence, submit_ns, false))
-			return -1;
-		(*active)++;
-	}
-	return 0;
-}
-
-static int hot_fg_hybrid_tail_handoff(struct hot_apply_ctx *ctx,
-				      struct hot_fg_compare_span *spans,
-				      struct hot_fg_ready_queue *dsa_ready,
-				      size_t unclaimed_head,
-				      size_t unclaimed_tail,
-				      size_t *cpu_current)
-{
-	struct hot_fg_compare_span *span;
-	size_t span_idx;
-
-	if (*cpu_current != SIZE_MAX ||
-	    unclaimed_head != unclaimed_tail ||
-	    !dsa_ready->nr)
-		return 0;
-	if (hot_fg_ready_queue_pop(dsa_ready, &span_idx))
-		return -1;
-	span = &spans[span_idx];
-	if (span->owner != HOT_FG_OWNER_DSA ||
-	    span->state != HOT_FG_SPAN_READY ||
-	    span->cursor >= span->length) {
-		pr_err("DSA hybrid-demand tail handoff has invalid span=%zu owner=%u state=%u cursor=%u length=%u\n",
-		       span_idx, span->owner, span->state, span->cursor, span->length);
-		return -1;
-	}
-	span->owner = HOT_FG_OWNER_CPU;
-	*cpu_current = span_idx;
-	if (ctx->profile) {
-		ctx->profile_hybrid_dsa_to_cpu_handoff_spans++;
-		ctx->profile_hybrid_dsa_to_cpu_handoff_pages +=
-			span->page_count - span->finalized_pages;
-		ctx->profile_hybrid_dsa_to_cpu_handoff_remaining_bytes +=
-			span->length - span->cursor;
-	}
-	return 0;
-}
-
-static int hot_fg_hybrid_cpu_page(struct hot_apply_ctx *ctx,
-				  struct hot_fg_raw_page *pages,
-				  struct hot_fg_compare_span *spans,
-				  size_t *cpu_current,
-				  struct hot_fg_cpu_scan_stats *stats,
-				  bool *span_done)
-{
-	struct hot_fg_compare_span *span;
-	size_t span_idx;
-	u32 page_end;
-
-	*span_done = false;
-	if (*cpu_current == SIZE_MAX)
-		return -1;
-	span_idx = *cpu_current;
-	span = &spans[span_idx];
-	if ((span->owner != HOT_FG_OWNER_CPU &&
-	     span->owner != HOT_FG_OWNER_CPU_FAULT) ||
-	    span->state != HOT_FG_SPAN_READY ||
-	    span->cursor >= span->length) {
-		pr_err("DSA hybrid-demand has invalid CPU span=%zu owner=%u state=%u cursor=%u length=%u\n",
-		       span_idx, span->owner, span->state, span->cursor, span->length);
-		return -1;
-	}
-
-	/* One page is the non-preemptible SIMD quantum.  The first load on a
-	 * newly claimed CPU span intentionally services its normal demand fault. */
-	page_end = (span->cursor & ~(PAGE_SIZE - 1)) + PAGE_SIZE;
-	if (page_end > span->length)
-		page_end = span->length;
-	span->state = HOT_FG_SPAN_ACTIVE;
-	while (span->cursor < page_end) {
-		bool equal;
-		u32 diff;
-		u32 length = page_end - span->cursor;
-
-		if (hot_fg_cpu_first_diff(HOT_FG_COMPARE_SIMD_AVX512,
-					  span->raw + span->cursor,
-					  span->parent + span->cursor,
-					  length, &equal, &diff,
-					  ctx->profile ? stats : NULL))
-			return -1;
-		if (equal) {
-			span->cursor = page_end;
-			if (hot_fg_span_finalize(span, pages, span->cursor))
-				return -1;
-			break;
-		}
-		if (hot_fg_span_record_diff(span, pages, span->cursor + diff))
-			return -1;
-	}
-	if (ctx->profile)
-		ctx->profile_hybrid_cpu_waves++;
-	if (ctx->profile && span->owner == HOT_FG_OWNER_CPU_FAULT)
-		ctx->profile_compare_cpu_fault_waves++;
-
-	if (span->cursor == span->length) {
-		if (hot_fg_span_finalize(span, pages, span->length) ||
-		    span->finalized_pages != span->page_count) {
-			pr_err("DSA hybrid-demand CPU span=%zu ended with unfinished pages\n",
-			       span_idx);
-			return -1;
-		}
-		span->state = HOT_FG_SPAN_DONE;
-		*cpu_current = SIZE_MAX;
-		*span_done = true;
-		return 0;
-	}
-	span->state = HOT_FG_SPAN_READY;
-	return 0;
-}
-
-static int hot_fg_compare_hybrid_demand(struct hot_apply_ctx *ctx,
-					struct hot_fg_raw_page *pages,
-					struct hot_fg_compare_span *spans,
-					size_t nr_spans)
-{
-	struct hot_fg_compare_slot slots[HOT_DSA_COMPARE_INFLIGHT] = {};
-	struct hot_fg_ready_queue dsa_ready;
-	struct hot_fg_cpu_scan_stats cpu_stats = {};
-	size_t unclaimed_head = 0;
-	size_t unclaimed_tail = nr_spans;
-	size_t cpu_current = SIZE_MAX;
-	size_t done = 0;
-	size_t active = 0;
-	u64 submit_sequence = 0;
-	bool unclaimed_empty_seen = false;
-	size_t i;
-	int ret = -1;
-
-	if (!nr_spans)
-		return 0;
-	if (hot_fg_hybrid_validate_spans(pages, spans, nr_spans))
-		return -1;
-	if (hot_fg_ready_queue_init(&dsa_ready, spans, nr_spans))
-		return -1;
-
-	while (done < nr_spans) {
-		u64 now_ns;
-		struct hot_fg_compare_slot *expired_slot = NULL;
-		size_t harvested = 0;
-		bool had_active;
-
-		/* Once all device work and shared work are exhausted, finish the one
-		 * CPU-owned span without a watchdog clock read per 4-KiB quantum. */
-		if (!active && !dsa_ready.nr &&
-		    unclaimed_head == unclaimed_tail &&
-		    cpu_current != SIZE_MAX) {
-			bool cpu_done;
-
-			if (hot_fg_hybrid_cpu_page(ctx, pages, spans, &cpu_current,
-						   &cpu_stats, &cpu_done))
-				goto out;
-			if (cpu_done)
-				done++;
-			continue;
-		}
-
-		now_ns = hot_dsa_watchdog_now_ns();
-		had_active = active != 0;
-		if (!now_ns) {
-			if (active) {
-				for (i = 0; i < HOT_DSA_COMPARE_INFLIGHT; i++) {
-					if (slots[i].active)
-						hot_fg_completion_timeout_fatal(&slots[i], active,
-							slots[i].completion_deadline_ns,
-							"hybrid-scheduler-clock");
-				}
-			}
-			pr_perror("DSA hybrid-demand completion watchdog clock failed");
-			goto out;
-		}
-		if (had_active && ctx->profile) {
-			ctx->profile_compare_poll_sweeps++;
-			if (active > ctx->profile_compare_max_active)
-				ctx->profile_compare_max_active = active;
-		}
-
-		for (i = 0; i < HOT_DSA_COMPARE_INFLIGHT; i++) {
-			struct hot_fg_compare_slot *slot = &slots[i];
-			struct hot_fg_compare_span *span;
-			bool complete, equal;
-			u32 diff;
-
-			if (!slot->active)
-				continue;
-			if (hot_fg_compare_complete(slot, &complete, &equal, &diff)) {
-				if (__atomic_load_n(&slot->comp.status, __ATOMIC_ACQUIRE)) {
-					slot->active = false;
-					active--;
-				}
-				goto out;
-			}
-			if (!complete) {
-				if (ctx->profile)
-					ctx->profile_compare_not_ready++;
-				if (!expired_slot && now_ns >= slot->completion_deadline_ns)
-					expired_slot = slot;
-				continue;
-			}
-			span = slot->span;
-			if (!span || span->owner != HOT_FG_OWNER_DSA ||
-			    span->state != HOT_FG_SPAN_ACTIVE ||
-			    slot->submitted_cursor != span->cursor) {
-				pr_err("DSA hybrid-demand completion has stale span/cursor\n");
-				slot->active = false;
-				active--;
-				goto out;
-			}
-			slot->active = false;
-			active--;
-			harvested++;
-			if (ctx->profile && now_ns >= slot->submit_ns) {
-				u64 age_us = (now_ns - slot->submit_ns) / 1000ULL;
-
-				if (age_us > ctx->profile_max_completion_age_us)
-					ctx->profile_max_completion_age_us = age_us;
-			}
-			if (equal) {
-				span->cursor += slot->submitted_len;
-				if (hot_fg_span_finalize(span, pages, span->cursor))
-					goto out;
-			} else {
-				diff += slot->submitted_cursor;
-				if (hot_fg_span_record_diff(span, pages, diff))
-					goto out;
-			}
-			if (span->cursor == span->length) {
-				if (hot_fg_span_finalize(span, pages, span->length) ||
-				    span->finalized_pages != span->page_count) {
-					pr_err("DSA hybrid-demand DSA span ended with unfinished pages\n");
-					goto out;
-				}
-				span->state = HOT_FG_SPAN_DONE;
-				done++;
-			} else {
-				span->state = HOT_FG_SPAN_READY;
-				if (hot_fg_ready_queue_push(&dsa_ready,
-							    (size_t)(span - spans))) {
-					pr_err("DSA hybrid-demand DSA continuation queue overflow\n");
-					goto out;
-				}
-			}
-		}
-
-		if (expired_slot &&
-		    __atomic_load_n(&expired_slot->comp.status, __ATOMIC_ACQUIRE) == 0) {
-			if (ctx->profile)
-				ctx->profile_completion_timeout_count++;
-			hot_fg_completion_timeout_fatal(expired_slot, active, now_ns,
-						"hybrid-compare");
-		}
-		if (had_active && ctx->profile)
-			ctx->profile_completions_harvested += harvested;
-
-		/* CPU gets first refusal on the low-address end.  DSA then consumes
-		 * the high-address end only as free slots submit work immediately. */
-		if (cpu_current == SIZE_MAX && unclaimed_head < unclaimed_tail) {
-			int claim = hot_fg_hybrid_claim_cpu(ctx, spans,
-							  &unclaimed_head,
-							  unclaimed_tail,
-							  &cpu_current);
-
-			if (claim < 0)
-				goto out;
-		}
-		if (unclaimed_head == unclaimed_tail && !unclaimed_empty_seen) {
-			unclaimed_empty_seen = true;
-			if (ctx->profile)
-				ctx->profile_hybrid_unclaimed_empty_count++;
-		}
-		if (hot_fg_hybrid_tail_handoff(ctx, spans, &dsa_ready,
-					       unclaimed_head, unclaimed_tail,
-					       &cpu_current))
-			goto out;
-		if (hot_fg_hybrid_fill_dsa(ctx, slots, spans, &dsa_ready,
-					   unclaimed_head, &unclaimed_tail,
-					   &active, &submit_sequence, now_ns))
-			goto out;
-		if (unclaimed_head == unclaimed_tail && !unclaimed_empty_seen) {
-			unclaimed_empty_seen = true;
-			if (ctx->profile)
-				ctx->profile_hybrid_unclaimed_empty_count++;
-		}
-
-		if (cpu_current != SIZE_MAX) {
-			bool cpu_done;
-
-			if (hot_fg_hybrid_cpu_page(ctx, pages, spans, &cpu_current,
-						   &cpu_stats, &cpu_done))
-				goto out;
-			if (cpu_done)
-				done++;
-		}
-
-		if (!active && !dsa_ready.nr &&
-		    cpu_current == SIZE_MAX &&
-		    unclaimed_head == unclaimed_tail &&
-		    done < nr_spans) {
-			pr_err("DSA hybrid-demand lost work done=%zu total=%zu\n",
-			       done, nr_spans);
-			goto out;
-		}
-		if (active && cpu_current == SIZE_MAX)
-			hot_dsa_cpu_relax();
-	}
-
-	if (unclaimed_head != unclaimed_tail ||
-	    cpu_current != SIZE_MAX || dsa_ready.nr || active) {
-		pr_err("DSA hybrid-demand ended with live work head=%zu tail=%zu cpu=%zu ready=%zu active=%zu\n",
-		       unclaimed_head, unclaimed_tail, cpu_current,
-		       dsa_ready.nr, active);
-		goto out;
-	}
-	for (i = 0; i < nr_spans; i++) {
-		if (spans[i].state != HOT_FG_SPAN_DONE ||
-		    spans[i].owner == HOT_FG_OWNER_NONE ||
-		    spans[i].cursor != spans[i].length ||
-		    spans[i].finalized_pages != spans[i].page_count) {
-			pr_err("DSA hybrid-demand final span mismatch span=%zu owner=%u state=%u cursor=%u length=%u finalized=%zu pages=%zu\n",
-			       i, spans[i].owner, spans[i].state,
-			       spans[i].cursor, spans[i].length,
-			       spans[i].finalized_pages, spans[i].page_count);
-			goto out;
-		}
-	}
-	if (ctx->profile) {
-		if (ctx->profile_hybrid_dsa_claim_spans +
-		    ctx->profile_hybrid_cpu_claim_spans != nr_spans) {
-			pr_err("DSA hybrid-demand claim accounting mismatch dsa=%" PRIu64
-			       " cpu=%" PRIu64 " total=%zu\n",
-			       ctx->profile_hybrid_dsa_claim_spans,
-			       ctx->profile_hybrid_cpu_claim_spans, nr_spans);
-			goto out;
-		}
-		ctx->profile_simd_vector_ops += cpu_stats.vector_ops;
-		ctx->profile_simd_bytes_examined += cpu_stats.bytes_examined;
-	}
-	ret = 0;
-out:
-	if (active && hot_fg_wavefront_drain_slots(slots, &active))
-		ret = -1;
-	hot_fg_ready_queue_fini(&dsa_ready);
-	return ret;
-}
-
-/* A no-BOF fault is a scheduling event only after the descriptor is no
- * longer ACTIVE.  The remaining span moves one way to SIMD; do not touch a
- * byte and resubmit a suffix, because that turns every cold page into a
- * DSA->CPU->DSA round trip. */
-static int hot_fg_nobof_fault_to_cpu(struct hot_apply_ctx *ctx,
-				      struct hot_fg_raw_page *pages,
-				      struct hot_fg_compare_span *span,
-				      struct hot_fg_compare_slot *slot,
-				      struct hot_fg_ready_queue *cpu_fault_ready)
-{
+	struct hot_fg_cpu_scan_stats stats = {};
 	u8 fault_info = slot->comp.fault_info;
 	u32 operand = (fault_info >> HOT_DSA_FAULT_OPERAND_SHIFT) &
 		HOT_DSA_FAULT_OPERAND_MASK;
@@ -7102,62 +6398,93 @@ static int hot_fg_nobof_fault_to_cpu(struct hot_apply_ctx *ctx,
 	u64 first_page;
 	u64 end_page;
 	const u64 page_mask = (u64)PAGE_SIZE - 1ULL;
-	u32 remaining;
+	u32 old_cursor = span->cursor;
+	u32 absolute;
+	u32 page_base;
+	u32 page_end;
+	u32 start;
+	u64 simd_progress;
+	size_t page_idx;
+	struct hot_fg_raw_page *page;
 
 	if (slot->comp.result != 0 || (fault_info & HOT_DSA_FAULT_ADDR_MASKED) ||
 	    (operand != HOT_DSA_FAULT_OPERAND_SRC1 &&
 	     operand != HOT_DSA_FAULT_OPERAND_SRC2) ||
 	    partial >= slot->submitted_len ||
-	    slot->submitted_cursor != span->cursor) {
-		pr_err("DSA no-BOF compare fault has invalid metadata result=%u info=%u partial=%u submitted=%u cursor=%u\n",
-		       slot->comp.result, fault_info, partial, slot->submitted_len,
-		       span->cursor);
+	    slot->submitted_cursor != old_cursor) {
+		pr_err("DSA no-BOF fault has invalid metadata result=%u info=%u partial=%u submitted=%u cursor=%u\n",
+		       slot->comp.result, fault_info, partial,
+		       slot->submitted_len, old_cursor);
 		return -1;
 	}
+
 	operand_addr = operand == HOT_DSA_FAULT_OPERAND_SRC1 ?
 		slot->desc.src_addr : slot->desc.src2_addr;
-	/* bytes_completed is compare progress, whereas fault_addr identifies an
-	 * operand page whose translation failed.  DSA may have address requests
-	 * in flight beyond the retired compare prefix, so do not require the
-	 * fault page to equal operand_addr + partial.  The fault must still name
-	 * a page covered by this exact submitted descriptor. */
-	if (operand_addr > UINT64_MAX - slot->submitted_len) {
-		pr_err("DSA no-BOF compare fault submitted range overflow operand=%u base=%" PRIx64
-		       " len=%u\n", operand, operand_addr, slot->submitted_len);
+	if (operand_addr > UINT64_MAX - slot->submitted_len)
 		return -1;
-	}
 	operand_end = operand_addr + slot->submitted_len;
-	if (operand_end > UINT64_MAX - page_mask) {
-		pr_err("DSA no-BOF compare fault page range overflow operand=%u end=%" PRIx64
-		       "\n", operand, operand_end);
+	if (operand_end > UINT64_MAX - page_mask)
 		return -1;
-	}
 	first_page = operand_addr & ~page_mask;
 	end_page = (operand_end + page_mask) & ~page_mask;
 	fault_page = slot->comp.fault_addr & ~page_mask;
 	if (fault_page < first_page || fault_page >= end_page) {
-		pr_err("DSA no-BOF compare fault outside submitted range operand=%u fault=%" PRIx64
+		pr_err("DSA no-BOF fault outside submitted range operand=%u fault=%" PRIx64
 		       " range=[%" PRIx64 ",%" PRIx64 ") partial=%u len=%u\n",
 		       operand, fault_page, first_page, end_page, partial,
 		       slot->submitted_len);
 		return -1;
 	}
 
-	span->cursor += partial;
+	absolute = old_cursor + partial;
+	if (absolute >= span->length)
+		return -1;
+	if (hot_fg_span_finalize(span, pages, absolute))
+		return -1;
+	page_base = absolute & ~(PAGE_SIZE - 1);
+	page_end = page_base + PAGE_SIZE;
+	if (page_end > span->length)
+		return -1;
+	page_idx = span->first_page + page_base / PAGE_SIZE;
+	page = &pages[page_idx];
+	start = absolute - page_base;
+	if (page->state != HOT_FG_RAW_PENDING || page->cursor > start) {
+		pr_err("DSA no-BOF fault overlaps page state page=%zu state=%u cursor=%u start=%u\n",
+		       page_idx, page->state, page->cursor, start);
+		return -1;
+	}
+	page->cursor = start;
+	page->state = HOT_FG_RAW_CPU_FAULT;
+
+	while (page->cursor < PAGE_SIZE && page->state != HOT_FG_RAW_FULL) {
+		bool equal;
+		u32 diff;
+		u32 length = PAGE_SIZE - page->cursor;
+
+		if (hot_fg_cpu_first_diff(HOT_FG_COMPARE_SIMD_AVX512,
+					  page->raw + page->cursor,
+					  page->parent + page->cursor,
+					  length, &equal, &diff,
+					  ctx->profile ? &stats : NULL))
+			return -1;
+		if (equal) {
+			page->cursor = PAGE_SIZE;
+			break;
+		}
+		if (hot_fg_page_record_diff(page, page->cursor + diff))
+			return -1;
+	}
+	if (page->state != HOT_FG_RAW_FULL)
+		page->state = page->patch_count ? HOT_FG_RAW_PATCH :
+			HOT_FG_RAW_PARENT;
+	if (page->cursor != PAGE_SIZE)
+		return -1;
+
+	span->cursor = page_end;
 	if (hot_fg_span_finalize(span, pages, span->cursor))
 		return -1;
-	if (span->cursor >= span->length) {
-		pr_err("DSA no-BOF compare fault consumed complete span cursor=%u length=%u\n",
-		       span->cursor, span->length);
-		return -1;
-	}
-	remaining = span->length - span->cursor;
-	span->owner = HOT_FG_OWNER_CPU_FAULT;
-	span->state = HOT_FG_SPAN_READY;
-	if (hot_fg_ready_queue_push(cpu_fault_ready, (size_t)(span - cpu_fault_ready->spans))) {
-		pr_err("DSA no-BOF compare CPU fault queue overflow\n");
-		return -1;
-	}
+
+	simd_progress = PAGE_SIZE - start;
 	if (ctx->profile) {
 		ctx->profile_compare_nobof_faults++;
 		ctx->profile_compare_nobof_equal_prefix_bytes += partial;
@@ -7166,132 +6493,26 @@ static int hot_fg_nobof_fault_to_cpu(struct hot_apply_ctx *ctx,
 		else
 			ctx->profile_compare_nobof_fault_source2++;
 		ctx->profile_compare_fault_handoff_spans++;
-		ctx->profile_compare_fault_handoff_pages +=
-			span->page_count - span->finalized_pages;
-		ctx->profile_compare_fault_handoff_remaining_bytes += remaining;
-		if (cpu_fault_ready->nr > ctx->profile_compare_fault_queue_max)
-			ctx->profile_compare_fault_queue_max = cpu_fault_ready->nr;
+		ctx->profile_compare_fault_handoff_pages++;
+		ctx->profile_compare_fault_handoff_remaining_bytes += simd_progress;
+		ctx->profile_compare_cpu_fault_waves++;
+		if (ctx->profile_compare_fault_queue_max < 1)
+			ctx->profile_compare_fault_queue_max = 1;
+		ctx->profile_dsa_logical_progress_bytes += partial;
+		ctx->profile_simd_logical_progress_bytes += simd_progress;
+		ctx->profile_fault_simd_logical_progress_bytes += simd_progress;
+		ctx->profile_simd_vector_ops += stats.vector_ops;
+		ctx->profile_simd_bytes_examined += stats.bytes_examined;
 	}
 	return 0;
 }
 
-/* Refill a no-BOF hybrid continuously.  A continuation is already DSA-owned
- * and therefore goes first.  Fresh spans leave the tail only when a slot can
- * submit them immediately; no paired-wave backlog or byte budget exists. */
-static int hot_fg_hybrid_fault_fill_dsa(
-	struct hot_apply_ctx *ctx, struct hot_fg_compare_slot *slots,
-	struct hot_fg_compare_span *spans,
-	struct hot_fg_ready_queue *dsa_ready, size_t unclaimed_head,
-	size_t *unclaimed_tail, size_t fault_debt, size_t *active,
-	u64 *submit_sequence, u64 submit_ns)
-{
-	size_t i;
-	size_t fresh_claimed = 0;
-
-	for (i = 0; i < HOT_DSA_COMPARE_INFLIGHT &&
-	     *active < HOT_DSA_COMPARE_INFLIGHT; i++) {
-		struct hot_fg_compare_span *span;
-		size_t span_idx;
-
-		if (slots[i].active)
-			continue;
-		if (dsa_ready->nr) {
-			if (hot_fg_ready_queue_pop(dsa_ready, &span_idx))
-				return -1;
-			span = &spans[span_idx];
-			if (span->owner != HOT_FG_OWNER_DSA ||
-			    span->state != HOT_FG_SPAN_READY || span->cursor >= span->length) {
-				pr_err("DSA no-BOF continuation has invalid span=%zu owner=%u state=%u cursor=%u length=%u\n",
-				       span_idx, span->owner, span->state,
-				       span->cursor, span->length);
-				return -1;
-			}
-		} else {
-			if (unclaimed_head >= *unclaimed_tail)
-				break;
-			if (*active + fault_debt >= HOT_DSA_COMPARE_INFLIGHT) {
-				if (ctx->profile) {
-					ctx->profile_compare_fresh_claim_throttles++;
-					ctx->profile_fresh_refill_blocked_fault_debt++;
-				}
-				break;
-			}
-			span_idx = --*unclaimed_tail;
-			span = &spans[span_idx];
-			if (span->owner != HOT_FG_OWNER_NONE ||
-			    span->state != HOT_FG_SPAN_UNPREFAULTED) {
-				pr_err("DSA no-BOF fresh claim has invalid span=%zu owner=%u state=%u\n",
-				       span_idx, span->owner, span->state);
-				return -1;
-			}
-			span->owner = HOT_FG_OWNER_DSA;
-			span->state = HOT_FG_SPAN_READY;
-			if (ctx->profile) {
-				ctx->profile_hybrid_dsa_claim_spans++;
-				ctx->profile_hybrid_dsa_claim_pages += span->page_count;
-				ctx->profile_dsa_fresh_claim_bytes += span->length;
-				fresh_claimed++;
-			}
-		}
-		if (hot_fg_compare_submit(ctx, &slots[i], span,
-					  ++*submit_sequence, submit_ns, true))
-			return -1;
-		(*active)++;
-	}
-	if (ctx->profile && fresh_claimed) {
-		ctx->profile_fresh_refill_spans += fresh_claimed;
-		ctx->profile_fresh_refill_batches++;
-	}
-	return 0;
-}
-
-static size_t hot_fg_profile_ready_completions(
-	struct hot_fg_compare_slot *slots)
-{
-	size_t ready = 0;
-	size_t i;
-
-	for (i = 0; i < HOT_DSA_COMPARE_INFLIGHT; i++)
-		if (slots[i].active &&
-		    __atomic_load_n(&slots[i].comp.status, __ATOMIC_ACQUIRE))
-			ready++;
-	return ready;
-}
-
-static int hot_fg_hybrid_fault_claim_cpu(struct hot_apply_ctx *ctx,
-					 struct hot_fg_ready_queue *cpu_fault_ready,
-					 size_t *cpu_current)
-{
-	struct hot_fg_compare_span *span;
-	size_t span_idx;
-
-	if (*cpu_current != SIZE_MAX || !cpu_fault_ready->nr)
-		return 0;
-	if (hot_fg_ready_queue_pop(cpu_fault_ready, &span_idx))
-		return -1;
-	span = &cpu_fault_ready->spans[span_idx];
-	if (span->owner != HOT_FG_OWNER_CPU_FAULT ||
-	    span->state != HOT_FG_SPAN_READY || span->cursor >= span->length) {
-		pr_err("DSA no-BOF CPU fault claim has invalid span=%zu owner=%u state=%u cursor=%u length=%u\n",
-		       span_idx, span->owner, span->state, span->cursor, span->length);
-		return -1;
-	}
-	*cpu_current = span_idx;
-	return 0;
-}
-
-static int hot_fg_compare_hybrid_fault_simd(struct hot_apply_ctx *ctx,
-					     struct hot_fg_raw_page *pages,
-					     struct hot_fg_compare_span *spans,
-					     size_t nr_spans)
+static int hot_fg_compare_wavefront(struct hot_apply_ctx *ctx,
+				    struct hot_fg_raw_page *pages,
+				    struct hot_fg_compare_span *spans, size_t nr_spans)
 {
 	struct hot_fg_compare_slot slots[HOT_DSA_COMPARE_INFLIGHT] = {};
-	struct hot_fg_ready_queue dsa_ready = {};
-	struct hot_fg_ready_queue cpu_fault_ready = {};
-	struct hot_fg_cpu_scan_stats cpu_stats = {};
-	size_t unclaimed_head = 0;
-	size_t unclaimed_tail = nr_spans;
-	size_t cpu_current = SIZE_MAX;
+	struct hot_fg_ready_queue ready;
 	size_t done = 0;
 	size_t active = 0;
 	u64 submit_sequence = 0;
@@ -7300,51 +6521,42 @@ static int hot_fg_compare_hybrid_fault_simd(struct hot_apply_ctx *ctx,
 
 	if (!nr_spans)
 		return 0;
-	if (hot_fg_hybrid_validate_spans(pages, spans, nr_spans) ||
-	    hot_fg_ready_queue_init(&dsa_ready, spans, nr_spans) ||
-	    hot_fg_ready_queue_init(&cpu_fault_ready, spans, nr_spans))
-		goto out;
-
-	/* A service created/restarted around an already committed parent has no
-	 * locally retained PTEs yet.  Prepare that one known-cold generation once;
-	 * normal generations do not call any prefault routine. */
-	if (!ctx->service_parent_mapping_warm) {
-		for (i = 0; i < nr_spans; i++) {
-			if (hot_fg_prefault_parent_span(&spans[i], i, "nobof-cold-attach"))
-				goto out;
-			if (ctx->profile) {
-				ctx->profile_prefault_spans++;
-				ctx->profile_prefault_pages += spans[i].length / PAGE_SIZE;
-			}
+	if (hot_fg_ready_queue_init(&ready, spans, nr_spans))
+		return -1;
+	for (i = 0; i < nr_spans; i++) {
+		if (spans[i].state == HOT_FG_SPAN_UNPREFAULTED)
+			spans[i].state = HOT_FG_SPAN_READY;
+		else if (!ctx->compare_breakdown ||
+			 spans[i].state != HOT_FG_SPAN_READY) {
+			pr_err("DSA no-BOF compare has invalid initial span=%zu state=%u\n",
+			       i, spans[i].state);
+			goto out;
+		}
+		if (hot_fg_ready_queue_push(&ready, i)) {
+			pr_err("DSA no-BOF compare initial ready queue failed span=%zu\n",
+			       i);
+			goto out;
 		}
 	}
 
 	while (done < nr_spans) {
-		u64 now_ns = 1;
+		u64 now_ns = hot_dsa_watchdog_now_ns();
 		struct hot_fg_compare_slot *expired_slot = NULL;
 		size_t harvested = 0;
-		bool had_active;
-		bool refill_sample;
-		size_t fault_debt;
+		bool had_active = active != 0;
 
-		/* Do not add a clock read to a CPU-only tail.  A timestamp is needed
-		 * only while checking or creating device work. */
-		if (active || dsa_ready.nr || unclaimed_head < unclaimed_tail)
-			now_ns = hot_dsa_watchdog_now_ns();
-		had_active = active != 0;
 		if (!now_ns) {
 			if (active) {
 				for (i = 0; i < HOT_DSA_COMPARE_INFLIGHT; i++)
 					if (slots[i].active)
-						hot_fg_completion_timeout_fatal(&slots[i], active,
+						hot_fg_completion_timeout_fatal(
+							&slots[i], active,
 							slots[i].completion_deadline_ns,
-							"nobof-scheduler-clock");
+							"scheduler-clock");
 			}
 			pr_perror("DSA no-BOF completion watchdog clock failed");
 			goto out;
 		}
-		if (ctx->profile)
-			ctx->profile_scheduler_iterations++;
 		if (had_active && ctx->profile) {
 			ctx->profile_compare_poll_sweeps++;
 			if (active > ctx->profile_compare_max_active)
@@ -7355,14 +6567,14 @@ static int hot_fg_compare_hybrid_fault_simd(struct hot_apply_ctx *ctx,
 			struct hot_fg_compare_slot *slot = &slots[i];
 			struct hot_fg_compare_span *span;
 			enum hot_fg_nobof_completion kind;
-			u32 old_cursor;
-			u32 progress;
 			u32 diff = 0;
+			u32 old_cursor;
 
 			if (!slot->active)
 				continue;
 			if (hot_fg_compare_complete_nobof(slot, &kind, &diff)) {
-				if (__atomic_load_n(&slot->comp.status, __ATOMIC_ACQUIRE)) {
+				if (__atomic_load_n(&slot->comp.status,
+						    __ATOMIC_ACQUIRE)) {
 					slot->active = false;
 					active--;
 				}
@@ -7371,52 +6583,53 @@ static int hot_fg_compare_hybrid_fault_simd(struct hot_apply_ctx *ctx,
 			if (kind == HOT_FG_NOBOF_NOT_READY) {
 				if (ctx->profile)
 					ctx->profile_compare_not_ready++;
-				if (!expired_slot && now_ns >= slot->completion_deadline_ns)
+				if (!expired_slot &&
+				    now_ns >= slot->completion_deadline_ns)
 					expired_slot = slot;
 				continue;
 			}
 			span = slot->span;
-			if (!span || span->owner != HOT_FG_OWNER_DSA ||
-			    span->state != HOT_FG_SPAN_ACTIVE ||
+			if (!span || span->state != HOT_FG_SPAN_ACTIVE ||
 			    slot->submitted_cursor != span->cursor) {
-				pr_err("DSA no-BOF completion has stale span/cursor\n");
+				pr_err("DSA no-BOF completion has stale span cursor\n");
 				slot->active = false;
 				active--;
 				goto out;
 			}
-			/* Completion DMA is over before ownership changes. */
 			slot->active = false;
 			active--;
 			harvested++;
-			old_cursor = span->cursor;
 			if (ctx->profile && now_ns >= slot->submit_ns) {
 				u64 age_us = (now_ns - slot->submit_ns) / 1000ULL;
 
 				if (age_us > ctx->profile_max_completion_age_us)
 					ctx->profile_max_completion_age_us = age_us;
 			}
+
+			old_cursor = span->cursor;
 			if (kind == HOT_FG_NOBOF_EQUAL) {
 				span->cursor += slot->submitted_len;
 				if (hot_fg_span_finalize(span, pages, span->cursor))
 					goto out;
+				if (ctx->profile)
+					ctx->profile_dsa_logical_progress_bytes +=
+						slot->submitted_len;
 			} else if (kind == HOT_FG_NOBOF_DIFFERENT) {
-				if (hot_fg_span_record_diff(span, pages,
-						    slot->submitted_cursor + diff))
+				diff += slot->submitted_cursor;
+				if (hot_fg_span_record_diff(span, pages, diff))
 					goto out;
-			} else if (hot_fg_nobof_fault_to_cpu(ctx, pages, span, slot,
-							    &cpu_fault_ready)) {
+				if (ctx->profile)
+					ctx->profile_dsa_logical_progress_bytes +=
+						span->cursor - old_cursor;
+			} else if (hot_fg_compare_fault_page_simd(ctx, pages,
+								  span, slot)) {
 				goto out;
 			}
-			progress = span->cursor - old_cursor;
-			if (ctx->profile)
-				ctx->profile_dsa_logical_progress_bytes += progress;
 
-			if (span->owner == HOT_FG_OWNER_CPU_FAULT) {
-				continue;
-			}
 			if (span->cursor == span->length) {
-				if (hot_fg_span_finalize(span, pages, span->length) ||
-				    span->finalized_pages != span->page_count) {
+				if (hot_fg_span_finalize(span, pages, span->length))
+					goto out;
+				if (span->finalized_pages != span->page_count) {
 					pr_err("DSA no-BOF span ended with unfinished pages\n");
 					goto out;
 				}
@@ -7424,167 +6637,46 @@ static int hot_fg_compare_hybrid_fault_simd(struct hot_apply_ctx *ctx,
 				done++;
 			} else {
 				span->state = HOT_FG_SPAN_READY;
-				if (hot_fg_ready_queue_push(&dsa_ready,
-							    (size_t)(span - spans))) {
-					pr_err("DSA no-BOF continuation queue overflow\n");
+				if (hot_fg_ready_queue_push(&ready,
+							(size_t)(span - spans))) {
+					pr_err("DSA no-BOF ready queue overflow\n");
 					goto out;
 				}
 			}
 		}
 
 		if (expired_slot &&
-		    __atomic_load_n(&expired_slot->comp.status, __ATOMIC_ACQUIRE) == 0) {
+		    __atomic_load_n(&expired_slot->comp.status,
+				    __ATOMIC_ACQUIRE) == 0) {
 			if (ctx->profile)
 				ctx->profile_completion_timeout_count++;
 			hot_fg_completion_timeout_fatal(expired_slot, active, now_ns,
-						"nobof-compare");
+							"compare");
 		}
 		if (had_active && ctx->profile)
 			ctx->profile_completions_harvested += harvested;
 
-		/* CPU ownership is admitted before fresh DSA work in this iteration.
-		 * Fault remainder wins whenever there is no current CPU span; current
-		 * ownership itself is never preempted mid-span. */
-		if (hot_fg_hybrid_fault_claim_cpu(ctx, &cpu_fault_ready,
-						   &cpu_current))
+		if (hot_fg_wavefront_fill(ctx, slots, &ready, &active,
+					  &submit_sequence, now_ns))
 			goto out;
-		if (hot_fg_hybrid_tail_handoff(ctx, spans, &dsa_ready,
-					       unclaimed_head, unclaimed_tail,
-					       &cpu_current))
-			goto out;
-		if (cpu_current == SIZE_MAX && unclaimed_head < unclaimed_tail) {
-			int claim = hot_fg_hybrid_claim_cpu(
-				ctx, spans, &unclaimed_head, unclaimed_tail,
-				&cpu_current);
-
-			if (claim < 0)
-				goto out;
-		}
-
-		fault_debt = cpu_fault_ready.nr;
-		if (cpu_current != SIZE_MAX &&
-		    spans[cpu_current].owner == HOT_FG_OWNER_CPU_FAULT)
-			fault_debt++;
-		refill_sample = ctx->profile &&
-			(dsa_ready.nr || unclaimed_head < unclaimed_tail);
-		if (hot_fg_hybrid_fault_fill_dsa(
-			    ctx, slots, spans, &dsa_ready, unclaimed_head,
-			    &unclaimed_tail, fault_debt, &active,
-			    &submit_sequence, now_ns))
-			goto out;
-		if (ctx->profile && refill_sample) {
-			ctx->profile_dsa_refill_samples++;
-			ctx->profile_post_refill_active_sum += active;
-			if (active < 32)
-				ctx->profile_post_refill_active_lt_32++;
-			if (active < 64)
-				ctx->profile_post_refill_active_lt_64++;
-			if (active < 96)
-				ctx->profile_post_refill_active_lt_96++;
-			if (!active && !dsa_ready.nr &&
-			    unclaimed_head < unclaimed_tail &&
-			    fault_debt < HOT_DSA_COMPARE_INFLIGHT)
-				ctx->profile_dsa_empty_with_claimable_fresh++;
-		}
-
-		if (cpu_current != SIZE_MAX) {
-			struct hot_fg_compare_span *cpu_span = &spans[cpu_current];
-			bool cpu_fault = cpu_span->owner == HOT_FG_OWNER_CPU_FAULT;
-			bool dsa_active = active != 0;
-			u32 old_cursor = cpu_span->cursor;
-			u64 progress;
-			size_t ready_before = 0;
-			size_t ready_after = 0;
-			bool cpu_done;
-
-			if (ctx->profile && dsa_active)
-				ready_before =
-					hot_fg_profile_ready_completions(slots);
-			if (hot_fg_hybrid_cpu_page(ctx, pages, spans, &cpu_current,
-						   &cpu_stats, &cpu_done))
-				goto out;
-			progress = cpu_span->cursor - old_cursor;
-			if (!progress || progress > PAGE_SIZE) {
-				pr_err("DSA no-BOF demand SIMD quantum made invalid progress=%" PRIu64 "\n",
-				       progress);
-				goto out;
-			}
-			if (ctx->profile) {
-				ctx->profile_simd_logical_progress_bytes += progress;
-				if (cpu_fault)
-					ctx->profile_fault_simd_logical_progress_bytes +=
-						progress;
-				else
-					ctx->profile_normal_simd_logical_progress_bytes +=
-						progress;
-				if (dsa_active) {
-					ctx->profile_simd_progress_while_dsa_active_bytes +=
-						progress;
-					ctx->profile_simd_quanta_while_dsa_active++;
-				} else if (!cpu_fault) {
-					ctx->profile_dsa_active_zero_while_normal_cpu_work++;
-				}
-			}
-			if (dsa_active && ctx->profile) {
-				ready_after = hot_fg_profile_ready_completions(slots);
-				ctx->profile_ready_completions_before_simd += ready_before;
-				ctx->profile_ready_completions_after_simd += ready_after;
-			}
-			if (cpu_done)
-				done++;
-		}
-		if (!active && !dsa_ready.nr && !cpu_fault_ready.nr &&
-		    cpu_current == SIZE_MAX && unclaimed_head == unclaimed_tail &&
-		    done < nr_spans) {
-			pr_err("DSA no-BOF compare lost work done=%zu total=%zu\n", done, nr_spans);
+		if (ctx->profile && active > ctx->profile_compare_max_active)
+			ctx->profile_compare_max_active = active;
+		if (!active && done < nr_spans) {
+			pr_err("DSA no-BOF compare lost work done=%zu ready=%zu total=%zu\n",
+			       done, ready.nr, nr_spans);
 			goto out;
 		}
-		if (active && cpu_current == SIZE_MAX)
+		if (active)
 			hot_dsa_cpu_relax();
 	}
 
-	if (unclaimed_head != unclaimed_tail || cpu_current != SIZE_MAX ||
-	    dsa_ready.nr ||
-	    cpu_fault_ready.nr || active) {
-		pr_err("DSA no-BOF demand compare ended with live work head=%zu tail=%zu "
-		       "cpu=%zu dsa_ready=%zu fault_ready=%zu active=%zu\n",
-		       unclaimed_head, unclaimed_tail, cpu_current, dsa_ready.nr,
-		       cpu_fault_ready.nr, active);
-		goto out;
-	}
 	for (i = 0; i < nr_spans; i++) {
 		if (spans[i].state != HOT_FG_SPAN_DONE ||
-		    spans[i].owner == HOT_FG_OWNER_NONE ||
 		    spans[i].cursor != spans[i].length ||
 		    spans[i].finalized_pages != spans[i].page_count) {
-			pr_err("DSA no-BOF final span mismatch span=%zu owner=%u state=%u cursor=%u length=%u finalized=%zu pages=%zu\n",
-			       i, spans[i].owner, spans[i].state, spans[i].cursor,
-			       spans[i].length, spans[i].finalized_pages, spans[i].page_count);
-			goto out;
-		}
-	}
-	if (ctx->profile) {
-		if (ctx->profile_hybrid_dsa_claim_spans +
-		    ctx->profile_hybrid_cpu_claim_spans != nr_spans) {
-			pr_err("DSA no-BOF claim accounting mismatch dsa=%" PRIu64
-			       " cpu=%" PRIu64 " total=%zu\n",
-			       ctx->profile_hybrid_dsa_claim_spans,
-			       ctx->profile_hybrid_cpu_claim_spans, nr_spans);
-			goto out;
-		}
-		ctx->profile_simd_vector_ops += cpu_stats.vector_ops;
-		ctx->profile_simd_bytes_examined += cpu_stats.bytes_examined;
-		if (ctx->profile_dsa_fresh_submit_ops !=
-		    ctx->profile_hybrid_dsa_claim_spans ||
-		    ctx->fg_compare_ops != ctx->profile_dsa_fresh_submit_ops +
-			    ctx->profile_dsa_continuation_submit_ops) {
-			pr_err("DSA no-BOF demand submit accounting mismatch fresh=%" PRIu64
-			       " claims=%" PRIu64 " continuation=%" PRIu64
-			       " total=%" PRIu64 "\n",
-			       ctx->profile_dsa_fresh_submit_ops,
-			       ctx->profile_hybrid_dsa_claim_spans,
-			       ctx->profile_dsa_continuation_submit_ops,
-			       ctx->fg_compare_ops);
+			pr_err("DSA no-BOF final span mismatch span=%zu state=%u cursor=%u length=%u finalized=%zu pages=%zu\n",
+			       i, spans[i].state, spans[i].cursor, spans[i].length,
+			       spans[i].finalized_pages, spans[i].page_count);
 			goto out;
 		}
 	}
@@ -7592,8 +6684,7 @@ static int hot_fg_compare_hybrid_fault_simd(struct hot_apply_ctx *ctx,
 out:
 	if (active && hot_fg_wavefront_drain_slots(slots, &active))
 		ret = -1;
-	hot_fg_ready_queue_fini(&cpu_fault_ready);
-	hot_fg_ready_queue_fini(&dsa_ready);
+	hot_fg_ready_queue_fini(&ready);
 	return ret;
 }
 
@@ -7652,7 +6743,9 @@ static int hot_fg_publish_results(struct page_xfer *xfer,
 		u32 raw_off;
 		u16 j;
 
-		if (page->state == HOT_FG_RAW_PENDING || page->raw < shared ||
+		if ((page->state != HOT_FG_RAW_PARENT &&
+		     page->state != HOT_FG_RAW_PATCH &&
+		     page->state != HOT_FG_RAW_FULL) || page->raw < shared ||
 		    (u64)(page->raw - shared) > UINT_MAX) {
 			pr_err("DSA fine-grained cannot publish incomplete result page=%zu\n", i);
 			return -1;
@@ -7957,8 +7050,7 @@ static int hot_fg_encode_raw_wavefront(struct page_xfer *xfer,
 		for (page_off = 0; page_off < desc->copy_len; page_off += PAGE_SIZE) {
 			if (hot_fg_raw_pages_append(ctx, &pages, &nr, &cap,
 						    (unsigned long)desc->src_addr + page_off,
-						    shared + raw_off + page_off,
-						    capture_run))
+						    shared + raw_off + page_off))
 				goto err;
 		}
 		raw_off += desc->copy_len;
@@ -7984,9 +7076,9 @@ static int hot_fg_encode_raw_wavefront(struct page_xfer *xfer,
 		goto err;
 	}
 
-	/* Build spans with three monotonic inputs already ordered by capture:
-	 * raw capture runs, current VMA plans, and parent-map continuity.  A span
-	 * never crosses any of those boundaries or the actual WQ transfer limit. */
+	/* Build compare extents from the real address invariants.  Capture-run
+	 * boundaries do not matter once adjacent raw arena, vaddr and parent
+	 * addresses are all proven continuous. */
 	for (i = 0; i < nr;) {
 		struct hot_fg_raw_page *first = &pages[i];
 		size_t j;
@@ -8015,13 +7107,9 @@ static int hot_fg_encode_raw_wavefront(struct page_xfer *xfer,
 			struct hot_fg_raw_page *next = &pages[j];
 
 			if (next->state != HOT_FG_RAW_PENDING ||
-			    next->capture_run != first->capture_run ||
 			    next->vaddr != prev->vaddr + PAGE_SIZE ||
 			    next->raw != prev->raw + PAGE_SIZE ||
 			    next->parent != prev->parent + PAGE_SIZE ||
-			    (ctx->fg_compare_backend == HOT_FG_COMPARE_HYBRID_DEMAND &&
-			     (next->vaddr & ~(HOT_FG_HYBRID_CHUNK_BYTES - 1)) !=
-			     (first->vaddr & ~(HOT_FG_HYBRID_CHUNK_BYTES - 1))) ||
 			    next->vaddr + PAGE_SIZE > vma_end)
 				break;
 			length += PAGE_SIZE;
@@ -8101,14 +7189,6 @@ static int hot_fg_encode_raw_wavefront(struct page_xfer *xfer,
 					       ctx->fg_compare_backend, true))
 				goto err;
 			break;
-		case HOT_FG_COMPARE_HYBRID_DEMAND:
-			if (hot_fg_compare_hybrid_demand(ctx, pages, spans, nr_spans))
-				goto err;
-			break;
-		case HOT_FG_COMPARE_HYBRID_FAULT_SIMD:
-			if (hot_fg_compare_hybrid_fault_simd(ctx, pages, spans, nr_spans))
-				goto err;
-			break;
 		case HOT_FG_COMPARE_VALIDATE:
 			if (hot_fg_compare_wavefront(ctx, pages, spans, nr_spans) ||
 			    hot_fg_compare_cpu(ctx, validate_pages, validate_spans, nr_spans,
@@ -8136,9 +7216,11 @@ static int hot_fg_encode_raw_wavefront(struct page_xfer *xfer,
 		(void)hot_prq_profile_stop(ctx);
 	}
 	for (i = 0; i < nr; i++) {
-		if (pages[i].state == HOT_FG_RAW_PENDING) {
-			pr_err("DSA fine-grained compare barrier has pending page=%zu vaddr=%lx\n",
-			       i, pages[i].vaddr);
+		if (pages[i].state != HOT_FG_RAW_PARENT &&
+		    pages[i].state != HOT_FG_RAW_PATCH &&
+		    pages[i].state != HOT_FG_RAW_FULL) {
+			pr_err("DSA fine-grained compare barrier has incomplete page=%zu vaddr=%lx state=%u\n",
+			       i, pages[i].vaddr, pages[i].state);
 			goto err;
 		}
 	}
@@ -8218,8 +7300,6 @@ static int hot_fg_encode_raw_wavefront(struct page_xfer *xfer,
 			xfer->dsa_fg_raw_payload_head - xfer->dsa_fg_raw_payload_base,
 			ctx->fg_compare_ops, nr_spans,
 			ctx->fg_compare_backend == HOT_FG_COMPARE_DSA ||
-			ctx->fg_compare_backend == HOT_FG_COMPARE_HYBRID_DEMAND ||
-			ctx->fg_compare_backend == HOT_FG_COMPARE_HYBRID_FAULT_SIMD ||
 			ctx->fg_compare_backend == HOT_FG_COMPARE_VALIDATE ?
 			HOT_DSA_COMPARE_INFLIGHT : 0, max_xfer);
 	xfree(validate_spans);

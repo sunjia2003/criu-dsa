@@ -180,15 +180,19 @@ struct cdp_dsa_memory_service_profile {
 	uint64_t normal_simd_logical_progress_bytes;
 	uint64_t fault_simd_logical_progress_bytes;
 	uint64_t dsa_fresh_submit_ops;
+	/* Profile schema v10+: page-aligned extent suffix probes.  The field name
+	 * is retained to keep the fixed-width service record layout stable. */
 	uint64_t dsa_continuation_submit_ops;
 	uint64_t dsa_submitted_bytes;
 	uint64_t simd_progress_while_dsa_active_bytes;
 	uint64_t simd_quanta_while_dsa_active;
 	uint64_t dsa_fresh_claim_bytes;
 	uint64_t dsa_active_zero_while_normal_cpu_work;
+	/* Profile schema v12: aggregate ready slots immediately before and after
+	 * each whole SIMD wave.  This is never sampled per page. */
 	uint64_t ready_completions_before_simd;
 	uint64_t ready_completions_after_simd;
-	/* Continuous demand-driven scheduler diagnostics.  These are populated
+	/* Dual-granularity extent/page scheduler diagnostics.  These are populated
 	 * only when the task explicitly enables the profile path. */
 	uint64_t scheduler_iterations;
 	uint64_t dsa_refill_samples;
