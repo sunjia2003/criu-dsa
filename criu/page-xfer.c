@@ -55,7 +55,10 @@
 #define HOT_APPLY_SCRATCH_PAGES 32
 #define HOT_DSA_PORTAL_MAP_SIZE 0x1000UL
 #define HOT_DSA_MAX_WQ 16
-#define HOT_DSA_COMPARE_INFLIGHT 128
+#define HOT_DSA_COMPARE_INFLIGHT DSA_HW_BATCH_OUTER_DEPTH
+#define HOT_DSA_COMPARE_BATCH_CHILDREN DSA_HW_BATCH_CHILDREN
+#define HOT_DSA_COMPARE_MAX_CHILDREN \
+	(HOT_DSA_COMPARE_INFLIGHT * HOT_DSA_COMPARE_BATCH_CHILDREN)
 #define HOT_DSA_MAX_ENQ_RETRY 1000000U
 #define HOT_DSA_MAX_POLL_RETRY 1000000U
 #define HOT_DSA_COMPLETION_TIMEOUT_NS (5ULL * 1000ULL * 1000ULL * 1000ULL)
@@ -469,6 +472,8 @@ struct hot_prq_profile_source {
 	pid_t irq_tid;
 };
 
+struct hot_fg_compare_batch;
+
 struct hot_apply_ctx {
 	bool enabled;
 	bool memstore;
@@ -545,6 +550,9 @@ struct hot_apply_ctx {
 	unsigned long dsa_portal_offset[HOT_DSA_MAX_WQ];
 	unsigned int dsa_next_wq;
 	u32 dsa_max_transfer_size;
+	/* Task-service lifetime pool: descriptor/completion pages remain resident
+	 * across generations; individual submissions rewrite only used slots. */
+	struct hot_fg_compare_batch *compare_batches;
 	struct hot_apply_extent pending;
 	/* Aggregate-only profile data.  It is populated only when
 	 * CRIU_DSA_PROFILE=1; no timer is read from page/range/descriptor loops. */
@@ -579,6 +587,16 @@ struct hot_apply_ctx {
 	u64 profile_compare_poll_sweeps;
 	u64 profile_compare_not_ready;
 	u64 profile_compare_max_active;
+	u64 profile_batch_outer_submits;
+	u64 profile_batch_child_submits;
+	u64 profile_batch_partial_submits;
+	u64 profile_batch_single_tail_submits;
+	u64 profile_batch_outer_success;
+	u64 profile_batch_outer_fail;
+	u64 profile_batch_child_success;
+	u64 profile_batch_child_nobof;
+	u64 profile_batch_max_active_outer;
+	u64 profile_batch_max_active_children;
 	u64 profile_completions_harvested;
 	u64 profile_completion_timeout_count;
 	u64 profile_max_completion_age_us;
@@ -751,7 +769,6 @@ static inline int hot_dsa_enqcmd(void *portal_slot, const void *desc)
 	unsigned char retry = 0;
 
 	asm volatile(
-		"sfence\n\t"
 		".byte 0xf2, 0x0f, 0x38, 0xf8, 0x02\n\t"
 		"setz %0\n\t"
 		: "=r"(retry)
@@ -763,6 +780,15 @@ static inline int hot_dsa_enqcmd(void *portal_slot, const void *desc)
 	(void)portal_slot;
 	(void)desc;
 	return 1;
+#endif
+}
+
+static inline void hot_dsa_release_descriptors(void)
+{
+#if defined(__x86_64__)
+	asm volatile("sfence" ::: "memory");
+#else
+	asm volatile("" ::: "memory");
 #endif
 }
 
@@ -1292,8 +1318,10 @@ static int hot_dsa_collect_workqueues(char paths[HOT_DSA_MAX_WQ][64])
 	while ((de = readdir(dir)) && nr < HOT_DSA_MAX_WQ) {
 		char type_path[160];
 		char state_path[160];
+		char mode_path[160];
 		char type_buf[32];
 		char state_buf[32];
+		char mode_buf[32];
 		int n;
 
 		if (strncmp(de->d_name, "wq", 2))
@@ -1307,6 +1335,10 @@ static int hot_dsa_collect_workqueues(char paths[HOT_DSA_MAX_WQ][64])
 			     "/sys/bus/dsa/devices/%s/state", de->d_name);
 		if (n < 0 || n >= (int)sizeof(state_path))
 			continue;
+		n = snprintf(mode_path, sizeof(mode_path),
+			     "/sys/bus/dsa/devices/%s/mode", de->d_name);
+		if (n < 0 || n >= (int)sizeof(mode_path))
+			continue;
 
 		if (hot_read_small_file(type_path, type_buf, sizeof(type_buf)))
 			continue;
@@ -1315,6 +1347,10 @@ static int hot_dsa_collect_workqueues(char paths[HOT_DSA_MAX_WQ][64])
 		if (hot_read_small_file(state_path, state_buf, sizeof(state_buf)))
 			continue;
 		if (strncmp(state_buf, "enabled", 7))
+			continue;
+		if (hot_read_small_file(mode_path, mode_buf, sizeof(mode_buf)))
+			continue;
+		if (strncmp(mode_buf, "shared", 6))
 			continue;
 
 		n = snprintf(paths[nr], sizeof(paths[nr]), "/dev/dsa/%s", de->d_name);
@@ -1325,6 +1361,42 @@ static int hot_dsa_collect_workqueues(char paths[HOT_DSA_MAX_WQ][64])
 
 	closedir(dir);
 	return nr;
+}
+
+static int hot_dsa_wq_batch_capability(const char *path)
+{
+	const char *name = strrchr(path, '/');
+	char sysfs[PATH_MAX];
+	char value[512];
+	char *last_word;
+	char *end = NULL;
+	unsigned long ops;
+	unsigned long max_batch;
+
+	if (!name || !name[1])
+		return -1;
+	name++;
+	if (snprintf(sysfs, sizeof(sysfs),
+		     "/sys/bus/dsa/devices/%s/op_config", name) >=
+		    (int)sizeof(sysfs) || hot_read_small_file(sysfs, value, sizeof(value)))
+		return -1;
+	last_word = strrchr(value, ',');
+	last_word = last_word ? last_word + 1 : value;
+	errno = 0;
+	ops = strtoul(last_word, &end, 16);
+	if (errno || end == last_word ||
+	    !(ops & (1UL << DSA_OPCODE_BATCH)) ||
+	    !(ops & (1UL << DSA_OPCODE_COMPARE)))
+		return -1;
+	if (snprintf(sysfs, sizeof(sysfs),
+		     "/sys/bus/dsa/devices/%s/max_batch_size", name) >=
+		    (int)sizeof(sysfs) || hot_read_small_file(sysfs, value, sizeof(value)))
+		return -1;
+	errno = 0;
+	max_batch = strtoul(value, &end, 0);
+	if (errno || end == value || max_batch < HOT_DSA_COMPARE_BATCH_CHILDREN)
+		return -1;
+	return 0;
 }
 
 static int hot_dsa_wq_max_transfer(const char *path, u32 *max_xfer)
@@ -1395,13 +1467,14 @@ static int hot_dsa_wq_supports_compare(const char *path)
 	    hot_read_small_file(sysfs, value, sizeof(value)))
 		return -1;
 
-	/* accel-config prints op_cap most-significant word first; DSA COMPARE is
-	 * opcode 5, hence lives in the final (least-significant) word. */
+	/* accel-config prints op_cap most-significant word first; BATCH and
+	 * COMPARE both live in the final (least-significant) word. */
 	last_word = strrchr(value, ',');
 	last_word = last_word ? last_word + 1 : value;
 	errno = 0;
 	op_cap = strtoul(last_word, &end, 16);
 	if (errno || end == last_word ||
+	    !(op_cap & (1UL << DSA_OPCODE_BATCH)) ||
 	    !(op_cap & (1UL << DSA_OPCODE_COMPARE)))
 		return -1;
 	return 0;
@@ -1468,7 +1541,12 @@ static int hot_dsa_open(struct hot_apply_ctx *ctx)
 		u32 wq_max_xfer;
 
 		if (hot_dsa_wq_supports_compare(paths[i])) {
-			pr_err("DSA hot apply WQ/device doesn't advertise COMPARE: %s\n",
+			pr_err("DSA hot apply WQ/device doesn't advertise BATCH+COMPARE: %s\n",
+			       paths[i]);
+			goto err;
+		}
+		if (hot_dsa_wq_batch_capability(paths[i])) {
+			pr_err("DSA hot apply WQ does not provide shared BATCH(32)+COMPARE: %s\n",
 			       paths[i]);
 			goto err;
 		}
@@ -1563,6 +1641,7 @@ static int hot_dsa_submit_ptr(struct hot_apply_ctx *ctx, uint8_t opcode,
 	}
 
 	start_us = hot_now_us();
+	hot_dsa_release_descriptors();
 	for (retry_count = 0; retry_count < HOT_DSA_MAX_ENQ_RETRY; retry_count++) {
 		off = ((ctx->dsa_portal_offset[wq_idx]++ << 6) & 0xfffUL);
 		slot = (void *)(portal_mask | off);
@@ -2533,7 +2612,9 @@ int page_xfer_hot_prepare_before_freeze(unsigned long img_id)
 	 * this context owns the COMPARE portals used after thaw. */
 	if (ctx->profile)
 		phase_start_us = dsa_profile_wall_now_us();
-	if (hot_dsa_open(ctx))
+	if ((ctx->fg_compare_backend == HOT_FG_COMPARE_DSA ||
+	     ctx->fg_compare_backend == HOT_FG_COMPARE_VALIDATE) &&
+	    hot_dsa_open(ctx))
 		goto err;
 	if (ctx->profile)
 		wq_us = dsa_profile_delta_us(phase_start_us, dsa_profile_wall_now_us());
@@ -2991,6 +3072,7 @@ static void hot_apply_abort(struct page_xfer *xfer)
 	xfree(ctx->vma_segments);
 	xfree(ctx->vma_plans);
 	xfree(ctx->pagemap_plan);
+	free(ctx->compare_batches);
 	xfree(ctx);
 	xfer->hot_apply = NULL;
 }
@@ -3072,7 +3154,10 @@ static int hot_apply_prepare_post_thaw(struct hot_apply_ctx *ctx)
 	if (ctx->fine_output) {
 		if (hot_fg_open_sidecar(ctx))
 			return -1;
-		if (!ctx->pre_freeze_ready && hot_dsa_open(ctx))
+		if (!ctx->pre_freeze_ready &&
+		    (ctx->fg_compare_backend == HOT_FG_COMPARE_DSA ||
+		     ctx->fg_compare_backend == HOT_FG_COMPARE_VALIDATE) &&
+		    hot_dsa_open(ctx))
 			return -1;
 	}
 	if (!ctx->memory_next_path || !ctx->memory_next_path[0]) {
@@ -3213,6 +3298,16 @@ static void hot_service_profile_reset_generation(struct hot_apply_ctx *ctx)
 	ctx->profile_compare_poll_sweeps = 0;
 	ctx->profile_compare_not_ready = 0;
 	ctx->profile_compare_max_active = 0;
+	ctx->profile_batch_outer_submits = 0;
+	ctx->profile_batch_child_submits = 0;
+	ctx->profile_batch_partial_submits = 0;
+	ctx->profile_batch_single_tail_submits = 0;
+	ctx->profile_batch_outer_success = 0;
+	ctx->profile_batch_outer_fail = 0;
+	ctx->profile_batch_child_success = 0;
+	ctx->profile_batch_child_nobof = 0;
+	ctx->profile_batch_max_active_outer = 0;
+	ctx->profile_batch_max_active_children = 0;
 	ctx->profile_completions_harvested = 0;
 	ctx->profile_completion_timeout_count = 0;
 	ctx->profile_max_completion_age_us = 0;
@@ -3328,6 +3423,17 @@ static void hot_service_profile_snapshot(
 	profile->poll_sweeps = ctx->profile_compare_poll_sweeps;
 	profile->not_ready = ctx->profile_compare_not_ready;
 	profile->max_active = ctx->profile_compare_max_active;
+	profile->batch_outer_submits = ctx->profile_batch_outer_submits;
+	profile->batch_child_submits = ctx->profile_batch_child_submits;
+	profile->batch_partial_submits = ctx->profile_batch_partial_submits;
+	profile->batch_single_tail_submits =
+		ctx->profile_batch_single_tail_submits;
+	profile->batch_outer_success = ctx->profile_batch_outer_success;
+	profile->batch_outer_fail = ctx->profile_batch_outer_fail;
+	profile->batch_child_success = ctx->profile_batch_child_success;
+	profile->batch_child_nobof = ctx->profile_batch_child_nobof;
+	profile->batch_max_active_outer = ctx->profile_batch_max_active_outer;
+	profile->batch_max_active_children = ctx->profile_batch_max_active_children;
 	profile->completions_harvested = ctx->profile_completions_harvested;
 	profile->completion_timeout_count = ctx->profile_completion_timeout_count;
 	profile->max_completion_age_us = ctx->profile_max_completion_age_us;
@@ -3533,7 +3639,7 @@ static void dsa_memory_service_profile_emit(struct page_xfer *xfer, int ret)
 		xfer->dsa_fg_profile_ipc_apply_us >= p->hot_apply_us ?
 		xfer->dsa_fg_profile_ipc_apply_us - p->hot_apply_us : 0;
 
-	pr_info("DSA_POST_THAW_PROFILE_TIME: version=13 pages_id=%u backend=%s ret=%d service_enabled=1 service_profile_enabled=%u service_mapping_warm=%u total_us=%" PRIu64 " result_request_publish_us=%" PRIu64 " ipc_compare_us=%" PRIu64 " ipc_compare_overhead_us=%" PRIu64 " service_compare_wall_us=%" PRIu64 " service_compare_cpu_us=%" PRIu64 " service_hot_reconcile_us=%" PRIu64 " service_raw_index_us=%" PRIu64 " service_span_build_us=%" PRIu64 " raw_index_us=%" PRIu64 " span_build_us=%" PRIu64 " service_cold_prepare_us=0 compare_wall_us=%" PRIu64 " compare_thread_cpu_us=%" PRIu64 " compare_engine_wall_us=%" PRIu64 " compare_engine_cpu_us=%" PRIu64 " service_result_publish_us=%" PRIu64 " compare_breakdown=%u parent_prefault_wall_us=%" PRIu64 " parent_prefault_cpu_us=%" PRIu64 " compare_core_wall_us=%" PRIu64 " compare_core_cpu_us=%" PRIu64 " sidecar_us=%" PRIu64 " output_wall_us=%" PRIu64 " sidecar_preflight_us=%" PRIu64 " sidecar_serialize_us=%" PRIu64 " sidecar_idx_write_us=%" PRIu64 " sidecar_dat_write_us=%" PRIu64 " pagemap_us=%" PRIu64 " finish_us=%" PRIu64 " ipc_apply_us=%" PRIu64 " ipc_apply_overhead_us=%" PRIu64 " service_hot_apply_us=%" PRIu64 " service_hot_apply_cpu_us=%" PRIu64 " service_apply_validate_us=%" PRIu64 " service_apply_materialize_us=%" PRIu64 " service_apply_store_us=%" PRIu64 " service_apply_manifest_finish_us=%" PRIu64 " service_apply_manifest_close_us=%" PRIu64 " accounted_us=%" PRIu64 " unaccounted_us=%" PRIu64 " ledger_overrun=%u\n",
+	pr_info("DSA_POST_THAW_PROFILE_TIME: version=14 pages_id=%u backend=%s ret=%d service_enabled=1 service_profile_enabled=%u service_mapping_warm=%u total_us=%" PRIu64 " result_request_publish_us=%" PRIu64 " ipc_compare_us=%" PRIu64 " ipc_compare_overhead_us=%" PRIu64 " service_compare_wall_us=%" PRIu64 " service_compare_cpu_us=%" PRIu64 " service_hot_reconcile_us=%" PRIu64 " service_raw_index_us=%" PRIu64 " service_span_build_us=%" PRIu64 " raw_index_us=%" PRIu64 " span_build_us=%" PRIu64 " service_cold_prepare_us=0 compare_wall_us=%" PRIu64 " compare_thread_cpu_us=%" PRIu64 " compare_engine_wall_us=%" PRIu64 " compare_engine_cpu_us=%" PRIu64 " service_result_publish_us=%" PRIu64 " compare_breakdown=%u parent_prefault_wall_us=%" PRIu64 " parent_prefault_cpu_us=%" PRIu64 " compare_core_wall_us=%" PRIu64 " compare_core_cpu_us=%" PRIu64 " sidecar_us=%" PRIu64 " output_wall_us=%" PRIu64 " sidecar_preflight_us=%" PRIu64 " sidecar_serialize_us=%" PRIu64 " sidecar_idx_write_us=%" PRIu64 " sidecar_dat_write_us=%" PRIu64 " pagemap_us=%" PRIu64 " finish_us=%" PRIu64 " ipc_apply_us=%" PRIu64 " ipc_apply_overhead_us=%" PRIu64 " service_hot_apply_us=%" PRIu64 " service_hot_apply_cpu_us=%" PRIu64 " service_apply_validate_us=%" PRIu64 " service_apply_materialize_us=%" PRIu64 " service_apply_store_us=%" PRIu64 " service_apply_manifest_finish_us=%" PRIu64 " service_apply_manifest_close_us=%" PRIu64 " accounted_us=%" PRIu64 " unaccounted_us=%" PRIu64 " ledger_overrun=%u\n",
 		xfer->pages_id, backend, ret, p->enabled, p->mapping_warm, total_us,
 		xfer->dsa_fg_profile_request_publish_us,
 		xfer->dsa_fg_profile_ipc_compare_us,
@@ -3562,7 +3668,7 @@ static void dsa_memory_service_profile_emit(struct page_xfer *xfer, int ret)
 		xfer->dsa_fg_service_diag.apply_manifest_finish_wall_us,
 		xfer->dsa_fg_service_diag.apply_manifest_close_wall_us,
 		accounted_us, unaccounted_us, accounted_us > total_us ? 1 : 0);
-	pr_info("DSA_POST_THAW_PROFILE_COUNT: version=13 pages_id=%u backend=%s ret=%d service_enabled=1 service_profile_enabled=%u service_mapping_warm=%u raw_pages=%" PRIu64 " raw_bytes=%" PRIu64 " capture_runs=%" PRIu64 " spans=%" PRIu64 " span_pages=%" PRIu64 " max_span_pages=%" PRIu64 " compare_ops=%" PRIu64 " dsa_compare_ops=%" PRIu64 " memcmp_calls=%" PRIu64 " memcmp_requested_bytes=%" PRIu64 " memcmp_scalar_bytes=%" PRIu64 " scalar64_calls=%" PRIu64 " scalar64_word_ops=%" PRIu64 " scalar64_refine_bytes=%" PRIu64 " scalar64_tail_bytes=%" PRIu64 " scalar64_bytes_examined=%" PRIu64 " simd_vector_ops=%" PRIu64 " simd_bytes_examined=%" PRIu64 " hybrid_dsa_claim_spans=%" PRIu64 " hybrid_dsa_claim_pages=%" PRIu64 " hybrid_cpu_claim_spans=%" PRIu64 " hybrid_cpu_claim_pages=%" PRIu64 " hybrid_cpu_waves=%" PRIu64 " hybrid_dsa_to_cpu_handoff_spans=%" PRIu64 " hybrid_dsa_to_cpu_handoff_pages=%" PRIu64 " hybrid_dsa_to_cpu_handoff_remaining_bytes=%" PRIu64 " hybrid_unclaimed_empty_count=%" PRIu64 " compare_nobof_faults=%" PRIu64 " compare_nobof_fault_source1=%" PRIu64 " compare_nobof_fault_source2=%" PRIu64 " compare_nobof_equal_prefix_bytes=%" PRIu64 " compare_fault_handoff_spans=%" PRIu64 " compare_fault_handoff_pages=%" PRIu64 " compare_fault_handoff_remaining_bytes=%" PRIu64 " compare_fault_queue_max=%" PRIu64 " compare_fresh_claim_throttles=%" PRIu64 " compare_cpu_fault_waves=%" PRIu64 " dsa_logical_progress_bytes=%" PRIu64 " simd_logical_progress_bytes=%" PRIu64 " normal_simd_logical_progress_bytes=%" PRIu64 " fault_simd_logical_progress_bytes=%" PRIu64 " dsa_fresh_submit_ops=%" PRIu64 " dsa_continuation_submit_ops=%" PRIu64 " dsa_submitted_bytes=%" PRIu64 " simd_progress_while_dsa_active_bytes=%" PRIu64 " simd_quanta_while_dsa_active=%" PRIu64 " dsa_fresh_claim_bytes=%" PRIu64 " dsa_active_zero_while_normal_cpu_work=%" PRIu64 " ready_completions_before_simd=%" PRIu64 " ready_completions_after_simd=%" PRIu64 " scheduler_iterations=%" PRIu64 " dsa_refill_samples=%" PRIu64 " post_refill_active_sum=%" PRIu64 " post_refill_active_lt_32=%" PRIu64 " post_refill_active_lt_64=%" PRIu64 " post_refill_active_lt_96=%" PRIu64 " fresh_refill_spans=%" PRIu64 " fresh_refill_batches=%" PRIu64 " fresh_refill_blocked_fault_debt=%" PRIu64 " dsa_empty_with_claimable_fresh=%" PRIu64 " prq_profile_available=%u prq_profile_sources=%u prq_pg_requests=%" PRIu64 " prq_thread_cpu_us=%" PRIu64 " prq_setup_errno=%d enq_retries=%" PRIu64 " poll_sweeps=%" PRIu64 " not_ready=%" PRIu64 " max_active=%" PRIu64 " completions_harvested=%" PRIu64 " completion_timeout_count=%" PRIu64 " max_completion_age_us=%" PRIu64 " prefault_spans=%" PRIu64 " prefault_pages=%" PRIu64 " parent_pages=%" PRIu64 " patch_pages=%" PRIu64 " full_pages=%" PRIu64 " patch_ranges=%" PRIu64 " patch_bytes=%" PRIu64 " idx_write_calls=%" PRIu64 " idx_bytes=%" PRIu64 " dat_write_calls=%" PRIu64 " dat_writev_calls=%" PRIu64 " dat_bytes=%" PRIu64 " idx_write_syscalls=%" PRIu64 " dat_write_syscalls=%" PRIu64 " dat_writev_syscalls=%" PRIu64 " sidecar_lseek_syscalls=%" PRIu64 " pagemap_records=%" PRIu64 " pagemap_bytes=%" PRIu64 "\n",
+	pr_info("DSA_POST_THAW_PROFILE_COUNT: version=14 pages_id=%u backend=%s ret=%d service_enabled=1 service_profile_enabled=%u service_mapping_warm=%u raw_pages=%" PRIu64 " raw_bytes=%" PRIu64 " capture_runs=%" PRIu64 " spans=%" PRIu64 " span_pages=%" PRIu64 " max_span_pages=%" PRIu64 " compare_ops=%" PRIu64 " dsa_compare_ops=%" PRIu64 " memcmp_calls=%" PRIu64 " memcmp_requested_bytes=%" PRIu64 " memcmp_scalar_bytes=%" PRIu64 " scalar64_calls=%" PRIu64 " scalar64_word_ops=%" PRIu64 " scalar64_refine_bytes=%" PRIu64 " scalar64_tail_bytes=%" PRIu64 " scalar64_bytes_examined=%" PRIu64 " simd_vector_ops=%" PRIu64 " simd_bytes_examined=%" PRIu64 " hybrid_dsa_claim_spans=%" PRIu64 " hybrid_dsa_claim_pages=%" PRIu64 " hybrid_cpu_claim_spans=%" PRIu64 " hybrid_cpu_claim_pages=%" PRIu64 " hybrid_cpu_waves=%" PRIu64 " hybrid_dsa_to_cpu_handoff_spans=%" PRIu64 " hybrid_dsa_to_cpu_handoff_pages=%" PRIu64 " hybrid_dsa_to_cpu_handoff_remaining_bytes=%" PRIu64 " hybrid_unclaimed_empty_count=%" PRIu64 " compare_nobof_faults=%" PRIu64 " compare_nobof_fault_source1=%" PRIu64 " compare_nobof_fault_source2=%" PRIu64 " compare_nobof_equal_prefix_bytes=%" PRIu64 " compare_fault_handoff_spans=%" PRIu64 " compare_fault_handoff_pages=%" PRIu64 " compare_fault_handoff_remaining_bytes=%" PRIu64 " compare_fault_queue_max=%" PRIu64 " compare_fresh_claim_throttles=%" PRIu64 " compare_cpu_fault_waves=%" PRIu64 " dsa_logical_progress_bytes=%" PRIu64 " simd_logical_progress_bytes=%" PRIu64 " normal_simd_logical_progress_bytes=%" PRIu64 " fault_simd_logical_progress_bytes=%" PRIu64 " dsa_fresh_submit_ops=%" PRIu64 " dsa_continuation_submit_ops=%" PRIu64 " dsa_submitted_bytes=%" PRIu64 " simd_progress_while_dsa_active_bytes=%" PRIu64 " simd_quanta_while_dsa_active=%" PRIu64 " dsa_fresh_claim_bytes=%" PRIu64 " dsa_active_zero_while_normal_cpu_work=%" PRIu64 " ready_completions_before_simd=%" PRIu64 " ready_completions_after_simd=%" PRIu64 " scheduler_iterations=%" PRIu64 " dsa_refill_samples=%" PRIu64 " post_refill_active_sum=%" PRIu64 " post_refill_active_lt_32=%" PRIu64 " post_refill_active_lt_64=%" PRIu64 " post_refill_active_lt_96=%" PRIu64 " fresh_refill_spans=%" PRIu64 " fresh_refill_batches=%" PRIu64 " fresh_refill_blocked_fault_debt=%" PRIu64 " dsa_empty_with_claimable_fresh=%" PRIu64 " batch_outer_submits=%" PRIu64 " batch_child_submits=%" PRIu64 " batch_partial_submits=%" PRIu64 " batch_single_tail_submits=%" PRIu64 " batch_outer_success=%" PRIu64 " batch_outer_fail=%" PRIu64 " batch_child_success=%" PRIu64 " batch_child_nobof=%" PRIu64 " batch_max_active_outer=%" PRIu64 " batch_max_active_children=%" PRIu64 " prq_profile_available=%u prq_profile_sources=%u prq_pg_requests=%" PRIu64 " prq_thread_cpu_us=%" PRIu64 " prq_setup_errno=%d enq_retries=%" PRIu64 " poll_sweeps=%" PRIu64 " not_ready=%" PRIu64 " max_active=%" PRIu64 " completions_harvested=%" PRIu64 " completion_timeout_count=%" PRIu64 " max_completion_age_us=%" PRIu64 " prefault_spans=%" PRIu64 " prefault_pages=%" PRIu64 " parent_pages=%" PRIu64 " patch_pages=%" PRIu64 " full_pages=%" PRIu64 " patch_ranges=%" PRIu64 " patch_bytes=%" PRIu64 " idx_write_calls=%" PRIu64 " idx_bytes=%" PRIu64 " dat_write_calls=%" PRIu64 " dat_writev_calls=%" PRIu64 " dat_bytes=%" PRIu64 " idx_write_syscalls=%" PRIu64 " dat_write_syscalls=%" PRIu64 " dat_writev_syscalls=%" PRIu64 " sidecar_lseek_syscalls=%" PRIu64 " pagemap_records=%" PRIu64 " pagemap_bytes=%" PRIu64 "\n",
 		xfer->pages_id, backend, ret, p->enabled, p->mapping_warm,
 		p->raw_pages, p->raw_bytes, p->capture_runs, p->spans,
 		p->span_pages, p->max_span_pages, p->compare_ops, p->compare_ops,
@@ -3600,6 +3706,11 @@ static void dsa_memory_service_profile_emit(struct page_xfer *xfer, int ret)
 		p->fresh_refill_spans, p->fresh_refill_batches,
 		p->fresh_refill_blocked_fault_debt,
 		p->dsa_empty_with_claimable_fresh,
+		p->batch_outer_submits, p->batch_child_submits,
+		p->batch_partial_submits, p->batch_single_tail_submits,
+		p->batch_outer_success, p->batch_outer_fail,
+		p->batch_child_success, p->batch_child_nobof,
+		p->batch_max_active_outer, p->batch_max_active_children,
 		p->prq_profile_available,
 		p->prq_profile_sources, p->prq_pg_requests,
 		p->prq_thread_cpu_us, p->prq_setup_errno, p->enq_retries,
@@ -5111,6 +5222,29 @@ struct hot_fg_compare_slot {
 	bool active;
 };
 
+struct hot_fg_compare_child_meta {
+	struct hot_fg_compare_span *span;
+	u32 submitted_cursor;
+	u32 submitted_len;
+	u64 submit_sequence;
+};
+
+struct hot_fg_compare_batch {
+	struct dsa_hw_desc child_desc[HOT_DSA_COMPARE_BATCH_CHILDREN]
+		__attribute__((aligned(64)));
+	volatile struct dsa_completion_record child_comp[HOT_DSA_COMPARE_BATCH_CHILDREN]
+		__attribute__((aligned(32)));
+	struct hot_fg_compare_child_meta child[HOT_DSA_COMPARE_BATCH_CHILDREN];
+	struct dsa_hw_desc outer_desc __attribute__((aligned(64)));
+	volatile struct dsa_completion_record outer_comp __attribute__((aligned(32)));
+	u32 child_count;
+	u32 wq_idx;
+	u64 submit_ns;
+	u64 completion_deadline_ns;
+	bool direct_single;
+	bool active;
+};
+
 enum hot_fg_compare_span_state {
 	HOT_FG_SPAN_UNPREFAULTED = 0,
 	HOT_FG_SPAN_READY,
@@ -5687,6 +5821,7 @@ static int hot_fg_compare_submit(struct hot_apply_ctx *ctx,
 	slot->desc.xfer_size = slot->submitted_len;
 	slot->desc.completion_addr = (uint64_t)(unsigned long)&slot->comp;
 
+	hot_dsa_release_descriptors();
 	for (retry = 0; retry < HOT_DSA_MAX_ENQ_RETRY; retry++) {
 		void *portal_slot;
 
@@ -6507,7 +6642,7 @@ static int hot_fg_compare_fault_page_simd(struct hot_apply_ctx *ctx,
 	return 0;
 }
 
-static int hot_fg_compare_wavefront(struct hot_apply_ctx *ctx,
+static int __attribute__((unused)) hot_fg_compare_wavefront(struct hot_apply_ctx *ctx,
 				    struct hot_fg_raw_page *pages,
 				    struct hot_fg_compare_span *spans, size_t nr_spans)
 {
@@ -6685,6 +6820,431 @@ out:
 	if (active && hot_fg_wavefront_drain_slots(slots, &active))
 		ret = -1;
 	hot_fg_ready_queue_fini(&ready);
+	return ret;
+}
+
+static int hot_fg_compare_batch_prepare_child(
+	struct hot_apply_ctx *ctx, struct hot_fg_compare_batch *batch, u32 child,
+	struct hot_fg_compare_span *span, u64 sequence)
+{
+	struct dsa_hw_desc *desc = &batch->child_desc[child];
+	struct hot_fg_compare_child_meta *meta = &batch->child[child];
+
+	if (!span || !span->parent || span->state != HOT_FG_SPAN_READY ||
+	    span->cursor >= span->length || child >= HOT_DSA_COMPARE_BATCH_CHILDREN)
+		return -1;
+	memset(desc, 0, sizeof(*desc));
+	memset((void *)&batch->child_comp[child], 0,
+	       sizeof(batch->child_comp[child]));
+	meta->span = span;
+	meta->submitted_cursor = span->cursor;
+	meta->submitted_len = span->length - span->cursor;
+	if (meta->submitted_len > ctx->dsa_max_transfer_size)
+		meta->submitted_len = ctx->dsa_max_transfer_size;
+	if (!meta->submitted_len)
+		return -1;
+	meta->submit_sequence = sequence;
+	desc->opcode = DSA_OPCODE_COMPARE;
+	desc->flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
+	desc->src_addr = (u64)(unsigned long)(span->raw + span->cursor);
+	desc->src2_addr = (u64)(unsigned long)(span->parent + span->cursor);
+	desc->xfer_size = meta->submitted_len;
+	desc->completion_addr = (u64)(unsigned long)&batch->child_comp[child];
+	span->state = HOT_FG_SPAN_ACTIVE;
+	return 0;
+}
+
+static int hot_fg_compare_batch_prepare_outer(struct hot_apply_ctx *ctx,
+					      struct hot_fg_compare_batch *batch)
+{
+	if (!batch->child_count || batch->child_count > HOT_DSA_COMPARE_BATCH_CHILDREN ||
+	    !ctx->dsa_wq_count)
+		return -1;
+	batch->wq_idx = ctx->dsa_next_wq++ % (u32)ctx->dsa_wq_count;
+	batch->direct_single = batch->child_count == 1;
+	if (!batch->direct_single) {
+		memset(&batch->outer_desc, 0, sizeof(batch->outer_desc));
+		memset((void *)&batch->outer_comp, 0, sizeof(batch->outer_comp));
+		batch->outer_desc.opcode = DSA_OPCODE_BATCH;
+		batch->outer_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
+		batch->outer_desc.desc_list_addr =
+			(u64)(unsigned long)&batch->child_desc[0];
+		batch->outer_desc.desc_count = batch->child_count;
+		batch->outer_desc.completion_addr =
+			(u64)(unsigned long)&batch->outer_comp;
+	}
+	return 0;
+}
+
+/* All descriptor and completion-record stores for the current refill group
+ * must be released by one hot_dsa_release_descriptors() before entering this
+ * helper.  ENQCMD retry does not need another fence because the descriptor is
+ * immutable between attempts. */
+static int hot_fg_compare_batch_submit_released(
+	struct hot_apply_ctx *ctx, struct hot_fg_compare_batch *batch, u64 submit_ns)
+{
+	u32 retry;
+	unsigned long portal_mask;
+	unsigned long off;
+	const void *submitted_desc;
+	u32 i;
+
+	if (!batch->child_count || batch->child_count > HOT_DSA_COMPARE_BATCH_CHILDREN ||
+	    batch->active || batch->wq_idx >= (u32)ctx->dsa_wq_count)
+		return -1;
+	portal_mask = ((unsigned long)ctx->dsa_portals[batch->wq_idx]) & ~0xfffUL;
+	submitted_desc = batch->direct_single ?
+		(const void *)&batch->child_desc[0] : (const void *)&batch->outer_desc;
+
+	for (retry = 0; retry < HOT_DSA_MAX_ENQ_RETRY; retry++) {
+		void *portal_slot;
+
+		off = ((ctx->dsa_portal_offset[batch->wq_idx]++ << 6) & 0xfffUL);
+		portal_slot = (void *)(portal_mask | off);
+		if (hot_dsa_enqcmd(portal_slot, submitted_desc) == 0)
+			break;
+		hot_dsa_cpu_relax();
+	}
+	if (retry == HOT_DSA_MAX_ENQ_RETRY) {
+		pr_err("DSA fine-grained hardware-BATCH enqcmd timed out\n");
+		return -1;
+	}
+	batch->submit_ns = submit_ns;
+	batch->completion_deadline_ns = submit_ns + HOT_DSA_COMPLETION_TIMEOUT_NS;
+	batch->active = true;
+	if (ctx->profile) {
+		ctx->dsa_enqcmd++;
+		ctx->profile_compare_enq_retries += retry;
+		ctx->profile_batch_child_submits += batch->child_count;
+		if (batch->direct_single)
+			ctx->profile_batch_single_tail_submits++;
+		else {
+			ctx->profile_batch_outer_submits++;
+			if (batch->child_count < HOT_DSA_COMPARE_BATCH_CHILDREN)
+				ctx->profile_batch_partial_submits++;
+		}
+		for (i = 0; i < batch->child_count; i++) {
+			ctx->fg_compare_ops++;
+			ctx->profile_dsa_submitted_bytes += batch->child[i].submitted_len;
+			if (batch->child[i].submitted_cursor)
+				ctx->profile_dsa_continuation_submit_ops++;
+			else
+				ctx->profile_dsa_fresh_submit_ops++;
+		}
+	}
+	return 0;
+}
+
+static bool hot_fg_compare_batch_ready(const struct hot_fg_compare_batch *batch)
+{
+	if (!batch->active)
+		return false;
+	if (batch->direct_single)
+		return __atomic_load_n(&batch->child_comp[0].status,
+				       __ATOMIC_ACQUIRE) != 0;
+	return __atomic_load_n(&batch->outer_comp.status, __ATOMIC_ACQUIRE) != 0;
+}
+
+static int hot_fg_compare_batch_harvest(
+	struct hot_apply_ctx *ctx, struct hot_fg_compare_batch *batch,
+	struct hot_fg_raw_page *pages, struct hot_fg_compare_span *spans,
+	struct hot_fg_ready_queue *ready, size_t *done, u64 now_ns)
+{
+	u32 i;
+	bool saw_nobof = false;
+	u32 outer_code = DSA_COMP_SUCCESS;
+
+	if (!hot_fg_compare_batch_ready(batch))
+		return 0;
+	if (!batch->direct_single) {
+		outer_code = DSA_COMP_STATUS(batch->outer_comp.status);
+		if ((outer_code != DSA_COMP_SUCCESS &&
+		     outer_code != DSA_COMP_BATCH_FAIL) ||
+		    batch->outer_comp.descs_completed != batch->child_count) {
+			pr_err("DSA COMPARE BATCH outer failed code=%u completed=%u expected=%u\n",
+			       outer_code, batch->outer_comp.descs_completed,
+			       batch->child_count);
+			return -1;
+		}
+	}
+
+	for (i = 0; i < batch->child_count; i++) {
+		struct hot_fg_compare_child_meta *meta = &batch->child[i];
+		struct hot_fg_compare_span *span = meta->span;
+		struct hot_fg_compare_slot view;
+		enum hot_fg_nobof_completion kind;
+		u32 diff = 0;
+		u32 old_cursor;
+
+		memset(&view, 0, sizeof(view));
+		view.desc = batch->child_desc[i];
+		memcpy((void *)&view.comp, (const void *)&batch->child_comp[i],
+		       sizeof(view.comp));
+		view.span = span;
+		view.submitted_cursor = meta->submitted_cursor;
+		view.submitted_len = meta->submitted_len;
+		view.wq_idx = batch->wq_idx;
+		view.submit_sequence = meta->submit_sequence;
+		view.submit_ns = batch->submit_ns;
+		view.completion_deadline_ns = batch->completion_deadline_ns;
+		if (hot_fg_compare_complete_nobof(&view, &kind, &diff) ||
+		    kind == HOT_FG_NOBOF_NOT_READY) {
+			pr_err("DSA COMPARE BATCH child is not terminal child=%u\n", i);
+			return -1;
+		}
+		if (!span || span->state != HOT_FG_SPAN_ACTIVE ||
+		    meta->submitted_cursor != span->cursor) {
+			pr_err("DSA COMPARE BATCH child has stale span cursor child=%u\n", i);
+			return -1;
+		}
+		if (ctx->profile && now_ns >= batch->submit_ns) {
+			u64 age_us = (now_ns - batch->submit_ns) / 1000ULL;
+			if (age_us > ctx->profile_max_completion_age_us)
+				ctx->profile_max_completion_age_us = age_us;
+		}
+		old_cursor = span->cursor;
+		if (kind == HOT_FG_NOBOF_EQUAL) {
+			span->cursor += meta->submitted_len;
+			if (hot_fg_span_finalize(span, pages, span->cursor))
+				return -1;
+			if (ctx->profile) {
+				ctx->profile_dsa_logical_progress_bytes += meta->submitted_len;
+				ctx->profile_batch_child_success++;
+			}
+		} else if (kind == HOT_FG_NOBOF_DIFFERENT) {
+			diff += meta->submitted_cursor;
+			if (hot_fg_span_record_diff(span, pages, diff))
+				return -1;
+			if (ctx->profile) {
+				ctx->profile_dsa_logical_progress_bytes += span->cursor - old_cursor;
+				ctx->profile_batch_child_success++;
+			}
+		} else {
+			saw_nobof = true;
+			if (hot_fg_compare_fault_page_simd(ctx, pages, span, &view))
+				return -1;
+			if (ctx->profile)
+				ctx->profile_batch_child_nobof++;
+		}
+
+		if (span->cursor == span->length) {
+			if (hot_fg_span_finalize(span, pages, span->length) ||
+			    span->finalized_pages != span->page_count)
+				return -1;
+			span->state = HOT_FG_SPAN_DONE;
+			(*done)++;
+		} else {
+			span->state = HOT_FG_SPAN_READY;
+			if (hot_fg_ready_queue_push(ready, (size_t)(span - spans)))
+				return -1;
+		}
+	}
+	if (!batch->direct_single) {
+		if ((outer_code == DSA_COMP_BATCH_FAIL) != saw_nobof) {
+			pr_err("DSA COMPARE BATCH outer/child status mismatch outer=%u nobof=%u\n",
+			       outer_code, saw_nobof ? 1U : 0U);
+			return -1;
+		}
+		if (ctx->profile) {
+			if (outer_code == DSA_COMP_SUCCESS)
+				ctx->profile_batch_outer_success++;
+			else
+				ctx->profile_batch_outer_fail++;
+		}
+	}
+	batch->active = false;
+	batch->child_count = 0;
+	return 1;
+}
+
+static void hot_fg_compare_batch_timeout(
+	const struct hot_fg_compare_batch *batch, size_t active, u64 now_ns)
+{
+	u64 age_us = now_ns >= batch->submit_ns ?
+		(now_ns - batch->submit_ns) / 1000ULL : 0;
+
+	pr_err("CDP_DSA_COMPLETION_TIMEOUT: stage=compare-batch exit=%u wq=%u age_us=%" PRIu64
+	       " active_outer=%zu child_count=%u outer_status=%u\n",
+	       CDP_DSA_COMPLETION_TIMEOUT_EXIT, batch->wq_idx, age_us, active,
+	       batch->child_count,
+	       batch->direct_single ?
+		(unsigned int)__atomic_load_n(&batch->child_comp[0].status,
+					 __ATOMIC_ACQUIRE) :
+		(unsigned int)__atomic_load_n(&batch->outer_comp.status,
+					 __ATOMIC_ACQUIRE));
+	_exit(CDP_DSA_COMPLETION_TIMEOUT_EXIT);
+}
+
+static int hot_fg_compare_hw_batch(struct hot_apply_ctx *ctx,
+				   struct hot_fg_raw_page *pages,
+				   struct hot_fg_compare_span *spans,
+				   size_t nr_spans)
+{
+	struct hot_fg_compare_batch *batches;
+	struct hot_fg_ready_queue ready;
+	size_t active_outer = 0;
+	size_t active_children = 0;
+	size_t done = 0;
+	u64 sequence = 0;
+	size_t i;
+	int ret = -1;
+
+	if (!nr_spans)
+		return 0;
+	if (!ctx->compare_batches) {
+		if (posix_memalign((void **)&ctx->compare_batches, 64,
+				   HOT_DSA_COMPARE_INFLIGHT *
+					   sizeof(*ctx->compare_batches)))
+			return -1;
+		memset(ctx->compare_batches, 0,
+		       HOT_DSA_COMPARE_INFLIGHT * sizeof(*ctx->compare_batches));
+	}
+	batches = ctx->compare_batches;
+	for (i = 0; i < HOT_DSA_COMPARE_INFLIGHT; i++) {
+		if (batches[i].active) {
+			pr_err("DSA hardware-BATCH compare pool still has active outer=%zu\n",
+			       i);
+			return -1;
+		}
+		batches[i].child_count = 0;
+		batches[i].direct_single = false;
+	}
+	if (hot_fg_ready_queue_init(&ready, spans, nr_spans))
+		goto out;
+	for (i = 0; i < nr_spans; i++) {
+		if (spans[i].state == HOT_FG_SPAN_UNPREFAULTED)
+			spans[i].state = HOT_FG_SPAN_READY;
+		else if (!ctx->compare_breakdown ||
+			 spans[i].state != HOT_FG_SPAN_READY)
+			goto out_queue;
+		if (hot_fg_ready_queue_push(&ready, i))
+			goto out_queue;
+	}
+
+	while (done < nr_spans) {
+		u64 now_ns = hot_dsa_watchdog_now_ns();
+		u32 prepared[HOT_DSA_COMPARE_INFLIGHT];
+		size_t prepared_count = 0;
+		size_t harvested = 0;
+		bool submitted = false;
+
+		if (!now_ns)
+			goto out_queue;
+		if (ctx->profile && active_outer)
+			ctx->profile_compare_poll_sweeps++;
+		for (i = 0; i < HOT_DSA_COMPARE_INFLIGHT; i++) {
+			struct hot_fg_compare_batch *batch = &batches[i];
+			int rc;
+
+			if (!batch->active)
+				continue;
+			if (!hot_fg_compare_batch_ready(batch)) {
+				if (now_ns >= batch->completion_deadline_ns)
+					hot_fg_compare_batch_timeout(batch, active_outer, now_ns);
+				continue;
+			}
+			rc = hot_fg_compare_batch_harvest(ctx, batch, pages, spans,
+							  &ready, &done, now_ns);
+			if (rc < 0)
+				goto out_queue;
+			if (rc > 0) {
+				active_outer--;
+				harvested++;
+			}
+		}
+		/* harvest resets child_count; recompute the exact active child count
+		 * before refilling rather than maintaining a second failure-prone
+		 * ownership ledger. */
+		active_children = 0;
+		for (i = 0; i < HOT_DSA_COMPARE_INFLIGHT; i++)
+			if (batches[i].active)
+				active_children += batches[i].child_count;
+
+		for (i = 0; i < HOT_DSA_COMPARE_INFLIGHT && ready.nr; i++) {
+			struct hot_fg_compare_batch *batch = &batches[i];
+			u32 count;
+			u32 j;
+
+			if (batch->active)
+				continue;
+			count = ready.nr > HOT_DSA_COMPARE_BATCH_CHILDREN ?
+				HOT_DSA_COMPARE_BATCH_CHILDREN : (u32)ready.nr;
+			if (count == 1 && active_outer)
+				break;
+			batch->child_count = count;
+			for (j = 0; j < count; j++) {
+				size_t span_idx;
+				if (hot_fg_ready_queue_pop(&ready, &span_idx) ||
+				    hot_fg_compare_batch_prepare_child(
+					ctx, batch, j, &spans[span_idx], ++sequence))
+					goto out_queue;
+			}
+			if (hot_fg_compare_batch_prepare_outer(ctx, batch))
+				goto out_queue;
+			prepared[prepared_count++] = (u32)i;
+		}
+		if (prepared_count) {
+			hot_dsa_release_descriptors();
+			for (i = 0; i < prepared_count; i++) {
+				struct hot_fg_compare_batch *batch =
+					&batches[prepared[i]];
+
+				if (hot_fg_compare_batch_submit_released(ctx, batch, now_ns))
+					goto out_queue;
+				active_outer++;
+				active_children += batch->child_count;
+			}
+			submitted = true;
+		}
+		if (ctx->profile) {
+			ctx->profile_completions_harvested += harvested;
+			if (active_outer > ctx->profile_batch_max_active_outer)
+				ctx->profile_batch_max_active_outer = active_outer;
+			if (active_children > ctx->profile_batch_max_active_children)
+				ctx->profile_batch_max_active_children = active_children;
+			if (active_children > ctx->profile_compare_max_active)
+				ctx->profile_compare_max_active = active_children;
+		}
+		if (!active_outer && done < nr_spans && !ready.nr) {
+			pr_err("DSA hardware-BATCH compare lost work done=%zu total=%zu\n",
+			       done, nr_spans);
+			goto out_queue;
+		}
+		if (active_outer && !submitted && !harvested)
+			hot_dsa_cpu_relax();
+	}
+
+	for (i = 0; i < nr_spans; i++)
+		if (spans[i].state != HOT_FG_SPAN_DONE ||
+		    spans[i].cursor != spans[i].length ||
+		    spans[i].finalized_pages != spans[i].page_count)
+			goto out_queue;
+	ret = 0;
+
+out_queue:
+	if (active_outer) {
+		for (;;) {
+			u64 now_ns = hot_dsa_watchdog_now_ns();
+			size_t remaining = 0;
+			for (i = 0; i < HOT_DSA_COMPARE_INFLIGHT; i++) {
+				if (!batches[i].active)
+					continue;
+				if (hot_fg_compare_batch_ready(&batches[i]))
+					batches[i].active = false;
+				else {
+					remaining++;
+					if (!now_ns || now_ns >= batches[i].completion_deadline_ns)
+						hot_fg_compare_batch_timeout(
+							&batches[i], remaining, now_ns);
+				}
+			}
+			if (!remaining)
+				break;
+			hot_dsa_cpu_relax();
+		}
+	}
+	hot_fg_ready_queue_fini(&ready);
+out:
 	return ret;
 }
 
@@ -7070,10 +7630,18 @@ static int hot_fg_encode_raw_wavefront(struct page_xfer *xfer,
 		ctx->profile_capture_runs = capture_run;
 		phase_start_us = dsa_profile_wall_now_us();
 	}
-	max_xfer = ctx->dsa_max_transfer_size & ~(PAGE_SIZE - 1);
-	if (max_xfer < PAGE_SIZE) {
-		pr_err("DSA fine-grained compare max transfer is smaller than one page\n");
-		goto err;
+	if (ctx->fg_compare_backend == HOT_FG_COMPARE_DSA ||
+	    ctx->fg_compare_backend == HOT_FG_COMPARE_VALIDATE) {
+		max_xfer = ctx->dsa_max_transfer_size & ~(PAGE_SIZE - 1);
+		if (max_xfer < PAGE_SIZE) {
+			pr_err("DSA fine-grained compare max transfer is smaller than one page\n");
+			goto err;
+		}
+	} else {
+		/* CPU backends do not open a COMPARE WQ.  Their common span is
+		 * bounded by the u32 wire/state representation rather than by an
+		 * uninitialised DSA device limit. */
+		max_xfer = UINT_MAX & ~(PAGE_SIZE - 1);
 	}
 
 	/* Build compare extents from the real address invariants.  Capture-run
@@ -7102,7 +7670,7 @@ static int hot_fg_encode_raw_wavefront(struct page_xfer *xfer,
 		vma_end = ctx->vma_plans[vma_cursor].end;
 		j = i + 1;
 		length = PAGE_SIZE;
-		while (j < nr && length + PAGE_SIZE <= max_xfer) {
+		while (j < nr && length <= max_xfer - PAGE_SIZE) {
 			struct hot_fg_raw_page *prev = &pages[j - 1];
 			struct hot_fg_raw_page *next = &pages[j];
 
@@ -7178,7 +7746,7 @@ static int hot_fg_encode_raw_wavefront(struct page_xfer *xfer,
 	if (nr_spans) {
 		switch (ctx->fg_compare_backend) {
 		case HOT_FG_COMPARE_DSA:
-			if (hot_fg_compare_wavefront(ctx, pages, spans, nr_spans))
+			if (hot_fg_compare_hw_batch(ctx, pages, spans, nr_spans))
 				goto err;
 			break;
 		case HOT_FG_COMPARE_MEMCMP:
@@ -7190,7 +7758,7 @@ static int hot_fg_encode_raw_wavefront(struct page_xfer *xfer,
 				goto err;
 			break;
 		case HOT_FG_COMPARE_VALIDATE:
-			if (hot_fg_compare_wavefront(ctx, pages, spans, nr_spans) ||
+			if (hot_fg_compare_hw_batch(ctx, pages, spans, nr_spans) ||
 			    hot_fg_compare_cpu(ctx, validate_pages, validate_spans, nr_spans,
 					       HOT_FG_COMPARE_SIMD_AVX512, false) ||
 			    hot_fg_validate_compare_metadata(pages, validate_pages, nr,
@@ -9430,7 +9998,10 @@ static int dsa_ms_prepare_ctx(struct hot_apply_ctx **ctxp,
 		if (hot_memstore_old_map(ctx, &ctx->old_memstore[i]) == MAP_FAILED)
 			goto err;
 	}
-	if (ctx->fine_output && hot_dsa_open(ctx))
+	if (ctx->fine_output &&
+	    (ctx->fg_compare_backend == HOT_FG_COMPARE_DSA ||
+	     ctx->fg_compare_backend == HOT_FG_COMPARE_VALIDATE) &&
+	    hot_dsa_open(ctx))
 		goto err;
 	/* The service stages only hot-memory.<generation>.next.  CDP alone owns
 	 * latest.json and the durable READY commit, so generic CRIU cleanup must

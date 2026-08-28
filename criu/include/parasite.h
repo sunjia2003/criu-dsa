@@ -257,17 +257,20 @@ struct parasite_dump_cgroup_args {
 };
 
 /* DSA dump pages batch structure */
-#define DSA_DUMP_BATCH_SIZE    128
+#define DSA_HW_BATCH_CHILDREN      32U
+#define DSA_HW_BATCH_OUTER_DEPTH   128U
+#define DSA_DUMP_BATCH_SIZE        (DSA_HW_BATCH_CHILDREN * DSA_HW_BATCH_OUTER_DEPTH)
 #define DSA_DUMP_MAX_WQ        16
 #define DSA_SHARED_DATA_ALIGN  4096U
 #define PARASITE_DSA_SHM_HDR_MAGIC   0x4453414dU
-#define PARASITE_DSA_SHM_HDR_VERSION 3U
+#define PARASITE_DSA_SHM_HDR_VERSION 4U
 #define PARASITE_DSA_SHM_F_STREAM    0x1U
 #ifdef CRIU_DSA_ENABLE_LEGACY_SINGLE_RPC
 #define PARASITE_DSA_SHM_F_SINGLE_RPC 0x2U
 #endif
-#define DSA_STREAM_SLOT_COUNT        8U
-#define DSA_STREAM_SLOT_DESC_CAP     DSA_DUMP_BATCH_SIZE
+#define DSA_STREAM_SLOT_COUNT        64U
+#define DSA_STREAM_WAVE_SLOT_COUNT   32U
+#define DSA_STREAM_SLOT_DESC_CAP     128U
 #ifndef DSA_FG_PATCH_SIZE
 #define DSA_FG_PATCH_SIZE            128U
 #endif
@@ -386,6 +389,17 @@ struct parasite_dsa_stream_hdr {
 	u64 result_poll_us;
 	u32 result_submit_enqcmd;
 	u32 result_submit_write;
+	u32 result_batch_outer_submits;
+	u32 result_batch_child_submits;
+	u32 result_batch_partial_submits;
+	u32 result_batch_single_tail_submits;
+	u32 result_batch_outer_success;
+	u32 result_batch_outer_fail;
+	u32 result_batch_child_success;
+	u32 result_batch_child_nobof;
+	u32 result_batch_max_active_outer;
+	u32 result_batch_max_active_children;
+	u32 result_batch_enq_retries;
 	u32 result_raw_faults;
 	u32 result_raw_fault_source;
 	u32 result_raw_fault_destination;
@@ -422,6 +436,17 @@ struct parasite_dsa_dump_pages_args {
 	u32 new_buf_offset;	/* New buffer write offset after this batch */
 	u32 submit_enqcmd;	/* Number of descriptors submitted via enqcmd */
 	u32 submit_write;	/* Number of descriptors submitted via write() */
+	u32 batch_outer_submits;	/* Hardware BATCH portal submissions */
+	u32 batch_child_submits;	/* Logical child descriptor submissions */
+	u32 batch_partial_submits;	/* Hardware BATCH submissions with <32 children */
+	u32 batch_single_tail_submits; /* Deterministic direct one-child tails */
+	u32 batch_outer_success;	/* Successful outer completions */
+	u32 batch_outer_fail;	/* BATCH_FAIL outer completions */
+	u32 batch_child_success;	/* Logical children reaching SUCCESS */
+	u32 batch_child_nobof;	/* Recoverable no-BOF child completions */
+	u32 batch_max_active_outer;	/* Maximum accepted outer descriptors */
+	u32 batch_max_active_children;	/* Maximum logical children in flight */
+	u32 batch_enq_retries;	/* Shared-WQ ENQCMD admission retries */
 	u32 map_populate_fallbacks;	/* MAP_POPULATE -> MAP_SHARED fallbacks */
 	u32 raw_faults;	/* Recoverable raw MEMMOVE page faults */
 	u32 raw_fault_source;	/* Raw source operand page faults */

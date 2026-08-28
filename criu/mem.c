@@ -15,6 +15,7 @@
 #include <time.h>
 #include <pthread.h>
 #include <linux/memfd.h>
+#include <linux/idxd.h>
 #include <sys/stat.h>
 #include <sys/vfs.h>
 #include <linux/magic.h>
@@ -997,6 +998,8 @@ static bool dsa_dump_enabled(void)
 	return atoi(env) > 0;
 }
 
+#define DSA_STREAM_SLOT_PAYLOAD_TARGET (2U * 1024U * 1024U)
+
 static int dsa_collect_workqueues(char wq_paths[DSA_DUMP_MAX_WQ][64], int max_wq)
 {
 	DIR *dir;
@@ -1005,10 +1008,21 @@ static int dsa_collect_workqueues(char wq_paths[DSA_DUMP_MAX_WQ][64], int max_wq
 	char path[128];
 	char type_path[160];
 	char state_path[160];
+		char mode_path[160];
+		char batch_path[160];
+		char xfer_path[160];
+		char op_path[160];
+		char dev_op_path[160];
 	char type_buf[32];
 	char state_buf[32];
+	char mode_buf[32];
+	char batch_buf[32];
+	char op_buf[512];
 	int type_fd;
 	int state_fd;
+	int mode_fd;
+	int batch_fd;
+	int op_fd;
 	ssize_t read_len;
 	int i;
 
@@ -1034,6 +1048,32 @@ static int dsa_collect_workqueues(char wq_paths[DSA_DUMP_MAX_WQ][64], int max_wq
 			     "/sys/bus/dsa/devices/%s/state", de->d_name);
 		if (n < 0 || n >= sizeof(state_path))
 			continue;
+		n = snprintf(mode_path, sizeof(mode_path),
+			     "/sys/bus/dsa/devices/%s/mode", de->d_name);
+		if (n < 0 || n >= sizeof(mode_path))
+			continue;
+		n = snprintf(batch_path, sizeof(batch_path),
+			     "/sys/bus/dsa/devices/%s/max_batch_size", de->d_name);
+		if (n < 0 || n >= sizeof(batch_path))
+			continue;
+		n = snprintf(xfer_path, sizeof(xfer_path),
+			     "/sys/bus/dsa/devices/%s/max_transfer_size", de->d_name);
+		if (n < 0 || n >= sizeof(xfer_path))
+			continue;
+		n = snprintf(op_path, sizeof(op_path),
+			     "/sys/bus/dsa/devices/%s/op_config", de->d_name);
+		if (n < 0 || n >= sizeof(op_path))
+			continue;
+		{
+			const char *suffix = de->d_name + 2;
+			size_t suffix_len = strcspn(suffix, ".");
+
+			if (!suffix_len ||
+			    snprintf(dev_op_path, sizeof(dev_op_path),
+				     "/sys/bus/dsa/devices/dsa%.*s/op_cap",
+				     (int)suffix_len, suffix) >= sizeof(dev_op_path))
+				continue;
+		}
 
 		type_fd = open(type_path, O_RDONLY | O_CLOEXEC);
 		if (type_fd < 0)
@@ -1058,6 +1098,73 @@ static int dsa_collect_workqueues(char wq_paths[DSA_DUMP_MAX_WQ][64], int max_wq
 		state_buf[read_len] = '\0';
 		if (strncmp(state_buf, "enabled", 7))
 			continue;
+
+		mode_fd = open(mode_path, O_RDONLY | O_CLOEXEC);
+		if (mode_fd < 0)
+			continue;
+		read_len = read(mode_fd, mode_buf, sizeof(mode_buf) - 1);
+		close(mode_fd);
+		if (read_len <= 0)
+			continue;
+		mode_buf[read_len] = '\0';
+		if (strncmp(mode_buf, "shared", 6))
+			continue;
+
+		batch_fd = open(batch_path, O_RDONLY | O_CLOEXEC);
+		if (batch_fd < 0)
+			continue;
+		read_len = read(batch_fd, batch_buf, sizeof(batch_buf) - 1);
+		close(batch_fd);
+		if (read_len <= 0)
+			continue;
+		batch_buf[read_len] = '\0';
+		if (strtoul(batch_buf, NULL, 0) < DSA_HW_BATCH_CHILDREN)
+			continue;
+
+		batch_fd = open(xfer_path, O_RDONLY | O_CLOEXEC);
+		if (batch_fd < 0)
+			continue;
+		read_len = read(batch_fd, batch_buf, sizeof(batch_buf) - 1);
+		close(batch_fd);
+		if (read_len <= 0)
+			continue;
+		batch_buf[read_len] = '\0';
+		if (strtoul(batch_buf, NULL, 0) < DSA_STREAM_SLOT_PAYLOAD_TARGET)
+			continue;
+
+		op_fd = open(op_path, O_RDONLY | O_CLOEXEC);
+		if (op_fd < 0)
+			continue;
+		read_len = read(op_fd, op_buf, sizeof(op_buf) - 1);
+		close(op_fd);
+		if (read_len <= 0)
+			continue;
+		op_buf[read_len] = '\0';
+		{
+			char *last = strrchr(op_buf, ',');
+			unsigned long ops = strtoul(last ? last + 1 : op_buf, NULL, 16);
+
+			if (!(ops & (1UL << DSA_OPCODE_BATCH)) ||
+			    !(ops & (1UL << DSA_OPCODE_MEMMOVE)))
+				continue;
+		}
+
+		op_fd = open(dev_op_path, O_RDONLY | O_CLOEXEC);
+		if (op_fd < 0)
+			continue;
+		read_len = read(op_fd, op_buf, sizeof(op_buf) - 1);
+		close(op_fd);
+		if (read_len <= 0)
+			continue;
+		op_buf[read_len] = '\0';
+		{
+			char *last = strrchr(op_buf, ',');
+			unsigned long ops = strtoul(last ? last + 1 : op_buf, NULL, 16);
+
+			if (!(ops & (1UL << DSA_OPCODE_BATCH)) ||
+			    !(ops & (1UL << DSA_OPCODE_MEMMOVE)))
+				continue;
+		}
 
 		n = snprintf(path, sizeof(path), "/dev/dsa/%.*s",
 			     (int)(sizeof(path) - sizeof("/dev/dsa/")), de->d_name);
@@ -1153,6 +1260,8 @@ struct dsa_shared_mem_before_freeze {
 	size_t size;
 	bool external_arena;
 	u64 arena_epoch;
+	int wq_count;
+	char wq_paths[DSA_DUMP_MAX_WQ][64];
 	bool ready;
 	u64 total_us;
 	u64 create_us;
@@ -1186,6 +1295,9 @@ static void dsa_shared_mem_bf_reset(void)
 	dsa_shared_mem_bf.size = 0;
 	dsa_shared_mem_bf.external_arena = false;
 	dsa_shared_mem_bf.arena_epoch = 0;
+	dsa_shared_mem_bf.wq_count = 0;
+	memset(dsa_shared_mem_bf.wq_paths, 0,
+	       sizeof(dsa_shared_mem_bf.wq_paths));
 	dsa_shared_mem_bf.ready = false;
 	dsa_shared_mem_bf.total_us = 0;
 	dsa_shared_mem_bf.create_us = 0;
@@ -1436,6 +1548,14 @@ int dsa_shared_mem_prepare_before_freeze(void)
 	if (dsa_shared_mem_bf.fd >= 0 || dsa_shared_mem_bf.buf != MAP_FAILED)
 		dsa_shared_mem_cleanup_after_dump();
 
+	dsa_shared_mem_bf.wq_count =
+		dsa_collect_workqueues(dsa_shared_mem_bf.wq_paths, DSA_DUMP_MAX_WQ);
+	if (dsa_shared_mem_bf.wq_count <= 0) {
+		pr_err("DSA hardware-BATCH setup found no compatible shared WQ before freeze\n");
+		dsa_shared_mem_bf_reset();
+		return -1;
+	}
+
 	external_ret = dsa_shared_mem_take_external_arena(alloc_size, usable_size);
 	if (external_ret < 0)
 		return -1;
@@ -1541,6 +1661,9 @@ static int dsa_take_shared_mem_before_freeze(struct dsa_dump_ctx *ctx, pid_t tar
 	ctx->shared_buf_size = dsa_shared_mem_bf.size;
 	ctx->shared_map_size = dsa_shared_mem_bf.alloc_size;
 	ctx->shared_from_before_freeze = true;
+	ctx->wq_count = dsa_shared_mem_bf.wq_count;
+	memcpy(ctx->wq_paths, dsa_shared_mem_bf.wq_paths,
+	       sizeof(ctx->wq_paths));
 
 	return 0;
 }
@@ -1559,7 +1682,9 @@ static int dsa_dump_ctx_init(struct dsa_dump_ctx *ctx, pid_t target_pid)
 	ctx->shared_hugetlb = true;
 	ctx->shared_degrade_cnt = 0;
 
-	ctx->wq_count = dsa_collect_workqueues(ctx->wq_paths, DSA_DUMP_MAX_WQ);
+	ctx->wq_count = dsa_shared_mem_bf.wq_count;
+	memcpy(ctx->wq_paths, dsa_shared_mem_bf.wq_paths,
+	       sizeof(ctx->wq_paths));
 	if (ctx->wq_count <= 0) {
 		pr_info("DSA dump requested, but no /dev/dsa workqueue is available\n");
 		return 1;
@@ -1809,7 +1934,6 @@ static inline void dsa_stream_cpu_relax(void)
 #endif
 }
 
-#define DSA_STREAM_SLOT_PAYLOAD_TARGET (2U * 1024U * 1024U)
 #define DSA_STREAM_DESC_REGION_BYTES (64U * 1024U * 1024U)
 #define DSA_STREAM_FG_META_REGION_BYTES (32U * 1024U * 1024U)
 
@@ -2098,6 +2222,28 @@ static int dsa_stream_join_rpc(struct dsa_desc_scan_ctx *sc)
 		sc->rpc_args.poll_us = sc->stream_hdr->result_poll_us;
 		sc->rpc_args.submit_enqcmd = sc->stream_hdr->result_submit_enqcmd;
 		sc->rpc_args.submit_write = sc->stream_hdr->result_submit_write;
+		sc->rpc_args.batch_outer_submits =
+			sc->stream_hdr->result_batch_outer_submits;
+		sc->rpc_args.batch_child_submits =
+			sc->stream_hdr->result_batch_child_submits;
+		sc->rpc_args.batch_partial_submits =
+			sc->stream_hdr->result_batch_partial_submits;
+		sc->rpc_args.batch_single_tail_submits =
+			sc->stream_hdr->result_batch_single_tail_submits;
+		sc->rpc_args.batch_outer_success =
+			sc->stream_hdr->result_batch_outer_success;
+		sc->rpc_args.batch_outer_fail =
+			sc->stream_hdr->result_batch_outer_fail;
+		sc->rpc_args.batch_child_success =
+			sc->stream_hdr->result_batch_child_success;
+		sc->rpc_args.batch_child_nobof =
+			sc->stream_hdr->result_batch_child_nobof;
+		sc->rpc_args.batch_max_active_outer =
+			sc->stream_hdr->result_batch_max_active_outer;
+		sc->rpc_args.batch_max_active_children =
+			sc->stream_hdr->result_batch_max_active_children;
+		sc->rpc_args.batch_enq_retries =
+			sc->stream_hdr->result_batch_enq_retries;
 		sc->rpc_args.raw_faults = sc->stream_hdr->result_raw_faults;
 		sc->rpc_args.raw_fault_source = sc->stream_hdr->result_raw_fault_source;
 		sc->rpc_args.raw_fault_destination =
@@ -2416,7 +2562,7 @@ static int dsa_stream_finish(struct dsa_desc_scan_ctx *sc)
 			(unsigned long long)sc->rpc_args.cleanup_close_us,
 			(unsigned long long)sc->rpc_args.setup_shared_us);
 	if (sc->scan_profile)
-		pr_info("DSA_SCAN_PROFILE: mode=streaming raw_capture_mode=%s payload_bytes=%llu desc_count=%llu stream_flush_count=%u producer_wait_slot_us=%llu stream_finish_wait_us=%llu parasite_prefault_us=%llu raw_prefault_pages=%llu parasite_submit_us=%llu parasite_poll_us=%llu parasite_completed_count=%u parasite_submit_enqcmd=%u parasite_submit_write=%u raw_faults=%u raw_fault_source=%u raw_fault_destination=%u raw_fault_resubmits=%u raw_fault_partial_bytes=%llu raw_fault_touch_us=%llu raw_fault_resubmit_us=%llu\n",
+		pr_info("DSA_SCAN_PROFILE: mode=streaming raw_capture_mode=%s payload_bytes=%llu desc_count=%llu stream_flush_count=%u producer_wait_slot_us=%llu stream_finish_wait_us=%llu parasite_prefault_us=%llu raw_prefault_pages=%llu parasite_submit_us=%llu parasite_poll_us=%llu parasite_completed_count=%u parasite_submit_enqcmd=%u parasite_submit_write=%u batch_outer_submits=%u batch_child_submits=%u batch_partial_submits=%u batch_single_tail_submits=%u batch_outer_success=%u batch_outer_fail=%u batch_child_success=%u batch_child_nobof=%u batch_max_active_outer=%u batch_max_active_children=%u batch_enq_retries=%u raw_faults=%u raw_fault_source=%u raw_fault_destination=%u raw_fault_resubmits=%u raw_fault_partial_bytes=%llu raw_fault_touch_us=%llu raw_fault_resubmit_us=%llu\n",
 			sc->rpc_args.raw_full_prefault ?
 				"initial-full-prefault" : "incremental-exact-touch",
 			(unsigned long long)sc->stream_bytes,
@@ -2431,6 +2577,17 @@ static int dsa_stream_finish(struct dsa_desc_scan_ctx *sc)
 			sc->rpc_args.completed_count,
 			sc->rpc_args.submit_enqcmd,
 			sc->rpc_args.submit_write,
+			sc->rpc_args.batch_outer_submits,
+			sc->rpc_args.batch_child_submits,
+			sc->rpc_args.batch_partial_submits,
+			sc->rpc_args.batch_single_tail_submits,
+			sc->rpc_args.batch_outer_success,
+			sc->rpc_args.batch_outer_fail,
+			sc->rpc_args.batch_child_success,
+			sc->rpc_args.batch_child_nobof,
+			sc->rpc_args.batch_max_active_outer,
+			sc->rpc_args.batch_max_active_children,
+			sc->rpc_args.batch_enq_retries,
 			sc->rpc_args.raw_faults,
 			sc->rpc_args.raw_fault_source,
 			sc->rpc_args.raw_fault_destination,
@@ -3745,7 +3902,7 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 		}
 		dsa_rpc_total_us = dsa_wall_delta_us(dsa_rpc_start_us, dsa_wall_now_us());
 		if (dsa_sc.scan_profile)
-			pr_info("DSA_MEMDUMP_DETAIL: mode=streaming raw_capture=%u raw_capture_mode=%s scan_build_us=%llu scan_pages=%llu dump_pages=%llu hole_pages=%llu lazy_pages=%llu stream_finish_us=%llu dsa_rpc_total_us=%llu stream_payload_bytes=%llu stream_desc_count=%llu stream_flush_count=%u producer_wait_slot_us=%llu stream_finish_wait_us=%llu parasite_prefault_us=%llu raw_prefault_pages=%llu parasite_submit_us=%llu parasite_poll_us=%llu parasite_completed_count=%u parasite_submit_enqcmd=%u parasite_submit_write=%u raw_faults=%u raw_fault_source=%u raw_fault_destination=%u raw_fault_resubmits=%u raw_fault_partial_bytes=%llu raw_fault_touch_us=%llu raw_fault_resubmit_us=%llu\n",
+			pr_info("DSA_MEMDUMP_DETAIL: mode=streaming raw_capture=%u raw_capture_mode=%s scan_build_us=%llu scan_pages=%llu dump_pages=%llu hole_pages=%llu lazy_pages=%llu stream_finish_us=%llu dsa_rpc_total_us=%llu stream_payload_bytes=%llu stream_desc_count=%llu stream_flush_count=%u producer_wait_slot_us=%llu stream_finish_wait_us=%llu parasite_prefault_us=%llu raw_prefault_pages=%llu parasite_submit_us=%llu parasite_poll_us=%llu parasite_completed_count=%u parasite_submit_enqcmd=%u parasite_submit_write=%u batch_outer_submits=%u batch_child_submits=%u batch_partial_submits=%u batch_single_tail_submits=%u batch_outer_success=%u batch_outer_fail=%u batch_child_success=%u batch_child_nobof=%u batch_max_active_outer=%u batch_max_active_children=%u batch_enq_retries=%u raw_faults=%u raw_fault_source=%u raw_fault_destination=%u raw_fault_resubmits=%u raw_fault_partial_bytes=%llu raw_fault_touch_us=%llu raw_fault_resubmit_us=%llu\n",
 		dsa_ctx->raw_fg_capture ? 1 : 0,
 			dsa_sc.rpc_args.raw_full_prefault ?
 				"initial-full-prefault" : "incremental-exact-touch",
@@ -3768,6 +3925,17 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 			dsa_sc.rpc_args.completed_count,
 			dsa_sc.rpc_args.submit_enqcmd,
 			dsa_sc.rpc_args.submit_write,
+			dsa_sc.rpc_args.batch_outer_submits,
+			dsa_sc.rpc_args.batch_child_submits,
+			dsa_sc.rpc_args.batch_partial_submits,
+			dsa_sc.rpc_args.batch_single_tail_submits,
+			dsa_sc.rpc_args.batch_outer_success,
+			dsa_sc.rpc_args.batch_outer_fail,
+			dsa_sc.rpc_args.batch_child_success,
+			dsa_sc.rpc_args.batch_child_nobof,
+			dsa_sc.rpc_args.batch_max_active_outer,
+			dsa_sc.rpc_args.batch_max_active_children,
+			dsa_sc.rpc_args.batch_enq_retries,
 			dsa_sc.rpc_args.raw_faults,
 			dsa_sc.rpc_args.raw_fault_source,
 			dsa_sc.rpc_args.raw_fault_destination,

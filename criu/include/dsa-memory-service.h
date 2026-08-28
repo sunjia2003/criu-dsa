@@ -11,7 +11,7 @@
 #include <stdint.h>
 
 #define CDP_DSA_MEMORY_SERVICE_MAGIC   0x4350444dU /* "CDPM" */
-#define CDP_DSA_MEMORY_SERVICE_VERSION 8U
+#define CDP_DSA_MEMORY_SERVICE_VERSION 9U
 #define CDP_DSA_MEMORY_SERVICE_DIAG_MAGIC 0x43445044U /* "CDPD" */
 #define CDP_DSA_MEMORY_SERVICE_DIAG_VERSION 1U
 #define CDP_DSA_MS_DIAG_INVALID_OBJECT UINT64_MAX
@@ -204,6 +204,16 @@ struct cdp_dsa_memory_service_profile {
 	uint64_t fresh_refill_batches;
 	uint64_t fresh_refill_blocked_fault_debt;
 	uint64_t dsa_empty_with_claimable_fresh;
+	uint64_t batch_outer_submits;
+	uint64_t batch_child_submits;
+	uint64_t batch_partial_submits;
+	uint64_t batch_single_tail_submits;
+	uint64_t batch_outer_success;
+	uint64_t batch_outer_fail;
+	uint64_t batch_child_success;
+	uint64_t batch_child_nobof;
+	uint64_t batch_max_active_outer;
+	uint64_t batch_max_active_children;
 
 	/* Filled by the short-lived durable writer after COMPARE_DONE. */
 	uint64_t idx_write_calls;
