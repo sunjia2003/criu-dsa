@@ -59,6 +59,8 @@
 #define HOT_DSA_COMPARE_BATCH_CHILDREN DSA_HW_BATCH_CHILDREN
 #define HOT_DSA_COMPARE_MAX_CHILDREN \
 	(HOT_DSA_COMPARE_INFLIGHT * HOT_DSA_COMPARE_BATCH_CHILDREN)
+#define HOT_DSA_COMPARE_ASSIST_QUEUE_CAPACITY 32U
+#define HOT_DSA_COMPARE_ASSIST_BURST_PAGES 4U
 #define HOT_DSA_MAX_ENQ_RETRY 1000000U
 #define HOT_DSA_MAX_POLL_RETRY 1000000U
 #define HOT_DSA_COMPLETION_TIMEOUT_NS (5ULL * 1000ULL * 1000ULL * 1000ULL)
@@ -73,10 +75,6 @@
 #define HOT_DSA_FAULT_OPERAND_MASK 0x7U
 #define HOT_DSA_FAULT_OPERAND_SRC1 1U
 #define HOT_DSA_FAULT_OPERAND_SRC2 2U
-
-#ifndef MADV_POPULATE_READ
-#define MADV_POPULATE_READ 22
-#endif
 
 enum hot_fg_compare_backend {
 	HOT_FG_COMPARE_DSA = 0,
@@ -133,23 +131,6 @@ static bool dsa_page_xfer_profile_target(int fd_type, unsigned long img_id)
 	errno = 0;
 	parsed = strtoull(value, &end, 10);
 	return !errno && end && !*end && parsed == img_id;
-}
-
-static int dsa_compare_breakdown_mode(void)
-{
-	static int mode = -2;
-	const char *value = getenv("CRIU_DSA_COMPARE_BREAKDOWN");
-
-	if (mode != -2)
-		return mode;
-
-	if (!value || !value[0] || !strcmp(value, "0") ||
-	    !strcasecmp(value, "false") || !strcasecmp(value, "off"))
-		return mode = 0;
-	if (!strcmp(value, "1") || !strcasecmp(value, "true") ||
-	    !strcasecmp(value, "yes"))
-		return mode = 1;
-	return mode = -1;
 }
 
 /* The fd is inherited only by a short-lived CRIU dump.  The task worker keeps
@@ -480,7 +461,6 @@ struct hot_apply_ctx {
 	bool fine_grained;
 	bool fine_output;
 	bool profile;
-	bool compare_breakdown;
 	enum hot_fg_compare_backend fg_compare_backend;
 	bool finished;
 	int pipefd[2];
@@ -654,6 +634,73 @@ struct hot_apply_ctx {
 	u64 profile_fresh_refill_batches;
 	u64 profile_fresh_refill_blocked_fault_debt;
 	u64 profile_dsa_empty_with_claimable_fresh;
+	u64 profile_opportunistic_simd_gate_attempts;
+	u64 profile_opportunistic_simd_gate_success;
+	u64 profile_opportunistic_simd_blocked_partial_above_reserve;
+	u64 profile_opportunistic_simd_blocked_reserve_full;
+	u64 profile_opportunistic_simd_blocked_reserve_partial;
+	u64 profile_opportunistic_simd_blocked_exhausted_ready;
+	u64 profile_opportunistic_simd_blocked_exhausted_inflight;
+	u64 profile_opportunistic_simd_gate_full_above_reserve_ns;
+	u64 profile_opportunistic_simd_gate_partial_above_reserve_ns;
+	u64 profile_opportunistic_simd_gate_reserve_full_ns;
+	u64 profile_opportunistic_simd_gate_reserve_partial_ns;
+	u64 profile_opportunistic_simd_gate_exhausted_ready_ns;
+	u64 profile_opportunistic_simd_gate_exhausted_inflight_ns;
+	u64 profile_opportunistic_simd_reserve_active_outer_sum;
+	u64 profile_opportunistic_simd_reserve_active_children_sum;
+	u64 profile_opportunistic_simd_reserve_min_wq_outer_sum;
+	u64 profile_opportunistic_simd_reserve_min_wq_children_sum;
+	u64 profile_opportunistic_simd_reserve_fresh_spans_min;
+	u64 profile_opportunistic_simd_reserve_fresh_spans_max;
+	u64 profile_opportunistic_simd_reserve_fresh_pages_min;
+	u64 profile_opportunistic_simd_reserve_fresh_pages_max;
+	u64 profile_opportunistic_simd_exhausted_ready_depth_sum;
+	u64 profile_opportunistic_simd_exhausted_ready_depth_max;
+	u64 profile_opportunistic_simd_exhausted_inflight_active_children_sum;
+	u64 profile_opportunistic_simd_exhausted_inflight_min_wq_children_sum;
+	u64 profile_opportunistic_simd_bursts;
+	u64 profile_opportunistic_simd_pages;
+	u64 profile_opportunistic_simd_max_burst_pages;
+	u64 profile_opportunistic_simd_feedback_grow;
+	u64 profile_opportunistic_simd_feedback_hold;
+	u64 profile_opportunistic_simd_feedback_shrink;
+	u64 profile_opportunistic_simd_feedback_reset;
+	u64 profile_opportunistic_simd_max_completed_wq;
+	u64 profile_opportunistic_simd_min_runway_after_burst;
+	u64 profile_opportunistic_simd_feedback_completed_children;
+	u64 profile_opportunistic_simd_feedback_max_completed_children_wq;
+	u64 profile_opportunistic_simd_feedback_min_child_runway_after_burst;
+	u64 profile_opportunistic_simd_feedback_max_completed_children_per_page_x1024;
+	bool poll_probe_enabled;
+	u32 poll_probe_pages_per_pause;
+	u64 profile_poll_probe_bursts;
+	u64 profile_poll_probe_pages;
+	u64 profile_poll_probe_wall_ns;
+	u64 profile_poll_probe_skipped_no_sample;
+	u64 profile_poll_probe_shadow_parent_pages;
+	u64 profile_poll_probe_shadow_patch_pages;
+	u64 profile_poll_probe_shadow_full_pages;
+	u64 profile_poll_probe_followup_harvested_outer;
+	u64 profile_poll_probe_followup_harvested_children;
+	u64 profile_poll_probe_followup_max_harvested_outer_wq;
+	u64 profile_poll_probe_followup_min_outer_runway;
+	u64 profile_poll_probe_followup_zero_runway;
+	u64 profile_assist_enqueued;
+	u64 profile_assist_overflow_to_dsa;
+	u64 profile_assist_dequeued;
+	u64 profile_assist_pages;
+	u64 profile_assist_bytes;
+	u64 profile_assist_bursts;
+	u64 profile_assist_max_queue_depth;
+	u64 profile_assist_dsa_diff_submits;
+	u64 profile_assist_general_submits;
+	u64 profile_assist_fresh_submits;
+	u64 profile_assist_while_dsa_active_pages;
+	u64 profile_assist_tail_pages;
+	u64 profile_compare_wq_lane_count;
+	u64 profile_compare_wq_max_active_skew;
+	u64 profile_compare_wq_starved_with_claimable_work;
 	/* Set only after this service has promoted a locally staged generation.
 	 * It is a scheduling input, not merely a reporting label. */
 	bool service_parent_mapping_warm;
@@ -1921,6 +1968,35 @@ static int hot_fg_select_compare_backend(struct hot_apply_ctx *ctx)
 	return 0;
 }
 
+static int hot_fg_select_poll_probe(struct hot_apply_ctx *ctx)
+{
+	const char *value = getenv("CRIU_DSA_COMPARE_POLL_PROBE_PAGES");
+	char *end = NULL;
+	unsigned long pages;
+
+	if (!value)
+		return 0;
+	if (!value[0]) {
+		pr_err("DSA COMPARE poll probe has an empty page count\n");
+		return -1;
+	}
+	errno = 0;
+	pages = strtoul(value, &end, 10);
+	if (errno || !end || *end ||
+	    (pages != 0 && pages != 1 && pages != 2 && pages != 4 && pages != 8)) {
+		pr_err("DSA COMPARE poll probe pages must be one of 0,1,2,4,8: %s\n",
+		       value);
+		return -1;
+	}
+	if (!ctx->profile || ctx->fg_compare_backend != HOT_FG_COMPARE_DSA) {
+		pr_err("DSA COMPARE poll probe requires profile mode and backend=dsa\n");
+		return -1;
+	}
+	ctx->poll_probe_enabled = true;
+	ctx->poll_probe_pages_per_pause = (u32)pages;
+	return 0;
+}
+
 static int hot_fg_open_sidecar(struct hot_apply_ctx *ctx)
 {
 	char path[64];
@@ -2497,12 +2573,6 @@ static struct hot_apply_ctx *hot_apply_alloc_ctx(int fd_type,
 	const char *memory_manifest = getenv("CRIU_DSA_HOT_MEMORY_MANIFEST");
 	const char *memory_next = getenv("CRIU_DSA_HOT_MEMORY_NEXT");
 	struct hot_apply_ctx *ctx;
-	int compare_breakdown = dsa_compare_breakdown_mode();
-
-	if (compare_breakdown < 0) {
-		pr_err("Invalid CRIU_DSA_COMPARE_BREAKDOWN (use unset/0/off or 1/true)\n");
-		return NULL;
-	}
 
 	ctx = xzalloc(sizeof(*ctx));
 	if (!ctx)
@@ -2529,13 +2599,8 @@ static struct hot_apply_ctx *hot_apply_alloc_ctx(int fd_type,
 	ctx->fine_grained = ctx->memstore &&
 		(ctx->fine_output || dsa_aligned_full_enabled());
 	ctx->profile = dsa_profile_enabled();
-	ctx->compare_breakdown = compare_breakdown == 1;
-	if (ctx->compare_breakdown && (!ctx->fine_output || !ctx->profile)) {
-		pr_err("DSA compare breakdown requires fine-grained mode and CRIU_DSA_PROFILE=1\n");
-		xfree(ctx);
-		return NULL;
-	}
-	if (ctx->fine_output && hot_fg_select_compare_backend(ctx)) {
+	if (ctx->fine_output &&
+	    (hot_fg_select_compare_backend(ctx) || hot_fg_select_poll_probe(ctx))) {
 		xfree(ctx);
 		return NULL;
 	}
@@ -3365,6 +3430,71 @@ static void hot_service_profile_reset_generation(struct hot_apply_ctx *ctx)
 	ctx->profile_fresh_refill_batches = 0;
 	ctx->profile_fresh_refill_blocked_fault_debt = 0;
 	ctx->profile_dsa_empty_with_claimable_fresh = 0;
+	ctx->profile_opportunistic_simd_gate_attempts = 0;
+	ctx->profile_opportunistic_simd_gate_success = 0;
+	ctx->profile_opportunistic_simd_blocked_partial_above_reserve = 0;
+	ctx->profile_opportunistic_simd_blocked_reserve_full = 0;
+	ctx->profile_opportunistic_simd_blocked_reserve_partial = 0;
+	ctx->profile_opportunistic_simd_blocked_exhausted_ready = 0;
+	ctx->profile_opportunistic_simd_blocked_exhausted_inflight = 0;
+	ctx->profile_opportunistic_simd_gate_full_above_reserve_ns = 0;
+	ctx->profile_opportunistic_simd_gate_partial_above_reserve_ns = 0;
+	ctx->profile_opportunistic_simd_gate_reserve_full_ns = 0;
+	ctx->profile_opportunistic_simd_gate_reserve_partial_ns = 0;
+	ctx->profile_opportunistic_simd_gate_exhausted_ready_ns = 0;
+	ctx->profile_opportunistic_simd_gate_exhausted_inflight_ns = 0;
+	ctx->profile_opportunistic_simd_reserve_active_outer_sum = 0;
+	ctx->profile_opportunistic_simd_reserve_active_children_sum = 0;
+	ctx->profile_opportunistic_simd_reserve_min_wq_outer_sum = 0;
+	ctx->profile_opportunistic_simd_reserve_min_wq_children_sum = 0;
+	ctx->profile_opportunistic_simd_reserve_fresh_spans_min = 0;
+	ctx->profile_opportunistic_simd_reserve_fresh_spans_max = 0;
+	ctx->profile_opportunistic_simd_reserve_fresh_pages_min = 0;
+	ctx->profile_opportunistic_simd_reserve_fresh_pages_max = 0;
+	ctx->profile_opportunistic_simd_exhausted_ready_depth_sum = 0;
+	ctx->profile_opportunistic_simd_exhausted_ready_depth_max = 0;
+	ctx->profile_opportunistic_simd_exhausted_inflight_active_children_sum = 0;
+	ctx->profile_opportunistic_simd_exhausted_inflight_min_wq_children_sum = 0;
+	ctx->profile_opportunistic_simd_bursts = 0;
+	ctx->profile_opportunistic_simd_pages = 0;
+	ctx->profile_opportunistic_simd_max_burst_pages = 0;
+	ctx->profile_opportunistic_simd_feedback_grow = 0;
+	ctx->profile_opportunistic_simd_feedback_hold = 0;
+	ctx->profile_opportunistic_simd_feedback_shrink = 0;
+	ctx->profile_opportunistic_simd_feedback_reset = 0;
+	ctx->profile_opportunistic_simd_max_completed_wq = 0;
+	ctx->profile_opportunistic_simd_min_runway_after_burst = 0;
+	ctx->profile_opportunistic_simd_feedback_completed_children = 0;
+	ctx->profile_opportunistic_simd_feedback_max_completed_children_wq = 0;
+	ctx->profile_opportunistic_simd_feedback_min_child_runway_after_burst = 0;
+	ctx->profile_opportunistic_simd_feedback_max_completed_children_per_page_x1024 = 0;
+	ctx->profile_poll_probe_bursts = 0;
+	ctx->profile_poll_probe_pages = 0;
+	ctx->profile_poll_probe_wall_ns = 0;
+	ctx->profile_poll_probe_skipped_no_sample = 0;
+	ctx->profile_poll_probe_shadow_parent_pages = 0;
+	ctx->profile_poll_probe_shadow_patch_pages = 0;
+	ctx->profile_poll_probe_shadow_full_pages = 0;
+	ctx->profile_poll_probe_followup_harvested_outer = 0;
+	ctx->profile_poll_probe_followup_harvested_children = 0;
+	ctx->profile_poll_probe_followup_max_harvested_outer_wq = 0;
+	ctx->profile_poll_probe_followup_min_outer_runway = 0;
+	ctx->profile_poll_probe_followup_zero_runway = 0;
+	ctx->profile_assist_enqueued = 0;
+	ctx->profile_assist_overflow_to_dsa = 0;
+	ctx->profile_assist_dequeued = 0;
+	ctx->profile_assist_pages = 0;
+	ctx->profile_assist_bytes = 0;
+	ctx->profile_assist_bursts = 0;
+	ctx->profile_assist_max_queue_depth = 0;
+	ctx->profile_assist_dsa_diff_submits = 0;
+	ctx->profile_assist_general_submits = 0;
+	ctx->profile_assist_fresh_submits = 0;
+	ctx->profile_assist_while_dsa_active_pages = 0;
+	ctx->profile_assist_tail_pages = 0;
+	ctx->profile_compare_wq_lane_count = 0;
+	ctx->profile_compare_wq_max_active_skew = 0;
+	ctx->profile_compare_wq_starved_with_claimable_work = 0;
 	ctx->profile_prq_pg_requests = 0;
 	ctx->profile_prq_thread_cpu_us = 0;
 	ctx->profile_prefault_spans = 0;
@@ -3517,6 +3647,123 @@ static void hot_service_profile_snapshot(
 		ctx->profile_fresh_refill_blocked_fault_debt;
 	profile->dsa_empty_with_claimable_fresh =
 		ctx->profile_dsa_empty_with_claimable_fresh;
+	profile->opportunistic_simd_gate_attempts =
+		ctx->profile_opportunistic_simd_gate_attempts;
+	profile->opportunistic_simd_gate_success =
+		ctx->profile_opportunistic_simd_gate_success;
+	profile->opportunistic_simd_blocked_partial_above_reserve =
+		ctx->profile_opportunistic_simd_blocked_partial_above_reserve;
+	profile->opportunistic_simd_blocked_reserve_full =
+		ctx->profile_opportunistic_simd_blocked_reserve_full;
+	profile->opportunistic_simd_blocked_reserve_partial =
+		ctx->profile_opportunistic_simd_blocked_reserve_partial;
+	profile->opportunistic_simd_blocked_exhausted_ready =
+		ctx->profile_opportunistic_simd_blocked_exhausted_ready;
+	profile->opportunistic_simd_blocked_exhausted_inflight =
+		ctx->profile_opportunistic_simd_blocked_exhausted_inflight;
+	profile->opportunistic_simd_gate_full_above_reserve_ns =
+		ctx->profile_opportunistic_simd_gate_full_above_reserve_ns;
+	profile->opportunistic_simd_gate_partial_above_reserve_ns =
+		ctx->profile_opportunistic_simd_gate_partial_above_reserve_ns;
+	profile->opportunistic_simd_gate_reserve_full_ns =
+		ctx->profile_opportunistic_simd_gate_reserve_full_ns;
+	profile->opportunistic_simd_gate_reserve_partial_ns =
+		ctx->profile_opportunistic_simd_gate_reserve_partial_ns;
+	profile->opportunistic_simd_gate_exhausted_ready_ns =
+		ctx->profile_opportunistic_simd_gate_exhausted_ready_ns;
+	profile->opportunistic_simd_gate_exhausted_inflight_ns =
+		ctx->profile_opportunistic_simd_gate_exhausted_inflight_ns;
+	profile->opportunistic_simd_reserve_active_outer_sum =
+		ctx->profile_opportunistic_simd_reserve_active_outer_sum;
+	profile->opportunistic_simd_reserve_active_children_sum =
+		ctx->profile_opportunistic_simd_reserve_active_children_sum;
+	profile->opportunistic_simd_reserve_min_wq_outer_sum =
+		ctx->profile_opportunistic_simd_reserve_min_wq_outer_sum;
+	profile->opportunistic_simd_reserve_min_wq_children_sum =
+		ctx->profile_opportunistic_simd_reserve_min_wq_children_sum;
+	profile->opportunistic_simd_reserve_fresh_spans_min =
+		ctx->profile_opportunistic_simd_reserve_fresh_spans_min;
+	profile->opportunistic_simd_reserve_fresh_spans_max =
+		ctx->profile_opportunistic_simd_reserve_fresh_spans_max;
+	profile->opportunistic_simd_reserve_fresh_pages_min =
+		ctx->profile_opportunistic_simd_reserve_fresh_pages_min;
+	profile->opportunistic_simd_reserve_fresh_pages_max =
+		ctx->profile_opportunistic_simd_reserve_fresh_pages_max;
+	profile->opportunistic_simd_exhausted_ready_depth_sum =
+		ctx->profile_opportunistic_simd_exhausted_ready_depth_sum;
+	profile->opportunistic_simd_exhausted_ready_depth_max =
+		ctx->profile_opportunistic_simd_exhausted_ready_depth_max;
+	profile->opportunistic_simd_exhausted_inflight_active_children_sum =
+		ctx->profile_opportunistic_simd_exhausted_inflight_active_children_sum;
+	profile->opportunistic_simd_exhausted_inflight_min_wq_children_sum =
+		ctx->profile_opportunistic_simd_exhausted_inflight_min_wq_children_sum;
+	profile->opportunistic_simd_bursts =
+		ctx->profile_opportunistic_simd_bursts;
+	profile->opportunistic_simd_pages =
+		ctx->profile_opportunistic_simd_pages;
+	profile->opportunistic_simd_max_burst_pages =
+		ctx->profile_opportunistic_simd_max_burst_pages;
+	profile->opportunistic_simd_feedback_grow =
+		ctx->profile_opportunistic_simd_feedback_grow;
+	profile->opportunistic_simd_feedback_hold =
+		ctx->profile_opportunistic_simd_feedback_hold;
+	profile->opportunistic_simd_feedback_shrink =
+		ctx->profile_opportunistic_simd_feedback_shrink;
+	profile->opportunistic_simd_feedback_reset =
+		ctx->profile_opportunistic_simd_feedback_reset;
+	profile->opportunistic_simd_max_completed_wq =
+		ctx->profile_opportunistic_simd_max_completed_wq;
+	profile->opportunistic_simd_min_runway_after_burst =
+		ctx->profile_opportunistic_simd_min_runway_after_burst;
+	profile->opportunistic_simd_feedback_completed_children =
+		ctx->profile_opportunistic_simd_feedback_completed_children;
+	profile->opportunistic_simd_feedback_max_completed_children_wq =
+		ctx->profile_opportunistic_simd_feedback_max_completed_children_wq;
+	profile->opportunistic_simd_feedback_min_child_runway_after_burst =
+		ctx->profile_opportunistic_simd_feedback_min_child_runway_after_burst;
+	profile->opportunistic_simd_feedback_max_completed_children_per_page_x1024 =
+		ctx->profile_opportunistic_simd_feedback_max_completed_children_per_page_x1024;
+	profile->poll_probe_enabled = ctx->poll_probe_enabled ? 1 : 0;
+	profile->poll_probe_pages_per_pause = ctx->poll_probe_pages_per_pause;
+	profile->poll_probe_bursts = ctx->profile_poll_probe_bursts;
+	profile->poll_probe_pages = ctx->profile_poll_probe_pages;
+	profile->poll_probe_wall_ns = ctx->profile_poll_probe_wall_ns;
+	profile->poll_probe_skipped_no_sample =
+		ctx->profile_poll_probe_skipped_no_sample;
+	profile->poll_probe_shadow_parent_pages =
+		ctx->profile_poll_probe_shadow_parent_pages;
+	profile->poll_probe_shadow_patch_pages =
+		ctx->profile_poll_probe_shadow_patch_pages;
+	profile->poll_probe_shadow_full_pages =
+		ctx->profile_poll_probe_shadow_full_pages;
+	profile->poll_probe_followup_harvested_outer =
+		ctx->profile_poll_probe_followup_harvested_outer;
+	profile->poll_probe_followup_harvested_children =
+		ctx->profile_poll_probe_followup_harvested_children;
+	profile->poll_probe_followup_max_harvested_outer_wq =
+		ctx->profile_poll_probe_followup_max_harvested_outer_wq;
+	profile->poll_probe_followup_min_outer_runway =
+		ctx->profile_poll_probe_followup_min_outer_runway;
+	profile->poll_probe_followup_zero_runway =
+		ctx->profile_poll_probe_followup_zero_runway;
+	profile->assist_enqueued = ctx->profile_assist_enqueued;
+	profile->assist_overflow_to_dsa = ctx->profile_assist_overflow_to_dsa;
+	profile->assist_dequeued = ctx->profile_assist_dequeued;
+	profile->assist_pages = ctx->profile_assist_pages;
+	profile->assist_bytes = ctx->profile_assist_bytes;
+	profile->assist_bursts = ctx->profile_assist_bursts;
+	profile->assist_max_queue_depth = ctx->profile_assist_max_queue_depth;
+	profile->assist_dsa_diff_submits = ctx->profile_assist_dsa_diff_submits;
+	profile->assist_general_submits = ctx->profile_assist_general_submits;
+	profile->assist_fresh_submits = ctx->profile_assist_fresh_submits;
+	profile->assist_while_dsa_active_pages =
+		ctx->profile_assist_while_dsa_active_pages;
+	profile->assist_tail_pages = ctx->profile_assist_tail_pages;
+	profile->compare_wq_lane_count = ctx->profile_compare_wq_lane_count;
+	profile->compare_wq_max_active_skew =
+		ctx->profile_compare_wq_max_active_skew;
+	profile->compare_wq_starved_with_claimable_work =
+		ctx->profile_compare_wq_starved_with_claimable_work;
 }
 
 static void hot_profile_emit(struct hot_apply_ctx *ctx, int ret)
@@ -3549,7 +3796,7 @@ static void hot_profile_emit(struct hot_apply_ctx *ctx, int ret)
 		ctx->profile_span_build_us, ctx->profile_compare_wall_us,
 		ctx->profile_compare_engine_wall_us,
 		ctx->profile_compare_engine_cpu_us,
-		ctx->compare_breakdown ? 1 : 0,
+		0U,
 		ctx->profile_parent_prefault_wall_us,
 		ctx->profile_parent_prefault_cpu_us,
 		ctx->profile_compare_core_wall_us,
@@ -3650,7 +3897,7 @@ static void dsa_memory_service_profile_emit(struct page_xfer *xfer, int ret)
 		p->compare_engine_wall_us, p->compare_engine_cpu_us,
 		p->compare_engine_wall_us, p->compare_engine_cpu_us,
 		p->result_publish_us,
-		dsa_compare_breakdown_mode() == 1 ? 1 : 0,
+		0U,
 		p->parent_prefault_wall_us, p->parent_prefault_cpu_us,
 		p->compare_core_wall_us, p->compare_core_cpu_us,
 		xfer->dsa_fg_profile_sidecar_us,
@@ -3668,6 +3915,78 @@ static void dsa_memory_service_profile_emit(struct page_xfer *xfer, int ret)
 		xfer->dsa_fg_service_diag.apply_manifest_finish_wall_us,
 		xfer->dsa_fg_service_diag.apply_manifest_close_wall_us,
 		accounted_us, unaccounted_us, accounted_us > total_us ? 1 : 0);
+	if (xfer->dsa_fine_grained &&
+	    (backend_id == HOT_FG_COMPARE_DSA ||
+	     backend_id == HOT_FG_COMPARE_VALIDATE)) {
+		pr_info("DSA_COMPARE_OPPORTUNISTIC_PROFILE: version=4 pages_id=%u gate_attempts=%" PRIu64 " gate_success=%" PRIu64 " blocked_partial_above_reserve=%" PRIu64 " blocked_reserve_full=%" PRIu64 " blocked_reserve_partial=%" PRIu64 " blocked_exhausted_ready=%" PRIu64 " blocked_exhausted_inflight=%" PRIu64 " gate_full_above_reserve_ns=%" PRIu64 " gate_partial_above_reserve_ns=%" PRIu64 " gate_reserve_full_ns=%" PRIu64 " gate_reserve_partial_ns=%" PRIu64 " gate_exhausted_ready_ns=%" PRIu64 " gate_exhausted_inflight_ns=%" PRIu64 " reserve_active_outer_sum=%" PRIu64 " reserve_active_children_sum=%" PRIu64 " reserve_min_wq_outer_sum=%" PRIu64 " reserve_min_wq_children_sum=%" PRIu64 " reserve_fresh_spans_min=%" PRIu64 " reserve_fresh_spans_max=%" PRIu64 " reserve_fresh_pages_min=%" PRIu64 " reserve_fresh_pages_max=%" PRIu64 " exhausted_ready_depth_sum=%" PRIu64 " exhausted_ready_depth_max=%" PRIu64 " exhausted_inflight_active_children_sum=%" PRIu64 " exhausted_inflight_min_wq_children_sum=%" PRIu64 " bursts=%" PRIu64 " pages=%" PRIu64 " max_burst_pages=%" PRIu64 " feedback_grow=%" PRIu64 " feedback_hold=%" PRIu64 " feedback_shrink=%" PRIu64 " feedback_reset=%" PRIu64 " max_completed_wq=%" PRIu64 " min_runway_after_burst=%" PRIu64 " feedback_completed_children=%" PRIu64 " feedback_max_completed_children_wq=%" PRIu64 " feedback_min_child_runway_after_burst=%" PRIu64 " feedback_max_completed_children_per_page_x1024=%" PRIu64 "\n",
+			xfer->pages_id,
+			p->opportunistic_simd_gate_attempts,
+			p->opportunistic_simd_gate_success,
+			p->opportunistic_simd_blocked_partial_above_reserve,
+			p->opportunistic_simd_blocked_reserve_full,
+			p->opportunistic_simd_blocked_reserve_partial,
+			p->opportunistic_simd_blocked_exhausted_ready,
+			p->opportunistic_simd_blocked_exhausted_inflight,
+			p->opportunistic_simd_gate_full_above_reserve_ns,
+			p->opportunistic_simd_gate_partial_above_reserve_ns,
+			p->opportunistic_simd_gate_reserve_full_ns,
+			p->opportunistic_simd_gate_reserve_partial_ns,
+			p->opportunistic_simd_gate_exhausted_ready_ns,
+			p->opportunistic_simd_gate_exhausted_inflight_ns,
+			p->opportunistic_simd_reserve_active_outer_sum,
+			p->opportunistic_simd_reserve_active_children_sum,
+			p->opportunistic_simd_reserve_min_wq_outer_sum,
+			p->opportunistic_simd_reserve_min_wq_children_sum,
+			p->opportunistic_simd_reserve_fresh_spans_min,
+			p->opportunistic_simd_reserve_fresh_spans_max,
+			p->opportunistic_simd_reserve_fresh_pages_min,
+			p->opportunistic_simd_reserve_fresh_pages_max,
+			p->opportunistic_simd_exhausted_ready_depth_sum,
+			p->opportunistic_simd_exhausted_ready_depth_max,
+			p->opportunistic_simd_exhausted_inflight_active_children_sum,
+			p->opportunistic_simd_exhausted_inflight_min_wq_children_sum,
+			p->opportunistic_simd_bursts,
+			p->opportunistic_simd_pages,
+			p->opportunistic_simd_max_burst_pages,
+			p->opportunistic_simd_feedback_grow,
+			p->opportunistic_simd_feedback_hold,
+			p->opportunistic_simd_feedback_shrink,
+			p->opportunistic_simd_feedback_reset,
+			p->opportunistic_simd_max_completed_wq,
+			p->opportunistic_simd_min_runway_after_burst,
+			p->opportunistic_simd_feedback_completed_children,
+			p->opportunistic_simd_feedback_max_completed_children_wq,
+			p->opportunistic_simd_feedback_min_child_runway_after_burst,
+			p->opportunistic_simd_feedback_max_completed_children_per_page_x1024);
+		pr_info("DSA_COMPARE_POLL_PROBE_PROFILE: version=1 pages_id=%u enabled=%" PRIu64 " pages_per_pause=%" PRIu64 " bursts=%" PRIu64 " pages=%" PRIu64 " wall_ns=%" PRIu64 " skipped_no_sample=%" PRIu64 " shadow_parent_pages=%" PRIu64 " shadow_patch_pages=%" PRIu64 " shadow_full_pages=%" PRIu64 " followup_harvested_outer=%" PRIu64 " followup_harvested_children=%" PRIu64 " followup_max_harvested_outer_wq=%" PRIu64 " followup_min_outer_runway=%" PRIu64 " followup_zero_runway=%" PRIu64 "\n",
+			xfer->pages_id, p->poll_probe_enabled,
+			p->poll_probe_pages_per_pause, p->poll_probe_bursts,
+			p->poll_probe_pages, p->poll_probe_wall_ns,
+			p->poll_probe_skipped_no_sample,
+			p->poll_probe_shadow_parent_pages,
+			p->poll_probe_shadow_patch_pages,
+			p->poll_probe_shadow_full_pages,
+			p->poll_probe_followup_harvested_outer,
+			p->poll_probe_followup_harvested_children,
+			p->poll_probe_followup_max_harvested_outer_wq,
+			p->poll_probe_followup_min_outer_runway,
+			p->poll_probe_followup_zero_runway);
+		pr_info("DSA_COMPARE_ASSIST_PROFILE: version=1 pages_id=%u enabled=%u queue_capacity=%u burst_pages=%u enqueued=%" PRIu64 " overflow_to_dsa=%" PRIu64 " dequeued=%" PRIu64 " pages=%" PRIu64 " bytes=%" PRIu64 " bursts=%" PRIu64 " max_queue_depth=%" PRIu64 " dsa_diff_submits=%" PRIu64 " general_submits=%" PRIu64 " fresh_submits=%" PRIu64 " while_dsa_active_pages=%" PRIu64 " tail_pages=%" PRIu64 "\n",
+			xfer->pages_id, p->poll_probe_enabled ? 0U : 1U,
+			HOT_DSA_COMPARE_ASSIST_QUEUE_CAPACITY,
+			HOT_DSA_COMPARE_ASSIST_BURST_PAGES,
+			p->assist_enqueued, p->assist_overflow_to_dsa,
+			p->assist_dequeued, p->assist_pages, p->assist_bytes,
+			p->assist_bursts, p->assist_max_queue_depth,
+			p->assist_dsa_diff_submits, p->assist_general_submits,
+			p->assist_fresh_submits,
+			p->assist_while_dsa_active_pages,
+			p->assist_tail_pages);
+		pr_info("DSA_COMPARE_WQ_PROFILE: version=1 pages_id=%u wq_count=%" PRIu64 " max_active_skew=%" PRIu64 " starved_with_claimable_work=%" PRIu64 "\n",
+			xfer->pages_id, p->compare_wq_lane_count,
+			p->compare_wq_max_active_skew,
+			p->compare_wq_starved_with_claimable_work);
+	}
 	pr_info("DSA_POST_THAW_PROFILE_COUNT: version=14 pages_id=%u backend=%s ret=%d service_enabled=1 service_profile_enabled=%u service_mapping_warm=%u raw_pages=%" PRIu64 " raw_bytes=%" PRIu64 " capture_runs=%" PRIu64 " spans=%" PRIu64 " span_pages=%" PRIu64 " max_span_pages=%" PRIu64 " compare_ops=%" PRIu64 " dsa_compare_ops=%" PRIu64 " memcmp_calls=%" PRIu64 " memcmp_requested_bytes=%" PRIu64 " memcmp_scalar_bytes=%" PRIu64 " scalar64_calls=%" PRIu64 " scalar64_word_ops=%" PRIu64 " scalar64_refine_bytes=%" PRIu64 " scalar64_tail_bytes=%" PRIu64 " scalar64_bytes_examined=%" PRIu64 " simd_vector_ops=%" PRIu64 " simd_bytes_examined=%" PRIu64 " hybrid_dsa_claim_spans=%" PRIu64 " hybrid_dsa_claim_pages=%" PRIu64 " hybrid_cpu_claim_spans=%" PRIu64 " hybrid_cpu_claim_pages=%" PRIu64 " hybrid_cpu_waves=%" PRIu64 " hybrid_dsa_to_cpu_handoff_spans=%" PRIu64 " hybrid_dsa_to_cpu_handoff_pages=%" PRIu64 " hybrid_dsa_to_cpu_handoff_remaining_bytes=%" PRIu64 " hybrid_unclaimed_empty_count=%" PRIu64 " compare_nobof_faults=%" PRIu64 " compare_nobof_fault_source1=%" PRIu64 " compare_nobof_fault_source2=%" PRIu64 " compare_nobof_equal_prefix_bytes=%" PRIu64 " compare_fault_handoff_spans=%" PRIu64 " compare_fault_handoff_pages=%" PRIu64 " compare_fault_handoff_remaining_bytes=%" PRIu64 " compare_fault_queue_max=%" PRIu64 " compare_fresh_claim_throttles=%" PRIu64 " compare_cpu_fault_waves=%" PRIu64 " dsa_logical_progress_bytes=%" PRIu64 " simd_logical_progress_bytes=%" PRIu64 " normal_simd_logical_progress_bytes=%" PRIu64 " fault_simd_logical_progress_bytes=%" PRIu64 " dsa_fresh_submit_ops=%" PRIu64 " dsa_continuation_submit_ops=%" PRIu64 " dsa_submitted_bytes=%" PRIu64 " simd_progress_while_dsa_active_bytes=%" PRIu64 " simd_quanta_while_dsa_active=%" PRIu64 " dsa_fresh_claim_bytes=%" PRIu64 " dsa_active_zero_while_normal_cpu_work=%" PRIu64 " ready_completions_before_simd=%" PRIu64 " ready_completions_after_simd=%" PRIu64 " scheduler_iterations=%" PRIu64 " dsa_refill_samples=%" PRIu64 " post_refill_active_sum=%" PRIu64 " post_refill_active_lt_32=%" PRIu64 " post_refill_active_lt_64=%" PRIu64 " post_refill_active_lt_96=%" PRIu64 " fresh_refill_spans=%" PRIu64 " fresh_refill_batches=%" PRIu64 " fresh_refill_blocked_fault_debt=%" PRIu64 " dsa_empty_with_claimable_fresh=%" PRIu64 " batch_outer_submits=%" PRIu64 " batch_child_submits=%" PRIu64 " batch_partial_submits=%" PRIu64 " batch_single_tail_submits=%" PRIu64 " batch_outer_success=%" PRIu64 " batch_outer_fail=%" PRIu64 " batch_child_success=%" PRIu64 " batch_child_nobof=%" PRIu64 " batch_max_active_outer=%" PRIu64 " batch_max_active_children=%" PRIu64 " prq_profile_available=%u prq_profile_sources=%u prq_pg_requests=%" PRIu64 " prq_thread_cpu_us=%" PRIu64 " prq_setup_errno=%d enq_retries=%" PRIu64 " poll_sweeps=%" PRIu64 " not_ready=%" PRIu64 " max_active=%" PRIu64 " completions_harvested=%" PRIu64 " completion_timeout_count=%" PRIu64 " max_completion_age_us=%" PRIu64 " prefault_spans=%" PRIu64 " prefault_pages=%" PRIu64 " parent_pages=%" PRIu64 " patch_pages=%" PRIu64 " full_pages=%" PRIu64 " patch_ranges=%" PRIu64 " patch_bytes=%" PRIu64 " idx_write_calls=%" PRIu64 " idx_bytes=%" PRIu64 " dat_write_calls=%" PRIu64 " dat_writev_calls=%" PRIu64 " dat_bytes=%" PRIu64 " idx_write_syscalls=%" PRIu64 " dat_write_syscalls=%" PRIu64 " dat_writev_syscalls=%" PRIu64 " sidecar_lseek_syscalls=%" PRIu64 " pagemap_records=%" PRIu64 " pagemap_bytes=%" PRIu64 "\n",
 		xfer->pages_id, backend, ret, p->enabled, p->mapping_warm,
 		p->raw_pages, p->raw_bytes, p->capture_runs, p->spans,
@@ -5248,8 +5567,15 @@ struct hot_fg_compare_batch {
 enum hot_fg_compare_span_state {
 	HOT_FG_SPAN_UNPREFAULTED = 0,
 	HOT_FG_SPAN_READY,
+	HOT_FG_SPAN_CPU_ASSIST_READY,
 	HOT_FG_SPAN_ACTIVE,
 	HOT_FG_SPAN_DONE,
+};
+
+enum hot_fg_compare_span_owner {
+	HOT_FG_SPAN_OWNER_NONE = 0,
+	HOT_FG_SPAN_OWNER_DSA,
+	HOT_FG_SPAN_OWNER_SIMD,
 };
 
 struct hot_fg_compare_span {
@@ -5261,15 +5587,18 @@ struct hot_fg_compare_span {
 	u32 cursor;
 	size_t finalized_pages;
 	u8 state;
+	u8 owner;
 };
 
 struct hot_fg_ready_queue {
 	size_t *indices;
 	struct hot_fg_compare_span *spans;
+	size_t nr_spans;
 	size_t capacity;
 	size_t head;
 	size_t tail;
 	size_t nr;
+	bool owns_indices;
 };
 
 struct hot_fg_output_state {
@@ -5316,39 +5645,58 @@ static int hot_fg_raw_pages_append(struct hot_apply_ctx *ctx,
 	return 0;
 }
 
+static int hot_fg_ready_queue_init_capacity(struct hot_fg_ready_queue *queue,
+					    struct hot_fg_compare_span *spans,
+					    size_t nr_spans, size_t capacity)
+{
+	memset(queue, 0, sizeof(*queue));
+	if (!capacity || capacity > nr_spans)
+		return -1;
+	queue->indices = xmalloc(capacity * sizeof(*queue->indices));
+	if (!queue->indices)
+		return -1;
+	queue->spans = spans;
+	queue->nr_spans = nr_spans;
+	queue->capacity = capacity;
+	queue->owns_indices = true;
+	return 0;
+}
+
 static int hot_fg_ready_queue_init(struct hot_fg_ready_queue *queue,
 				   struct hot_fg_compare_span *spans,
 				   size_t nr_spans)
 {
-	memset(queue, 0, sizeof(*queue));
-	queue->indices = xmalloc(nr_spans * sizeof(*queue->indices));
-	if (!queue->indices)
-		return -1;
-	queue->spans = spans;
-	queue->capacity = nr_spans;
-	return 0;
+	return hot_fg_ready_queue_init_capacity(queue, spans, nr_spans, nr_spans);
 }
 
 static void hot_fg_ready_queue_fini(struct hot_fg_ready_queue *queue)
 {
-	xfree(queue->indices);
+	if (queue->owns_indices)
+		xfree(queue->indices);
 	queue->indices = NULL;
 }
 
-static int hot_fg_ready_queue_push(struct hot_fg_ready_queue *queue,
-				   size_t span_idx)
+static int hot_fg_ready_queue_push_state(struct hot_fg_ready_queue *queue,
+					 size_t span_idx, u8 expected_state)
 {
 	struct hot_fg_compare_span *span;
 
-	if (span_idx >= queue->capacity || queue->nr >= queue->capacity)
+	if (span_idx >= queue->nr_spans || queue->nr >= queue->capacity)
 		return -1;
 	span = &queue->spans[span_idx];
-	if (span->state != HOT_FG_SPAN_READY)
+	if (span->state != expected_state)
 		return -1;
 	queue->indices[queue->tail] = span_idx;
 	queue->tail = (queue->tail + 1) % queue->capacity;
 	queue->nr++;
 	return 0;
+}
+
+static int hot_fg_ready_queue_push(struct hot_fg_ready_queue *queue,
+				   size_t span_idx)
+{
+	return hot_fg_ready_queue_push_state(queue, span_idx,
+					     HOT_FG_SPAN_READY);
 }
 
 static int hot_fg_ready_queue_pop(struct hot_fg_ready_queue *queue,
@@ -6250,57 +6598,60 @@ static int hot_fg_cpu_first_diff(enum hot_fg_compare_backend backend,
 	return -1;
 }
 
-static int hot_fg_prefault_parent_span(const struct hot_fg_compare_span *span,
-				       size_t span_idx, const char *stage)
+static int hot_fg_compare_cpu_span(struct hot_apply_ctx *ctx,
+				   struct hot_fg_raw_page *pages,
+				   struct hot_fg_compare_span *span,
+				   enum hot_fg_compare_backend backend,
+				   struct hot_fg_cpu_scan_stats *stats)
 {
 	if (!span || !span->parent || !span->length ||
-	    ((unsigned long)span->parent & (PAGE_SIZE - 1)) ||
-	    span->length % PAGE_SIZE) {
-		pr_err("DSA fine-grained parent prefault invalid stage=%s span=%zu parent=%p length=%u\n",
-		       stage, span_idx, span ? span->parent : NULL,
-		       span ? span->length : 0);
+	    span->length % PAGE_SIZE ||
+	    span->state != HOT_FG_SPAN_UNPREFAULTED)
 		return -1;
-	}
+	/* A CPU-owned span faults on its first useful load; there is no separate
+	 * residency pass outside compare-breakdown mode. */
+	span->state = HOT_FG_SPAN_ACTIVE;
+	while (span->cursor < span->length) {
+		bool equal;
+		u32 diff;
 
-	/*
-	 * Populate only the exact compare span.  The hot parent is already a
-	 * resident tmpfs-backed, read-only MAP_SHARED mapping; this establishes
-	 * readable PTEs synchronously without the post-fault user load performed
-	 * by the old byte-per-page loop.  A failed populate must not submit DSA
-	 * against a partially prepared span or silently change fault semantics.
-	 */
-	if (madvise((void *)span->parent, span->length, MADV_POPULATE_READ)) {
-		pr_perror("DSA fine-grained parent MADV_POPULATE_READ failed stage=%s span=%zu parent=%p length=%u",
-			  stage, span_idx, span->parent, span->length);
+		if (hot_fg_cpu_first_diff(backend, span->raw + span->cursor,
+					  span->parent + span->cursor,
+					  span->length - span->cursor, &equal, &diff,
+					  stats))
+			return -1;
+		if (equal) {
+			span->cursor = span->length;
+			if (hot_fg_span_finalize(span, pages, span->cursor))
+				return -1;
+			break;
+		}
+		if (hot_fg_span_record_diff(span, pages, span->cursor + diff))
+			return -1;
+	}
+	if (span->cursor != span->length ||
+	    hot_fg_span_finalize(span, pages, span->length) ||
+	    span->finalized_pages != span->page_count)
 		return -1;
-	}
-
+	span->state = HOT_FG_SPAN_DONE;
 	return 0;
 }
 
-static int hot_fg_prefault_all(struct hot_apply_ctx *ctx,
-			       struct hot_fg_compare_span *spans, size_t nr_spans)
+static void hot_fg_cpu_scan_stats_add(struct hot_apply_ctx *ctx,
+				      const struct hot_fg_cpu_scan_stats *stats)
 {
-	size_t i;
-
-	for (i = 0; i < nr_spans; i++) {
-		struct hot_fg_compare_span *span = &spans[i];
-
-		if (!span->parent || !span->length || span->length % PAGE_SIZE ||
-		    span->state != HOT_FG_SPAN_UNPREFAULTED) {
-			pr_err("DSA compare breakdown has invalid prefault span=%zu state=%u length=%u\n",
-			       i, span->state, span->length);
-			return -1;
-		}
-		if (hot_fg_prefault_parent_span(span, i, "breakdown"))
-			return -1;
-		span->state = HOT_FG_SPAN_READY;
-		if (ctx->profile) {
-			ctx->profile_prefault_spans++;
-			ctx->profile_prefault_pages += span->length / PAGE_SIZE;
-		}
-	}
-	return 0;
+	if (!ctx->profile || !stats)
+		return;
+	ctx->profile_memcmp_calls += stats->memcmp_calls;
+	ctx->profile_memcmp_requested_bytes += stats->memcmp_requested_bytes;
+	ctx->profile_memcmp_scalar_bytes += stats->memcmp_scalar_bytes;
+	ctx->profile_scalar64_calls += stats->scalar64_calls;
+	ctx->profile_scalar64_word_ops += stats->scalar64_word_ops;
+	ctx->profile_scalar64_refine_bytes += stats->scalar64_refine_bytes;
+	ctx->profile_scalar64_tail_bytes += stats->scalar64_tail_bytes;
+	ctx->profile_scalar64_bytes_examined += stats->scalar64_bytes_examined;
+	ctx->profile_simd_vector_ops += stats->vector_ops;
+	ctx->profile_simd_bytes_examined += stats->bytes_examined;
 }
 
 static int hot_fg_compare_cpu(struct hot_apply_ctx *ctx,
@@ -6313,62 +6664,17 @@ static int hot_fg_compare_cpu(struct hot_apply_ctx *ctx,
 	size_t i;
 
 	for (i = 0; i < nr_spans; i++) {
-		struct hot_fg_compare_span *span = &spans[i];
-
-		if (!span->parent || !span->length || span->length % PAGE_SIZE ||
-		    (span->state != HOT_FG_SPAN_UNPREFAULTED &&
-		     !(ctx->compare_breakdown && span->state == HOT_FG_SPAN_READY))) {
-			pr_err("DSA fine-grained CPU compare has invalid backend=%s span=%zu state=%u length=%u\n",
+		if (hot_fg_compare_cpu_span(ctx, pages, &spans[i], backend,
+					    record_profile && ctx->profile ? &stats : NULL)) {
+			pr_err("DSA fine-grained CPU compare backend=%s failed span=%zu state=%u length=%u\n",
 			       hot_fg_compare_backend_name(backend), i,
-			       span->state, span->length);
+			       spans[i].state, spans[i].length);
 			return -1;
 		}
-		/* CPU backends do not need a separate residency pass.  A missing
-		 * file-backed PTE is resolved synchronously by the first real load,
-		 * which then resumes and performs useful comparison.  The explicit
-		 * all-span MADV_POPULATE_READ barrier is retained only by the
-		 * compare-breakdown path above this function. */
-		span->state = HOT_FG_SPAN_ACTIVE;
-		while (span->cursor < span->length) {
-			bool equal;
-			u32 diff;
-
-			if (hot_fg_cpu_first_diff(backend, span->raw + span->cursor,
-						  span->parent + span->cursor,
-						  span->length - span->cursor, &equal, &diff,
-						  record_profile && ctx->profile ? &stats : NULL))
-				return -1;
-			if (equal) {
-				span->cursor = span->length;
-				if (hot_fg_span_finalize(span, pages, span->cursor))
-					return -1;
-				break;
-			}
-			if (hot_fg_span_record_diff(span, pages, span->cursor + diff))
-				return -1;
-		}
-		if (span->cursor != span->length ||
-		    hot_fg_span_finalize(span, pages, span->length) ||
-		    span->finalized_pages != span->page_count) {
-			pr_err("DSA fine-grained CPU compare backend=%s span ended with unfinished pages\n",
-			       hot_fg_compare_backend_name(backend));
-			return -1;
-		}
-		span->state = HOT_FG_SPAN_DONE;
 	}
 
-	if (record_profile && ctx->profile) {
-		ctx->profile_memcmp_calls += stats.memcmp_calls;
-		ctx->profile_memcmp_requested_bytes += stats.memcmp_requested_bytes;
-		ctx->profile_memcmp_scalar_bytes += stats.memcmp_scalar_bytes;
-		ctx->profile_scalar64_calls += stats.scalar64_calls;
-		ctx->profile_scalar64_word_ops += stats.scalar64_word_ops;
-		ctx->profile_scalar64_refine_bytes += stats.scalar64_refine_bytes;
-		ctx->profile_scalar64_tail_bytes += stats.scalar64_tail_bytes;
-		ctx->profile_scalar64_bytes_examined += stats.scalar64_bytes_examined;
-		ctx->profile_simd_vector_ops += stats.vector_ops;
-		ctx->profile_simd_bytes_examined += stats.bytes_examined;
-	}
+	if (record_profile)
+		hot_fg_cpu_scan_stats_add(ctx, &stats);
 	return 0;
 }
 
@@ -6424,18 +6730,13 @@ static int hot_fg_validate_compare_metadata(const struct hot_fg_raw_page *dsa_pa
 			return -1;
 		}
 	}
-	for (i = 0; i < nr_spans; i++) {
-		const struct hot_fg_compare_span *dsa = &dsa_spans[i];
-		const struct hot_fg_compare_span *simd = &simd_spans[i];
-
-		if (dsa->cursor != simd->cursor ||
-		    dsa->finalized_pages != simd->finalized_pages ||
-		    dsa->state != simd->state) {
-			pr_err("DSA fine-grained validate span metadata mismatch span=%zu dsa_cursor=%u simd_cursor=%u dsa_state=%u simd_state=%u\n",
-			       i, dsa->cursor, simd->cursor, dsa->state, simd->state);
-			return -1;
-		}
-	}
+	/* Spans are transient scheduler views.  Opportunistic SIMD may remove
+	 * tail pages from an unclaimed DSA span, so the two backends need not end
+	 * with identical span length/cursor geometry.  Canonical correctness is
+	 * the page state and every patch range checked above. */
+	(void)dsa_spans;
+	(void)simd_spans;
+	(void)nr_spans;
 	return 0;
 }
 
@@ -6512,10 +6813,10 @@ static int hot_fg_wavefront_drain_slots(struct hot_fg_compare_slot *slots,
 }
 
 /*
- * A no-BOF fault does not change ownership of the extent.  DSA has proved the
- * bytes_completed prefix equal; AVX-512 resolves and classifies only the page
- * containing the next unprocessed byte, then the page-aligned suffix returns
- * to the ordinary DSA ready FIFO.
+ * A no-BOF fault does not change ownership of the extent.  First touch the
+ * exact operand page reported by the completion (it need not be the compare
+ * frontier), then let AVX-512 classify the page containing the next
+ * unprocessed byte.  The page-aligned suffix returns to the DSA ready FIFO.
  */
 static int hot_fg_compare_fault_page_simd(struct hot_apply_ctx *ctx,
 					  struct hot_fg_raw_page *pages,
@@ -6570,6 +6871,10 @@ static int hot_fg_compare_fault_page_simd(struct hot_apply_ctx *ctx,
 		       slot->submitted_len);
 		return -1;
 	}
+	/* The accelerator may fault on an implementation-dependent access ahead
+	 * of bytes_completed.  Resolve that precise mapping before retrying; do
+	 * not infer the faulting page from the completed-prefix length. */
+	(void)*(volatile const unsigned char *)(unsigned long)slot->comp.fault_addr;
 
 	absolute = old_cursor + partial;
 	if (absolute >= span->length)
@@ -6631,6 +6936,9 @@ static int hot_fg_compare_fault_page_simd(struct hot_apply_ctx *ctx,
 		ctx->profile_compare_fault_handoff_pages++;
 		ctx->profile_compare_fault_handoff_remaining_bytes += simd_progress;
 		ctx->profile_compare_cpu_fault_waves++;
+		ctx->profile_hybrid_dsa_to_cpu_handoff_spans++;
+		ctx->profile_hybrid_dsa_to_cpu_handoff_pages++;
+		ctx->profile_hybrid_dsa_to_cpu_handoff_remaining_bytes += simd_progress;
 		if (ctx->profile_compare_fault_queue_max < 1)
 			ctx->profile_compare_fault_queue_max = 1;
 		ctx->profile_dsa_logical_progress_bytes += partial;
@@ -6661,8 +6969,7 @@ static int __attribute__((unused)) hot_fg_compare_wavefront(struct hot_apply_ctx
 	for (i = 0; i < nr_spans; i++) {
 		if (spans[i].state == HOT_FG_SPAN_UNPREFAULTED)
 			spans[i].state = HOT_FG_SPAN_READY;
-		else if (!ctx->compare_breakdown ||
-			 spans[i].state != HOT_FG_SPAN_READY) {
+		else {
 			pr_err("DSA no-BOF compare has invalid initial span=%zu state=%u\n",
 			       i, spans[i].state);
 			goto out;
@@ -6858,9 +7165,8 @@ static int hot_fg_compare_batch_prepare_outer(struct hot_apply_ctx *ctx,
 					      struct hot_fg_compare_batch *batch)
 {
 	if (!batch->child_count || batch->child_count > HOT_DSA_COMPARE_BATCH_CHILDREN ||
-	    !ctx->dsa_wq_count)
+	    !ctx->dsa_wq_count || batch->wq_idx >= (u32)ctx->dsa_wq_count)
 		return -1;
-	batch->wq_idx = ctx->dsa_next_wq++ % (u32)ctx->dsa_wq_count;
 	batch->direct_single = batch->child_count == 1;
 	if (!batch->direct_single) {
 		memset(&batch->outer_desc, 0, sizeof(batch->outer_desc));
@@ -6948,7 +7254,10 @@ static bool hot_fg_compare_batch_ready(const struct hot_fg_compare_batch *batch)
 static int hot_fg_compare_batch_harvest(
 	struct hot_apply_ctx *ctx, struct hot_fg_compare_batch *batch,
 	struct hot_fg_raw_page *pages, struct hot_fg_compare_span *spans,
-	struct hot_fg_ready_queue *ready, size_t *done, u64 now_ns)
+	struct hot_fg_ready_queue *ready,
+	struct hot_fg_ready_queue *dsa_diff_ready,
+	struct hot_fg_ready_queue *cpu_assist,
+	bool assist_enabled, size_t *done, u64 now_ns)
 {
 	u32 i;
 	bool saw_nobof = false;
@@ -6992,7 +7301,8 @@ static int hot_fg_compare_batch_harvest(
 			pr_err("DSA COMPARE BATCH child is not terminal child=%u\n", i);
 			return -1;
 		}
-		if (!span || span->state != HOT_FG_SPAN_ACTIVE ||
+		if (!span || span->owner != HOT_FG_SPAN_OWNER_DSA ||
+		    span->state != HOT_FG_SPAN_ACTIVE ||
 		    meta->submitted_cursor != span->cursor) {
 			pr_err("DSA COMPARE BATCH child has stale span cursor child=%u\n", i);
 			return -1;
@@ -7034,9 +7344,36 @@ static int hot_fg_compare_batch_harvest(
 			span->state = HOT_FG_SPAN_DONE;
 			(*done)++;
 		} else {
-			span->state = HOT_FG_SPAN_READY;
-			if (hot_fg_ready_queue_push(ready, (size_t)(span - spans)))
-				return -1;
+			size_t span_idx = (size_t)(span - spans);
+			bool same_page_diff = kind == HOT_FG_NOBOF_DIFFERENT &&
+				(span->cursor & (PAGE_SIZE - 1));
+
+			if (same_page_diff && assist_enabled &&
+			    cpu_assist->nr < cpu_assist->capacity) {
+				span->state = HOT_FG_SPAN_CPU_ASSIST_READY;
+				if (hot_fg_ready_queue_push_state(
+					    cpu_assist, span_idx,
+					    HOT_FG_SPAN_CPU_ASSIST_READY))
+					return -1;
+				if (ctx->profile) {
+					ctx->profile_assist_enqueued++;
+					if (cpu_assist->nr >
+					    ctx->profile_assist_max_queue_depth)
+						ctx->profile_assist_max_queue_depth =
+							cpu_assist->nr;
+				}
+			} else {
+				span->state = HOT_FG_SPAN_READY;
+				if (same_page_diff) {
+					if (hot_fg_ready_queue_push(dsa_diff_ready,
+								span_idx))
+						return -1;
+					if (ctx->profile && assist_enabled)
+						ctx->profile_assist_overflow_to_dsa++;
+				} else if (hot_fg_ready_queue_push(ready, span_idx)) {
+					return -1;
+				}
+			}
 		}
 	}
 	if (!batch->direct_single) {
@@ -7057,6 +7394,70 @@ static int hot_fg_compare_batch_harvest(
 	return 1;
 }
 
+/* Finish only the current 4 KiB page of a DSA-discovered DIFFERENT chain.
+ * The following page, if any, returns to the ordinary DSA ready queue. */
+static int hot_fg_compare_assist_current_page(
+	struct hot_apply_ctx *ctx, struct hot_fg_raw_page *pages,
+	struct hot_fg_compare_span *span, struct hot_fg_ready_queue *ready,
+	size_t *done, u64 *progress_bytes)
+{
+	struct hot_fg_cpu_scan_stats stats = {};
+	u32 start;
+	u32 page_end;
+
+	if (!span || !span->parent ||
+	    span->owner != HOT_FG_SPAN_OWNER_DSA ||
+	    span->state != HOT_FG_SPAN_CPU_ASSIST_READY ||
+	    span->cursor >= span->length ||
+	    !(span->cursor & (PAGE_SIZE - 1)))
+		return -1;
+	start = span->cursor;
+	page_end = (start & ~(PAGE_SIZE - 1)) + PAGE_SIZE;
+	if (page_end > span->length)
+		return -1;
+	span->state = HOT_FG_SPAN_ACTIVE;
+	while (span->cursor < page_end) {
+		bool equal;
+		u32 diff;
+		u32 length = page_end - span->cursor;
+
+		if (hot_fg_cpu_first_diff(HOT_FG_COMPARE_SIMD_AVX512,
+					  span->raw + span->cursor,
+					  span->parent + span->cursor,
+					  length, &equal, &diff,
+					  ctx->profile ? &stats : NULL))
+			return -1;
+		if (equal) {
+			span->cursor = page_end;
+			if (hot_fg_span_finalize(span, pages, span->cursor))
+				return -1;
+			break;
+		}
+		if (hot_fg_span_record_diff(span, pages, span->cursor + diff))
+			return -1;
+	}
+	if (span->cursor != page_end ||
+	    hot_fg_span_finalize(span, pages, page_end))
+		return -1;
+	*progress_bytes = page_end - start;
+	if (span->cursor == span->length) {
+		if (span->finalized_pages != span->page_count)
+			return -1;
+		span->state = HOT_FG_SPAN_DONE;
+		(*done)++;
+	} else {
+		span->state = HOT_FG_SPAN_READY;
+		if (hot_fg_ready_queue_push(ready, (size_t)(span - ready->spans)))
+			return -1;
+	}
+	if (ctx->profile) {
+		hot_fg_cpu_scan_stats_add(ctx, &stats);
+		ctx->profile_simd_logical_progress_bytes += *progress_bytes;
+		ctx->profile_normal_simd_logical_progress_bytes += *progress_bytes;
+	}
+	return 0;
+}
+
 static void hot_fg_compare_batch_timeout(
 	const struct hot_fg_compare_batch *batch, size_t active, u64 now_ns)
 {
@@ -7075,22 +7476,154 @@ static void hot_fg_compare_batch_timeout(
 	_exit(CDP_DSA_COMPLETION_TIMEOUT_EXIT);
 }
 
+static int hot_fg_compare_claim_fresh(
+	struct hot_apply_ctx *ctx, struct hot_fg_compare_span *spans,
+	size_t *fresh_head, size_t fresh_tail, size_t *span_idx,
+	size_t *dsa_spans)
+{
+	struct hot_fg_compare_span *span;
+
+	if (*fresh_head >= fresh_tail)
+		return 1;
+	*span_idx = (*fresh_head)++;
+	span = &spans[*span_idx];
+	if (!span->parent || !span->page_count ||
+	    span->length != span->page_count * PAGE_SIZE ||
+	    span->owner != HOT_FG_SPAN_OWNER_NONE ||
+	    span->state != HOT_FG_SPAN_UNPREFAULTED)
+		return -1;
+	span->owner = HOT_FG_SPAN_OWNER_DSA;
+	span->state = HOT_FG_SPAN_READY;
+	(*dsa_spans)++;
+	if (ctx->profile) {
+		ctx->profile_hybrid_dsa_claim_spans++;
+		ctx->profile_hybrid_dsa_claim_pages += span->page_count;
+		ctx->profile_dsa_fresh_claim_bytes += span->length;
+	}
+	return 0;
+}
+
+/* Execute one real AVX-512 page comparison without changing the production
+ * ownership graph.  Samples come only from DSA-completed spans, so the probe
+ * cannot pre-touch or cache-warm work that DSA still has to execute. */
+static int hot_fg_compare_poll_probe_page(
+	struct hot_apply_ctx *ctx, struct hot_fg_raw_page *pages,
+	struct hot_fg_compare_span *spans, size_t nr_spans,
+	const size_t *samples, size_t sample_count, size_t *sample_read,
+	size_t *page_cursor)
+{
+	struct hot_fg_raw_page shadow_page = {};
+	struct hot_fg_compare_span shadow_span = {};
+	struct hot_fg_compare_span *sample;
+	struct hot_fg_raw_page *source;
+	size_t sample_idx;
+	size_t page_off;
+
+	if (!ctx || !pages || !spans || !nr_spans || !samples ||
+	    !sample_count || sample_count > nr_spans ||
+	    !sample_read || !page_cursor)
+		return -1;
+	if (*sample_read >= sample_count)
+		return 1;
+	sample_idx = samples[*sample_read];
+	if (sample_idx >= nr_spans)
+		return -1;
+	sample = &spans[sample_idx];
+	if (sample->owner != HOT_FG_SPAN_OWNER_DSA ||
+	    sample->state != HOT_FG_SPAN_DONE || !sample->page_count ||
+	    sample->cursor != sample->length ||
+	    sample->finalized_pages != sample->page_count)
+		return 1;
+	page_off = *page_cursor;
+	if (page_off >= sample->page_count)
+		return -1;
+	source = &pages[sample->first_page + page_off];
+	if (!source->raw || !source->parent ||
+	    (source->state != HOT_FG_RAW_PARENT &&
+	     source->state != HOT_FG_RAW_PATCH &&
+	     source->state != HOT_FG_RAW_FULL))
+		return -1;
+	shadow_page.vaddr = source->vaddr;
+	shadow_page.raw = source->raw;
+	shadow_page.parent = source->parent;
+	shadow_page.state = HOT_FG_RAW_PENDING;
+	shadow_span.raw = source->raw;
+	shadow_span.parent = source->parent;
+	shadow_span.first_page = 0;
+	shadow_span.page_count = 1;
+	shadow_span.length = PAGE_SIZE;
+	shadow_span.state = HOT_FG_SPAN_UNPREFAULTED;
+	shadow_span.owner = HOT_FG_SPAN_OWNER_SIMD;
+	if (hot_fg_compare_cpu_span(ctx, &shadow_page, &shadow_span,
+				    HOT_FG_COMPARE_SIMD_AVX512, NULL))
+		return -1;
+	switch (shadow_page.state) {
+	case HOT_FG_RAW_PARENT:
+		ctx->profile_poll_probe_shadow_parent_pages++;
+		break;
+	case HOT_FG_RAW_PATCH:
+		ctx->profile_poll_probe_shadow_patch_pages++;
+		break;
+	case HOT_FG_RAW_FULL:
+		ctx->profile_poll_probe_shadow_full_pages++;
+		break;
+	default:
+		return -1;
+	}
+	(*page_cursor)++;
+	if (*page_cursor == sample->page_count) {
+		(*sample_read)++;
+		*page_cursor = 0;
+	}
+	return 0;
+}
+
+enum hot_fg_simd_gate_profile_state {
+	HOT_FG_SIMD_GATE_PROFILE_NONE = 0,
+	HOT_FG_SIMD_GATE_PROFILE_FULL_ABOVE_RESERVE,
+	HOT_FG_SIMD_GATE_PROFILE_PARTIAL_ABOVE_RESERVE,
+	HOT_FG_SIMD_GATE_PROFILE_RESERVE_FULL,
+	HOT_FG_SIMD_GATE_PROFILE_RESERVE_PARTIAL,
+	HOT_FG_SIMD_GATE_PROFILE_EXHAUSTED_READY,
+	HOT_FG_SIMD_GATE_PROFILE_EXHAUSTED_INFLIGHT,
+};
+
 static int hot_fg_compare_hw_batch(struct hot_apply_ctx *ctx,
 				   struct hot_fg_raw_page *pages,
 				   struct hot_fg_compare_span *spans,
 				   size_t nr_spans)
 {
 	struct hot_fg_compare_batch *batches;
-	struct hot_fg_ready_queue ready;
+	struct hot_fg_ready_queue ready = {};
+	struct hot_fg_ready_queue dsa_diff_ready = {};
+	struct hot_fg_ready_queue cpu_assist = {};
+	size_t active_wq[HOT_DSA_MAX_WQ] = {};
+	size_t active_children_wq[HOT_DSA_MAX_WQ] = {};
 	size_t active_outer = 0;
 	size_t active_children = 0;
+	size_t dsa_spans = 0;
+	size_t fresh_head = 0;
+	size_t fresh_tail = nr_spans;
+	size_t fresh_pages_remaining = ctx->profile ?
+		(size_t)ctx->profile_span_pages : 0;
 	size_t done = 0;
+	bool poll_probe_feedback_pending = false;
+	u64 poll_probe_start_ns = 0;
+	size_t *poll_probe_samples = NULL;
+	size_t poll_probe_sample_count = 0;
+	size_t poll_probe_sample_read = 0;
+	size_t poll_probe_page_cursor = 0;
+	enum hot_fg_simd_gate_profile_state gate_profile_state =
+		HOT_FG_SIMD_GATE_PROFILE_NONE;
+	u64 gate_profile_start_ns = 0;
 	u64 sequence = 0;
 	size_t i;
 	int ret = -1;
 
 	if (!nr_spans)
 		return 0;
+	if (ctx->dsa_wq_count <= 0 || ctx->dsa_wq_count > HOT_DSA_MAX_WQ)
+		return -1;
 	if (!ctx->compare_batches) {
 		if (posix_memalign((void **)&ctx->compare_batches, 64,
 				   HOT_DSA_COMPARE_INFLIGHT *
@@ -7101,102 +7634,315 @@ static int hot_fg_compare_hw_batch(struct hot_apply_ctx *ctx,
 	}
 	batches = ctx->compare_batches;
 	for (i = 0; i < HOT_DSA_COMPARE_INFLIGHT; i++) {
-		if (batches[i].active) {
-			pr_err("DSA hardware-BATCH compare pool still has active outer=%zu\n",
-			       i);
+		if (batches[i].active || batches[i].child_count) {
+			pr_err("DSA opportunistic scheduler pool still owns outer=%zu active=%u children=%u\n",
+			       i, batches[i].active ? 1U : 0U,
+			       batches[i].child_count);
 			return -1;
 		}
-		batches[i].child_count = 0;
 		batches[i].direct_single = false;
+		/* A pool slot is a permanent lane of one WQ.  Reusing the slot on
+		 * the same portal bounds this service to at most ceil(128/nr_wq)
+		 * outstanding outer descriptors per WQ and avoids instantaneous
+		 * backlog skew hidden by cumulative round-robin counts. */
+		batches[i].wq_idx = (u32)(i % (size_t)ctx->dsa_wq_count);
 	}
-	if (hot_fg_ready_queue_init(&ready, spans, nr_spans))
-		goto out;
-	for (i = 0; i < nr_spans; i++) {
-		if (spans[i].state == HOT_FG_SPAN_UNPREFAULTED)
-			spans[i].state = HOT_FG_SPAN_READY;
-		else if (!ctx->compare_breakdown ||
-			 spans[i].state != HOT_FG_SPAN_READY)
-			goto out_queue;
-		if (hot_fg_ready_queue_push(&ready, i))
-			goto out_queue;
+	if (ctx->poll_probe_enabled) {
+		poll_probe_samples = xmalloc(nr_spans * sizeof(*poll_probe_samples));
+		if (!poll_probe_samples)
+			return -1;
 	}
-
+	if (ctx->profile)
+		ctx->profile_compare_wq_lane_count = (u64)ctx->dsa_wq_count;
+	if (hot_fg_ready_queue_init(&ready, spans, nr_spans) ||
+	    hot_fg_ready_queue_init(&dsa_diff_ready, spans, nr_spans) ||
+	    hot_fg_ready_queue_init_capacity(
+		    &cpu_assist, spans, nr_spans,
+		    nr_spans < HOT_DSA_COMPARE_ASSIST_QUEUE_CAPACITY ?
+			    nr_spans : HOT_DSA_COMPARE_ASSIST_QUEUE_CAPACITY)) {
+		hot_fg_ready_queue_fini(&ready);
+		hot_fg_ready_queue_fini(&dsa_diff_ready);
+		hot_fg_ready_queue_fini(&cpu_assist);
+		xfree(poll_probe_samples);
+		return -1;
+	}
 	while (done < nr_spans) {
-		u64 now_ns = hot_dsa_watchdog_now_ns();
+		u64 now_ns;
 		u32 prepared[HOT_DSA_COMPARE_INFLIGHT];
 		size_t prepared_count = 0;
 		size_t harvested = 0;
+		size_t harvested_wq[HOT_DSA_MAX_WQ] = {};
+		size_t harvested_children_wq[HOT_DSA_MAX_WQ] = {};
+		size_t fresh_prepared = 0;
+		size_t fresh_batches = 0;
+		size_t profile_min_wq_outer = 0;
+		size_t profile_min_wq_children = 0;
 		bool submitted = false;
+
+		now_ns = hot_dsa_watchdog_now_ns();
 
 		if (!now_ns)
 			goto out_queue;
-		if (ctx->profile && active_outer)
-			ctx->profile_compare_poll_sweeps++;
+		if (poll_probe_feedback_pending && poll_probe_start_ns) {
+			if (now_ns < poll_probe_start_ns)
+				goto out_queue;
+			ctx->profile_poll_probe_wall_ns +=
+				now_ns - poll_probe_start_ns;
+			poll_probe_start_ns = 0;
+		}
+		if (ctx->profile &&
+		    gate_profile_state != HOT_FG_SIMD_GATE_PROFILE_NONE) {
+			u64 elapsed_ns = now_ns >= gate_profile_start_ns ?
+				now_ns - gate_profile_start_ns : 0;
+
+			switch (gate_profile_state) {
+			case HOT_FG_SIMD_GATE_PROFILE_FULL_ABOVE_RESERVE:
+				ctx->profile_opportunistic_simd_gate_full_above_reserve_ns +=
+					elapsed_ns;
+				break;
+			case HOT_FG_SIMD_GATE_PROFILE_PARTIAL_ABOVE_RESERVE:
+				ctx->profile_opportunistic_simd_gate_partial_above_reserve_ns +=
+					elapsed_ns;
+				break;
+			case HOT_FG_SIMD_GATE_PROFILE_RESERVE_FULL:
+				ctx->profile_opportunistic_simd_gate_reserve_full_ns +=
+					elapsed_ns;
+				break;
+			case HOT_FG_SIMD_GATE_PROFILE_RESERVE_PARTIAL:
+				ctx->profile_opportunistic_simd_gate_reserve_partial_ns +=
+					elapsed_ns;
+				break;
+			case HOT_FG_SIMD_GATE_PROFILE_EXHAUSTED_READY:
+				ctx->profile_opportunistic_simd_gate_exhausted_ready_ns +=
+					elapsed_ns;
+				break;
+			case HOT_FG_SIMD_GATE_PROFILE_EXHAUSTED_INFLIGHT:
+				ctx->profile_opportunistic_simd_gate_exhausted_inflight_ns +=
+					elapsed_ns;
+				break;
+			default:
+				goto out_queue;
+			}
+			gate_profile_state = HOT_FG_SIMD_GATE_PROFILE_NONE;
+			gate_profile_start_ns = 0;
+		}
+		if (ctx->profile) {
+			ctx->profile_scheduler_iterations++;
+			if (active_outer)
+				ctx->profile_compare_poll_sweeps++;
+		}
 		for (i = 0; i < HOT_DSA_COMPARE_INFLIGHT; i++) {
 			struct hot_fg_compare_batch *batch = &batches[i];
+			size_t completed_children;
 			int rc;
 
 			if (!batch->active)
 				continue;
 			if (!hot_fg_compare_batch_ready(batch)) {
+				if (ctx->profile)
+					ctx->profile_compare_not_ready++;
 				if (now_ns >= batch->completion_deadline_ns)
-					hot_fg_compare_batch_timeout(batch, active_outer, now_ns);
+					hot_fg_compare_batch_timeout(batch, active_outer,
+								     now_ns);
 				continue;
 			}
-			rc = hot_fg_compare_batch_harvest(ctx, batch, pages, spans,
-							  &ready, &done, now_ns);
+			completed_children = batch->child_count;
+			rc = hot_fg_compare_batch_harvest(
+				ctx, batch, pages, spans, &ready, &dsa_diff_ready,
+				&cpu_assist, !ctx->poll_probe_enabled, &done, now_ns);
 			if (rc < 0)
 				goto out_queue;
 			if (rc > 0) {
+				u32 child;
+
+				/* Build the probe sample set only in the explicit experiment.
+				 * The child metadata survives harvest even though child_count is
+				 * cleared, so this adds O(completed children) work to an already
+				 * completed batch and never scans the global span table. */
+				if (ctx->poll_probe_enabled &&
+				    poll_probe_sample_count < nr_spans) {
+					for (child = 0; child < completed_children &&
+					     poll_probe_sample_count < nr_spans;
+					     child++) {
+						struct hot_fg_compare_span *sample =
+							batch->child[child].span;
+
+						if (!sample || sample < spans ||
+						    sample >= spans + nr_spans)
+							goto out_queue;
+						if (sample->state != HOT_FG_SPAN_DONE)
+							continue;
+						poll_probe_samples[poll_probe_sample_count++] =
+							(size_t)(sample - spans);
+					}
+				}
+				if (batch->wq_idx >= (u32)ctx->dsa_wq_count ||
+				    !active_wq[batch->wq_idx] ||
+				    (ctx->profile &&
+				     active_children_wq[batch->wq_idx] < completed_children)) {
+					pr_err("DSA COMPARE fixed lane active count underflow wq=%u\n",
+					       batch->wq_idx);
+					goto out_queue;
+				}
+				active_wq[batch->wq_idx]--;
+				harvested_wq[batch->wq_idx]++;
+				if (ctx->profile) {
+					active_children_wq[batch->wq_idx] -= completed_children;
+					harvested_children_wq[batch->wq_idx] +=
+						completed_children;
+				}
 				active_outer--;
 				harvested++;
 			}
 		}
-		/* harvest resets child_count; recompute the exact active child count
-		 * before refilling rather than maintaining a second failure-prone
-		 * ownership ledger. */
+
+		if (poll_probe_feedback_pending) {
+			size_t harvested_children = 0;
+			size_t max_harvested_wq = 0;
+			size_t min_runway = SIZE_MAX;
+			size_t wq;
+
+			for (wq = 0; wq < (size_t)ctx->dsa_wq_count; wq++) {
+				harvested_children += harvested_children_wq[wq];
+				if (harvested_wq[wq] > max_harvested_wq)
+					max_harvested_wq = harvested_wq[wq];
+				if (active_wq[wq] < min_runway)
+					min_runway = active_wq[wq];
+			}
+			ctx->profile_poll_probe_followup_harvested_outer += harvested;
+			ctx->profile_poll_probe_followup_harvested_children +=
+				harvested_children;
+			if (max_harvested_wq >
+			    ctx->profile_poll_probe_followup_max_harvested_outer_wq)
+				ctx->profile_poll_probe_followup_max_harvested_outer_wq =
+					max_harvested_wq;
+			if (ctx->profile_poll_probe_bursts == 1 ||
+			    min_runway < ctx->profile_poll_probe_followup_min_outer_runway)
+				ctx->profile_poll_probe_followup_min_outer_runway = min_runway;
+			if (!min_runway)
+				ctx->profile_poll_probe_followup_zero_runway++;
+			poll_probe_feedback_pending = false;
+		}
+
 		active_children = 0;
 		for (i = 0; i < HOT_DSA_COMPARE_INFLIGHT; i++)
 			if (batches[i].active)
 				active_children += batches[i].child_count;
 
-		for (i = 0; i < HOT_DSA_COMPARE_INFLIGHT && ready.nr; i++) {
+		for (i = 0; i < HOT_DSA_COMPARE_INFLIGHT &&
+		     (fresh_head < fresh_tail || ready.nr || dsa_diff_ready.nr); i++) {
 			struct hot_fg_compare_batch *batch = &batches[i];
+			size_t available;
 			u32 count;
+			u32 fresh = 0;
 			u32 j;
 
 			if (batch->active)
 				continue;
-			count = ready.nr > HOT_DSA_COMPARE_BATCH_CHILDREN ?
-				HOT_DSA_COMPARE_BATCH_CHILDREN : (u32)ready.nr;
-			if (count == 1 && active_outer)
+			available = fresh_tail - fresh_head + ready.nr +
+				dsa_diff_ready.nr;
+			count = available > HOT_DSA_COMPARE_BATCH_CHILDREN ?
+				HOT_DSA_COMPARE_BATCH_CHILDREN : (u32)available;
+			/* A single overflowed DIFFERENT continuation is on the known
+			 * dependency critical path.  Submit it directly instead of waiting
+			 * for unrelated work to make a two-child BATCH. */
+			if (count == 1 && active_outer && !dsa_diff_ready.nr)
 				break;
 			batch->child_count = count;
 			for (j = 0; j < count; j++) {
 				size_t span_idx;
-				if (hot_fg_ready_queue_pop(&ready, &span_idx) ||
-				    hot_fg_compare_batch_prepare_child(
-					ctx, batch, j, &spans[span_idx], ++sequence))
+				struct hot_fg_compare_span *span;
+				bool claimed_fresh = false;
+
+				/* A READY entry is a known dependency: DSA has already
+				 * found a difference (or completed fault recovery) and the
+				 * same span still has an unfinished suffix.  Advance those
+				 * chains first, then fill every remaining child with fresh
+				 * work so priority never reduces batch width. */
+				if (dsa_diff_ready.nr) {
+					if (hot_fg_ready_queue_pop(&dsa_diff_ready,
+								   &span_idx))
+						goto out_queue;
+					if (ctx->profile)
+						ctx->profile_assist_dsa_diff_submits++;
+				} else if (ready.nr) {
+					if (hot_fg_ready_queue_pop(&ready, &span_idx))
+						goto out_queue;
+					if (ctx->profile)
+						ctx->profile_assist_general_submits++;
+				} else {
+					int claim_rc = hot_fg_compare_claim_fresh(
+						ctx, spans, &fresh_head, fresh_tail, &span_idx,
+						&dsa_spans);
+
+					if (claim_rc)
+						goto out_queue;
+					claimed_fresh = true;
+					if (ctx->profile)
+						ctx->profile_assist_fresh_submits++;
+				}
+				span = &spans[span_idx];
+				if (span->owner != HOT_FG_SPAN_OWNER_DSA)
+					goto out_queue;
+				if (claimed_fresh) {
+					if (ctx->profile) {
+						if (fresh_pages_remaining < span->page_count)
+							goto out_queue;
+						fresh_pages_remaining -= span->page_count;
+					}
+					fresh++;
+				}
+				if (hot_fg_compare_batch_prepare_child(
+					    ctx, batch, j, span, ++sequence))
 					goto out_queue;
 			}
 			if (hot_fg_compare_batch_prepare_outer(ctx, batch))
 				goto out_queue;
 			prepared[prepared_count++] = (u32)i;
+			fresh_prepared += fresh;
+			if (fresh)
+				fresh_batches++;
 		}
 		if (prepared_count) {
+			/* One release fence covers every immutable descriptor prepared
+			 * during this refill group. */
 			hot_dsa_release_descriptors();
 			for (i = 0; i < prepared_count; i++) {
 				struct hot_fg_compare_batch *batch =
 					&batches[prepared[i]];
 
-				if (hot_fg_compare_batch_submit_released(ctx, batch, now_ns))
+				if (hot_fg_compare_batch_submit_released(ctx, batch,
+									 now_ns))
 					goto out_queue;
+				active_wq[batch->wq_idx]++;
+				if (ctx->profile)
+					active_children_wq[batch->wq_idx] +=
+						batch->child_count;
 				active_outer++;
 				active_children += batch->child_count;
 			}
 			submitted = true;
+			if (ctx->profile) {
+				ctx->profile_dsa_refill_samples++;
+				ctx->profile_post_refill_active_sum += active_children;
+				if (active_children < 32)
+					ctx->profile_post_refill_active_lt_32++;
+				if (active_children < 64)
+					ctx->profile_post_refill_active_lt_64++;
+				if (active_children < 96)
+					ctx->profile_post_refill_active_lt_96++;
+				ctx->profile_fresh_refill_spans += fresh_prepared;
+				ctx->profile_fresh_refill_batches += fresh_batches;
+			}
 		}
 		if (ctx->profile) {
+			size_t wq_min = SIZE_MAX;
+			size_t wq_child_min = SIZE_MAX;
+			size_t wq_max = 0;
+			size_t wq_sum = 0;
+			size_t wq_child_sum = 0;
+			size_t wq;
+
 			ctx->profile_completions_harvested += harvested;
 			if (active_outer > ctx->profile_batch_max_active_outer)
 				ctx->profile_batch_max_active_outer = active_outer;
@@ -7204,21 +7950,396 @@ static int hot_fg_compare_hw_batch(struct hot_apply_ctx *ctx,
 				ctx->profile_batch_max_active_children = active_children;
 			if (active_children > ctx->profile_compare_max_active)
 				ctx->profile_compare_max_active = active_children;
+			for (wq = 0; wq < (size_t)ctx->dsa_wq_count; wq++) {
+				if (active_wq[wq] < wq_min)
+					wq_min = active_wq[wq];
+				if (active_wq[wq] > wq_max)
+					wq_max = active_wq[wq];
+				if (active_children_wq[wq] < wq_child_min)
+					wq_child_min = active_children_wq[wq];
+				wq_sum += active_wq[wq];
+				wq_child_sum += active_children_wq[wq];
+			}
+			if (wq_sum != active_outer || wq_child_sum != active_children) {
+				pr_err("DSA COMPARE fixed lane ledger mismatch lanes=%zu active=%zu children=%zu active_children=%zu\n",
+				       wq_sum, active_outer, wq_child_sum,
+				       active_children);
+				goto out_queue;
+			}
+			if (wq_max - wq_min >
+			    ctx->profile_compare_wq_max_active_skew)
+				ctx->profile_compare_wq_max_active_skew = wq_max - wq_min;
+			if ((fresh_head < fresh_tail || ready.nr || dsa_diff_ready.nr) &&
+			    !wq_min && wq_max)
+				ctx->profile_compare_wq_starved_with_claimable_work++;
+			profile_min_wq_outer = wq_min;
+			profile_min_wq_children = wq_child_min;
 		}
-		if (!active_outer && done < nr_spans && !ready.nr) {
-			pr_err("DSA hardware-BATCH compare lost work done=%zu total=%zu\n",
-			       done, nr_spans);
+		if (active_outer && !submitted && !harvested) {
+			size_t fresh_spans = fresh_tail - fresh_head;
+			bool above_reserve =
+				fresh_spans > HOT_DSA_COMPARE_MAX_CHILDREN;
+
+			if (ctx->profile)
+				ctx->profile_opportunistic_simd_gate_attempts++;
+			if (ctx->profile) {
+				if (above_reserve) {
+					ctx->profile_opportunistic_simd_blocked_partial_above_reserve++;
+					gate_profile_state =
+						HOT_FG_SIMD_GATE_PROFILE_PARTIAL_ABOVE_RESERVE;
+				} else if (fresh_spans) {
+					u64 reserve_events;
+
+					if (!fresh_pages_remaining)
+						goto out_queue;
+					if (active_outer == HOT_DSA_COMPARE_INFLIGHT) {
+						ctx->profile_opportunistic_simd_blocked_reserve_full++;
+						gate_profile_state =
+							HOT_FG_SIMD_GATE_PROFILE_RESERVE_FULL;
+					} else {
+						ctx->profile_opportunistic_simd_blocked_reserve_partial++;
+						gate_profile_state =
+							HOT_FG_SIMD_GATE_PROFILE_RESERVE_PARTIAL;
+					}
+					reserve_events =
+						ctx->profile_opportunistic_simd_blocked_reserve_full +
+						ctx->profile_opportunistic_simd_blocked_reserve_partial;
+					ctx->profile_opportunistic_simd_reserve_active_outer_sum +=
+						active_outer;
+					ctx->profile_opportunistic_simd_reserve_active_children_sum +=
+						active_children;
+					ctx->profile_opportunistic_simd_reserve_min_wq_outer_sum +=
+						profile_min_wq_outer;
+					ctx->profile_opportunistic_simd_reserve_min_wq_children_sum +=
+						profile_min_wq_children;
+					if (reserve_events == 1 ||
+					    fresh_spans <
+						    ctx->profile_opportunistic_simd_reserve_fresh_spans_min)
+						ctx->profile_opportunistic_simd_reserve_fresh_spans_min =
+							fresh_spans;
+					if (fresh_spans >
+					    ctx->profile_opportunistic_simd_reserve_fresh_spans_max)
+						ctx->profile_opportunistic_simd_reserve_fresh_spans_max =
+							fresh_spans;
+					if (reserve_events == 1 || fresh_pages_remaining <
+					    ctx->profile_opportunistic_simd_reserve_fresh_pages_min)
+						ctx->profile_opportunistic_simd_reserve_fresh_pages_min =
+							fresh_pages_remaining;
+					if (fresh_pages_remaining >
+					    ctx->profile_opportunistic_simd_reserve_fresh_pages_max)
+						ctx->profile_opportunistic_simd_reserve_fresh_pages_max =
+							fresh_pages_remaining;
+				} else if (ready.nr || dsa_diff_ready.nr) {
+					size_t dsa_ready_depth = ready.nr + dsa_diff_ready.nr;
+
+					if (fresh_pages_remaining)
+						goto out_queue;
+					ctx->profile_opportunistic_simd_blocked_exhausted_ready++;
+					ctx->profile_opportunistic_simd_exhausted_ready_depth_sum +=
+						dsa_ready_depth;
+					if (dsa_ready_depth >
+					    ctx->profile_opportunistic_simd_exhausted_ready_depth_max)
+						ctx->profile_opportunistic_simd_exhausted_ready_depth_max =
+							dsa_ready_depth;
+					gate_profile_state =
+						HOT_FG_SIMD_GATE_PROFILE_EXHAUSTED_READY;
+				} else {
+					if (fresh_pages_remaining)
+						goto out_queue;
+					ctx->profile_opportunistic_simd_blocked_exhausted_inflight++;
+					ctx->profile_opportunistic_simd_exhausted_inflight_active_children_sum +=
+						active_children;
+					ctx->profile_opportunistic_simd_exhausted_inflight_min_wq_children_sum +=
+						profile_min_wq_children;
+					gate_profile_state =
+						HOT_FG_SIMD_GATE_PROFILE_EXHAUSTED_INFLIGHT;
+				}
+				gate_profile_start_ns = now_ns;
+			}
+			if (ctx->poll_probe_enabled &&
+			    ctx->poll_probe_pages_per_pause) {
+				size_t probe_done = 0;
+
+				while (probe_done < ctx->poll_probe_pages_per_pause) {
+					int probe_rc;
+
+					if (!poll_probe_sample_count)
+						break;
+					probe_rc = hot_fg_compare_poll_probe_page(
+						ctx, pages, spans, nr_spans,
+						poll_probe_samples,
+						poll_probe_sample_count,
+						&poll_probe_sample_read,
+						&poll_probe_page_cursor);
+
+					if (probe_rc < 0)
+						goto out_queue;
+					if (probe_rc > 0)
+						break;
+					probe_done++;
+				}
+				if (probe_done) {
+					ctx->profile_poll_probe_bursts++;
+					ctx->profile_poll_probe_pages += probe_done;
+					poll_probe_feedback_pending = true;
+					poll_probe_start_ns = now_ns;
+					continue;
+				}
+				ctx->profile_poll_probe_skipped_no_sample++;
+			}
+		}
+		if (!ctx->poll_probe_enabled && !submitted && !harvested &&
+		    cpu_assist.nr) {
+			size_t assist_done = 0;
+			bool dsa_was_active = active_outer != 0;
+
+			while (assist_done < HOT_DSA_COMPARE_ASSIST_BURST_PAGES &&
+			       cpu_assist.nr) {
+				size_t span_idx;
+				u64 progress_bytes = 0;
+
+				if (hot_fg_ready_queue_pop(&cpu_assist, &span_idx) ||
+				    hot_fg_compare_assist_current_page(
+					    ctx, pages, &spans[span_idx], &ready, &done,
+					    &progress_bytes))
+					goto out_queue;
+				assist_done++;
+				if (ctx->profile) {
+					ctx->profile_assist_dequeued++;
+					ctx->profile_assist_pages++;
+					ctx->profile_assist_bytes += progress_bytes;
+					if (dsa_was_active) {
+						ctx->profile_assist_while_dsa_active_pages++;
+						ctx->profile_simd_progress_while_dsa_active_bytes +=
+							progress_bytes;
+						ctx->profile_simd_quanta_while_dsa_active++;
+					} else {
+						ctx->profile_assist_tail_pages++;
+					}
+				}
+			}
+			if (ctx->profile)
+				ctx->profile_assist_bursts++;
+			continue;
+		}
+		if (!active_outer && done < nr_spans &&
+		    fresh_head == fresh_tail && !ready.nr && !dsa_diff_ready.nr &&
+		    !cpu_assist.nr) {
+			pr_err("DSA continuation-assist scheduler lost work done=%zu total=%zu dsa_spans=%zu assist=%zu diff_ready=%zu ready=%zu\n",
+			       done, nr_spans, dsa_spans, cpu_assist.nr,
+			       dsa_diff_ready.nr, ready.nr);
 			goto out_queue;
 		}
 		if (active_outer && !submitted && !harvested)
 			hot_dsa_cpu_relax();
 	}
-
 	for (i = 0; i < nr_spans; i++)
 		if (spans[i].state != HOT_FG_SPAN_DONE ||
 		    spans[i].cursor != spans[i].length ||
-		    spans[i].finalized_pages != spans[i].page_count)
+		    spans[i].finalized_pages != spans[i].page_count ||
+		    (spans[i].owner != HOT_FG_SPAN_OWNER_DSA &&
+		     spans[i].owner != HOT_FG_SPAN_OWNER_SIMD))
 			goto out_queue;
+	if (fresh_head != fresh_tail || ready.nr || dsa_diff_ready.nr ||
+	    cpu_assist.nr)
+		goto out_queue;
+	if (poll_probe_feedback_pending || poll_probe_start_ns)
+		goto out_queue;
+	for (i = 0; i < (size_t)ctx->dsa_wq_count; i++)
+		if (active_wq[i] || (ctx->profile && active_children_wq[i]))
+			goto out_queue;
+	if (ctx->profile &&
+	    (ctx->profile_poll_probe_pages !=
+		     ctx->profile_poll_probe_shadow_parent_pages +
+		     ctx->profile_poll_probe_shadow_patch_pages +
+		     ctx->profile_poll_probe_shadow_full_pages ||
+	     (ctx->poll_probe_enabled && ctx->poll_probe_pages_per_pause &&
+	      ctx->profile_poll_probe_pages >
+		      ctx->profile_poll_probe_bursts *
+		      (u64)ctx->poll_probe_pages_per_pause) ||
+	     (ctx->poll_probe_enabled && !ctx->poll_probe_pages_per_pause &&
+	      (ctx->profile_poll_probe_bursts ||
+	       ctx->profile_poll_probe_pages ||
+	       ctx->profile_poll_probe_wall_ns ||
+	       ctx->profile_poll_probe_skipped_no_sample ||
+	       ctx->profile_poll_probe_shadow_parent_pages ||
+	       ctx->profile_poll_probe_shadow_patch_pages ||
+	       ctx->profile_poll_probe_shadow_full_pages ||
+	       ctx->profile_poll_probe_followup_harvested_outer ||
+	       ctx->profile_poll_probe_followup_harvested_children ||
+	       ctx->profile_poll_probe_followup_max_harvested_outer_wq ||
+	       ctx->profile_poll_probe_followup_min_outer_runway ||
+	       ctx->profile_poll_probe_followup_zero_runway)) ||
+	     (!ctx->poll_probe_enabled &&
+	      (ctx->profile_poll_probe_bursts ||
+	       ctx->profile_poll_probe_pages ||
+	       ctx->profile_poll_probe_wall_ns ||
+	       ctx->profile_poll_probe_skipped_no_sample ||
+	       ctx->profile_poll_probe_shadow_parent_pages ||
+	       ctx->profile_poll_probe_shadow_patch_pages ||
+	       ctx->profile_poll_probe_shadow_full_pages ||
+	       ctx->profile_poll_probe_followup_harvested_outer ||
+	       ctx->profile_poll_probe_followup_harvested_children ||
+	       ctx->profile_poll_probe_followup_max_harvested_outer_wq ||
+	       ctx->profile_poll_probe_followup_min_outer_runway ||
+	       ctx->profile_poll_probe_followup_zero_runway)))) {
+		pr_err("DSA poll-probe profile invariant failed enabled=%u pages_per_pause=%u bursts=%" PRIu64
+		       " pages=%" PRIu64 " wall_ns=%" PRIu64 " outcomes=%" PRIu64 "\n",
+		       ctx->poll_probe_enabled ? 1U : 0U,
+		       ctx->poll_probe_pages_per_pause,
+		       ctx->profile_poll_probe_bursts,
+		       ctx->profile_poll_probe_pages,
+		       ctx->profile_poll_probe_wall_ns,
+		       ctx->profile_poll_probe_shadow_parent_pages +
+		       ctx->profile_poll_probe_shadow_patch_pages +
+		       ctx->profile_poll_probe_shadow_full_pages);
+		goto out_queue;
+	}
+	if (ctx->profile &&
+	    (fresh_pages_remaining ||
+	     ctx->profile_hybrid_dsa_claim_pages +
+		     ctx->profile_hybrid_cpu_claim_pages !=
+		     ctx->profile_span_pages ||
+	     ctx->profile_normal_simd_logical_progress_bytes !=
+		     ctx->profile_opportunistic_simd_pages * (u64)PAGE_SIZE +
+		     ctx->profile_assist_bytes ||
+	     ctx->profile_dsa_fresh_submit_ops != dsa_spans ||
+	     ctx->profile_dsa_fresh_submit_ops +
+		     ctx->profile_dsa_continuation_submit_ops !=
+		     ctx->profile_batch_child_submits ||
+	     ctx->profile_assist_fresh_submits !=
+		     ctx->profile_dsa_fresh_submit_ops ||
+	     ctx->profile_assist_dsa_diff_submits +
+		     ctx->profile_assist_general_submits !=
+		     ctx->profile_dsa_continuation_submit_ops ||
+	     ctx->profile_batch_child_success +
+		     ctx->profile_batch_child_nobof !=
+		     ctx->profile_batch_child_submits ||
+	     ctx->profile_normal_simd_logical_progress_bytes +
+		     ctx->profile_fault_simd_logical_progress_bytes !=
+		     ctx->profile_simd_logical_progress_bytes ||
+	     ctx->profile_dsa_logical_progress_bytes +
+		     ctx->profile_simd_logical_progress_bytes !=
+		     ctx->profile_span_pages * (u64)PAGE_SIZE ||
+	     ctx->profile_dsa_fresh_claim_bytes !=
+		     ctx->profile_hybrid_dsa_claim_pages * (u64)PAGE_SIZE ||
+	     ctx->profile_hybrid_dsa_to_cpu_handoff_spans !=
+		     ctx->profile_compare_fault_handoff_spans ||
+	     ctx->profile_hybrid_dsa_to_cpu_handoff_pages !=
+		     ctx->profile_compare_fault_handoff_pages ||
+	     ctx->profile_hybrid_dsa_to_cpu_handoff_remaining_bytes !=
+		     ctx->profile_compare_fault_handoff_remaining_bytes ||
+	     ctx->profile_opportunistic_simd_pages !=
+		     ctx->profile_hybrid_cpu_claim_pages ||
+	     ctx->profile_assist_enqueued != ctx->profile_assist_dequeued ||
+	     ctx->profile_assist_dequeued != ctx->profile_assist_pages ||
+	     ctx->profile_assist_while_dsa_active_pages +
+		     ctx->profile_assist_tail_pages != ctx->profile_assist_pages ||
+	     ctx->profile_assist_max_queue_depth >
+		     HOT_DSA_COMPARE_ASSIST_QUEUE_CAPACITY ||
+	     (!ctx->poll_probe_enabled &&
+	      ctx->profile_assist_overflow_to_dsa !=
+		      ctx->profile_assist_dsa_diff_submits) ||
+	     (ctx->poll_probe_enabled &&
+	      (ctx->profile_assist_enqueued ||
+	       ctx->profile_assist_overflow_to_dsa ||
+	       ctx->profile_assist_dequeued || ctx->profile_assist_pages ||
+	       ctx->profile_assist_bytes || ctx->profile_assist_bursts ||
+	       ctx->profile_assist_max_queue_depth ||
+	       ctx->profile_assist_while_dsa_active_pages ||
+	       ctx->profile_assist_tail_pages)) ||
+	     ctx->profile_opportunistic_simd_gate_success !=
+		     ctx->profile_opportunistic_simd_bursts ||
+	     ctx->profile_opportunistic_simd_feedback_grow +
+		     ctx->profile_opportunistic_simd_feedback_hold +
+		     ctx->profile_opportunistic_simd_feedback_shrink +
+		     ctx->profile_opportunistic_simd_feedback_reset !=
+		     ctx->profile_opportunistic_simd_bursts ||
+	     ctx->profile_opportunistic_simd_gate_attempts !=
+		     ctx->profile_opportunistic_simd_gate_success +
+		     ctx->profile_opportunistic_simd_blocked_partial_above_reserve +
+		     ctx->profile_opportunistic_simd_blocked_reserve_full +
+		     ctx->profile_opportunistic_simd_blocked_reserve_partial +
+		     ctx->profile_opportunistic_simd_blocked_exhausted_ready +
+		     ctx->profile_opportunistic_simd_blocked_exhausted_inflight ||
+	     (!ctx->profile_opportunistic_simd_blocked_partial_above_reserve &&
+	      ctx->profile_opportunistic_simd_gate_partial_above_reserve_ns) ||
+	     (!(ctx->profile_opportunistic_simd_blocked_reserve_full +
+		ctx->profile_opportunistic_simd_blocked_reserve_partial) &&
+	      (ctx->profile_opportunistic_simd_gate_reserve_full_ns ||
+	       ctx->profile_opportunistic_simd_gate_reserve_partial_ns ||
+	       ctx->profile_opportunistic_simd_reserve_active_outer_sum ||
+	       ctx->profile_opportunistic_simd_reserve_active_children_sum ||
+	       ctx->profile_opportunistic_simd_reserve_min_wq_outer_sum ||
+	       ctx->profile_opportunistic_simd_reserve_min_wq_children_sum ||
+	       ctx->profile_opportunistic_simd_reserve_fresh_spans_min ||
+	       ctx->profile_opportunistic_simd_reserve_fresh_spans_max ||
+	       ctx->profile_opportunistic_simd_reserve_fresh_pages_min ||
+	       ctx->profile_opportunistic_simd_reserve_fresh_pages_max)) ||
+	     ((ctx->profile_opportunistic_simd_blocked_reserve_full +
+	       ctx->profile_opportunistic_simd_blocked_reserve_partial) &&
+	      (!ctx->profile_opportunistic_simd_reserve_fresh_spans_min ||
+	       ctx->profile_opportunistic_simd_reserve_fresh_spans_min >
+		       HOT_DSA_COMPARE_MAX_CHILDREN ||
+	       ctx->profile_opportunistic_simd_reserve_fresh_spans_max <
+		       ctx->profile_opportunistic_simd_reserve_fresh_spans_min ||
+	       !ctx->profile_opportunistic_simd_reserve_fresh_pages_min ||
+	       ctx->profile_opportunistic_simd_reserve_fresh_pages_max <
+		       ctx->profile_opportunistic_simd_reserve_fresh_pages_min ||
+	       ctx->profile_opportunistic_simd_reserve_active_children_sum <
+		       ctx->profile_opportunistic_simd_reserve_active_outer_sum ||
+	       ctx->profile_opportunistic_simd_reserve_min_wq_outer_sum *
+		       (u64)ctx->dsa_wq_count >
+		       ctx->profile_opportunistic_simd_reserve_active_outer_sum ||
+	       ctx->profile_opportunistic_simd_reserve_min_wq_children_sum *
+		       (u64)ctx->dsa_wq_count >
+		       ctx->profile_opportunistic_simd_reserve_active_children_sum)) ||
+	     (!ctx->profile_opportunistic_simd_blocked_exhausted_ready &&
+	      (ctx->profile_opportunistic_simd_gate_exhausted_ready_ns ||
+	       ctx->profile_opportunistic_simd_exhausted_ready_depth_sum ||
+	       ctx->profile_opportunistic_simd_exhausted_ready_depth_max)) ||
+	     (ctx->profile_opportunistic_simd_blocked_exhausted_ready &&
+	      (!ctx->profile_opportunistic_simd_exhausted_ready_depth_max ||
+	       ctx->profile_opportunistic_simd_exhausted_ready_depth_sum <
+		       ctx->profile_opportunistic_simd_blocked_exhausted_ready ||
+	       ctx->profile_opportunistic_simd_exhausted_ready_depth_max >
+		       ctx->profile_opportunistic_simd_exhausted_ready_depth_sum)) ||
+	     (!ctx->profile_opportunistic_simd_blocked_exhausted_inflight &&
+	      (ctx->profile_opportunistic_simd_gate_exhausted_inflight_ns ||
+	       ctx->profile_opportunistic_simd_exhausted_inflight_active_children_sum ||
+	       ctx->profile_opportunistic_simd_exhausted_inflight_min_wq_children_sum)) ||
+	     (ctx->profile_opportunistic_simd_blocked_exhausted_inflight &&
+	      (ctx->profile_opportunistic_simd_exhausted_inflight_active_children_sum <
+		       ctx->profile_opportunistic_simd_blocked_exhausted_inflight ||
+	       ctx->profile_opportunistic_simd_exhausted_inflight_min_wq_children_sum *
+		       (u64)ctx->dsa_wq_count >
+		       ctx->profile_opportunistic_simd_exhausted_inflight_active_children_sum)) ||
+	     (!ctx->profile_opportunistic_simd_bursts &&
+	      (ctx->profile_opportunistic_simd_gate_full_above_reserve_ns ||
+	       ctx->profile_opportunistic_simd_feedback_completed_children ||
+	       ctx->profile_opportunistic_simd_feedback_max_completed_children_wq ||
+	       ctx->profile_opportunistic_simd_feedback_min_child_runway_after_burst ||
+	       ctx->profile_opportunistic_simd_feedback_max_completed_children_per_page_x1024)))) {
+		pr_err("DSA continuation-assist profile invariant failed spans=%zu dsa_spans=%zu fresh=%" PRIu64
+		       " continuation=%" PRIu64 " child_submits=%" PRIu64
+		       " dsa_pages=%" PRIu64 " simd_pages=%" PRIu64
+		       " dsa_progress=%" PRIu64 " simd_progress=%" PRIu64
+		       " assist_enqueued=%" PRIu64 " assist_dequeued=%" PRIu64
+		       " assist_bytes=%" PRIu64 " diff_submits=%" PRIu64 "\n",
+		       nr_spans, dsa_spans,
+		       ctx->profile_dsa_fresh_submit_ops,
+		       ctx->profile_dsa_continuation_submit_ops,
+		       ctx->profile_batch_child_submits,
+		       ctx->profile_hybrid_dsa_claim_pages,
+		       ctx->profile_hybrid_cpu_claim_pages,
+		       ctx->profile_dsa_logical_progress_bytes,
+		       ctx->profile_simd_logical_progress_bytes,
+		       ctx->profile_assist_enqueued,
+		       ctx->profile_assist_dequeued,
+		       ctx->profile_assist_bytes,
+		       ctx->profile_assist_dsa_diff_submits);
+		goto out_queue;
+	}
 	ret = 0;
 
 out_queue:
@@ -7226,14 +8347,17 @@ out_queue:
 		for (;;) {
 			u64 now_ns = hot_dsa_watchdog_now_ns();
 			size_t remaining = 0;
+
 			for (i = 0; i < HOT_DSA_COMPARE_INFLIGHT; i++) {
 				if (!batches[i].active)
 					continue;
-				if (hot_fg_compare_batch_ready(&batches[i]))
+				if (hot_fg_compare_batch_ready(&batches[i])) {
 					batches[i].active = false;
-				else {
+					batches[i].child_count = 0;
+				} else {
 					remaining++;
-					if (!now_ns || now_ns >= batches[i].completion_deadline_ns)
+					if (!now_ns ||
+					    now_ns >= batches[i].completion_deadline_ns)
 						hot_fg_compare_batch_timeout(
 							&batches[i], remaining, now_ns);
 				}
@@ -7244,7 +8368,9 @@ out_queue:
 		}
 	}
 	hot_fg_ready_queue_fini(&ready);
-out:
+	hot_fg_ready_queue_fini(&dsa_diff_ready);
+	hot_fg_ready_queue_fini(&cpu_assist);
+	xfree(poll_probe_samples);
 	return ret;
 }
 
@@ -7582,10 +8708,6 @@ static int hot_fg_encode_raw_wavefront(struct page_xfer *xfer,
 	u64 compare_engine_end_us = 0;
 	u64 compare_engine_cpu_start_us = 0;
 	u64 compare_engine_cpu_end_us = 0;
-	u64 prefault_wall_start_us = 0;
-	u64 prefault_cpu_start_us = 0;
-	u64 compare_core_wall_start_us = 0;
-	u64 compare_core_cpu_start_us = 0;
 	u64 result_publish_start_us = 0;
 
 	if (ctx->profile)
@@ -7719,18 +8841,6 @@ static int hot_fg_encode_raw_wavefront(struct page_xfer *xfer,
 		compare_cpu_start_us = dsa_profile_thread_now_us();
 		compare_engine_cpu_start_us = compare_cpu_start_us;
 	}
-	if (ctx->compare_breakdown && nr_spans) {
-		prefault_wall_start_us = dsa_profile_wall_now_us();
-		prefault_cpu_start_us = dsa_profile_thread_now_us();
-		if (hot_fg_prefault_all(ctx, spans, nr_spans))
-			goto err;
-		ctx->profile_parent_prefault_wall_us +=
-			dsa_profile_delta_us(prefault_wall_start_us,
-					     dsa_profile_wall_now_us());
-		ctx->profile_parent_prefault_cpu_us +=
-			dsa_profile_delta_us(prefault_cpu_start_us,
-					     dsa_profile_thread_now_us());
-	}
 	if (ctx->fg_compare_backend == HOT_FG_COMPARE_VALIDATE && nr_spans) {
 		validate_pages = xmalloc(nr * sizeof(*validate_pages));
 		validate_spans = xmalloc(nr_spans * sizeof(*validate_spans));
@@ -7739,15 +8849,12 @@ static int hot_fg_encode_raw_wavefront(struct page_xfer *xfer,
 		memcpy(validate_pages, pages, nr * sizeof(*validate_pages));
 		memcpy(validate_spans, spans, nr_spans * sizeof(*validate_spans));
 	}
-	if (ctx->compare_breakdown && nr_spans) {
-		compare_core_wall_start_us = dsa_profile_wall_now_us();
-		compare_core_cpu_start_us = dsa_profile_thread_now_us();
-	}
 	if (nr_spans) {
 		switch (ctx->fg_compare_backend) {
 		case HOT_FG_COMPARE_DSA:
-			if (hot_fg_compare_hw_batch(ctx, pages, spans, nr_spans))
+			if (hot_fg_compare_hw_batch(ctx, pages, spans, nr_spans)) {
 				goto err;
+			}
 			break;
 		case HOT_FG_COMPARE_MEMCMP:
 		case HOT_FG_COMPARE_SCALAR64:
@@ -7769,14 +8876,6 @@ static int hot_fg_encode_raw_wavefront(struct page_xfer *xfer,
 			pr_err("DSA fine-grained compare backend is invalid\n");
 			goto err;
 		}
-	}
-	if (ctx->compare_breakdown && nr_spans) {
-		ctx->profile_compare_core_wall_us +=
-			dsa_profile_delta_us(compare_core_wall_start_us,
-					     dsa_profile_wall_now_us());
-		ctx->profile_compare_core_cpu_us +=
-			dsa_profile_delta_us(compare_core_cpu_start_us,
-					     dsa_profile_thread_now_us());
 	}
 	if (ctx->profile) {
 		compare_engine_end_us = dsa_profile_wall_now_us();

@@ -11,7 +11,7 @@
 #include <stdint.h>
 
 #define CDP_DSA_MEMORY_SERVICE_MAGIC   0x4350444dU /* "CDPM" */
-#define CDP_DSA_MEMORY_SERVICE_VERSION 9U
+#define CDP_DSA_MEMORY_SERVICE_VERSION 19U
 #define CDP_DSA_MEMORY_SERVICE_DIAG_MAGIC 0x43445044U /* "CDPD" */
 #define CDP_DSA_MEMORY_SERVICE_DIAG_VERSION 1U
 #define CDP_DSA_MS_DIAG_INVALID_OBJECT UINT64_MAX
@@ -204,6 +204,79 @@ struct cdp_dsa_memory_service_profile {
 	uint64_t fresh_refill_batches;
 	uint64_t fresh_refill_blocked_fault_debt;
 	uint64_t dsa_empty_with_claimable_fresh;
+	uint64_t opportunistic_simd_gate_attempts;
+	uint64_t opportunistic_simd_gate_success;
+	/* Profile schema v17: exhaustive, mutually exclusive idle-gate states. */
+	uint64_t opportunistic_simd_blocked_partial_above_reserve;
+	uint64_t opportunistic_simd_blocked_reserve_full;
+	uint64_t opportunistic_simd_blocked_reserve_partial;
+	uint64_t opportunistic_simd_blocked_exhausted_ready;
+	uint64_t opportunistic_simd_blocked_exhausted_inflight;
+	uint64_t opportunistic_simd_gate_full_above_reserve_ns;
+	uint64_t opportunistic_simd_gate_partial_above_reserve_ns;
+	uint64_t opportunistic_simd_gate_reserve_full_ns;
+	uint64_t opportunistic_simd_gate_reserve_partial_ns;
+	uint64_t opportunistic_simd_gate_exhausted_ready_ns;
+	uint64_t opportunistic_simd_gate_exhausted_inflight_ns;
+	uint64_t opportunistic_simd_reserve_active_outer_sum;
+	uint64_t opportunistic_simd_reserve_active_children_sum;
+	uint64_t opportunistic_simd_reserve_min_wq_outer_sum;
+	uint64_t opportunistic_simd_reserve_min_wq_children_sum;
+	uint64_t opportunistic_simd_reserve_fresh_spans_min;
+	uint64_t opportunistic_simd_reserve_fresh_spans_max;
+	uint64_t opportunistic_simd_reserve_fresh_pages_min;
+	uint64_t opportunistic_simd_reserve_fresh_pages_max;
+	uint64_t opportunistic_simd_exhausted_ready_depth_sum;
+	uint64_t opportunistic_simd_exhausted_ready_depth_max;
+	uint64_t opportunistic_simd_exhausted_inflight_active_children_sum;
+	uint64_t opportunistic_simd_exhausted_inflight_min_wq_children_sum;
+	/* Profile schema v15+: feedback-controlled opportunistic SIMD bursts. */
+	uint64_t opportunistic_simd_bursts;
+	uint64_t opportunistic_simd_pages;
+	uint64_t opportunistic_simd_max_burst_pages;
+	uint64_t opportunistic_simd_feedback_grow;
+	uint64_t opportunistic_simd_feedback_hold;
+	uint64_t opportunistic_simd_feedback_shrink;
+	uint64_t opportunistic_simd_feedback_reset;
+	uint64_t opportunistic_simd_max_completed_wq;
+	uint64_t opportunistic_simd_min_runway_after_burst;
+	/* Profile schema v16: child-descriptor runway consumed by a burst. */
+	uint64_t opportunistic_simd_feedback_completed_children;
+	uint64_t opportunistic_simd_feedback_max_completed_children_wq;
+	uint64_t opportunistic_simd_feedback_min_child_runway_after_burst;
+	uint64_t opportunistic_simd_feedback_max_completed_children_per_page_x1024;
+	/* Profile schema v18: explicit poll-substitution experiment. */
+	uint64_t poll_probe_enabled;
+	uint64_t poll_probe_pages_per_pause;
+	uint64_t poll_probe_bursts;
+	uint64_t poll_probe_pages;
+	uint64_t poll_probe_wall_ns;
+	uint64_t poll_probe_skipped_no_sample;
+	uint64_t poll_probe_shadow_parent_pages;
+	uint64_t poll_probe_shadow_patch_pages;
+	uint64_t poll_probe_shadow_full_pages;
+	uint64_t poll_probe_followup_harvested_outer;
+	uint64_t poll_probe_followup_harvested_children;
+	uint64_t poll_probe_followup_max_harvested_outer_wq;
+	uint64_t poll_probe_followup_min_outer_runway;
+	uint64_t poll_probe_followup_zero_runway;
+	/* Profile schema v19: production continuation-assist scheduler. */
+	uint64_t assist_enqueued;
+	uint64_t assist_overflow_to_dsa;
+	uint64_t assist_dequeued;
+	uint64_t assist_pages;
+	uint64_t assist_bytes;
+	uint64_t assist_bursts;
+	uint64_t assist_max_queue_depth;
+	uint64_t assist_dsa_diff_submits;
+	uint64_t assist_general_submits;
+	uint64_t assist_fresh_submits;
+	uint64_t assist_while_dsa_active_pages;
+	uint64_t assist_tail_pages;
+	/* Profile schema v15: fixed-WQ-lane scheduler diagnostics. */
+	uint64_t compare_wq_lane_count;
+	uint64_t compare_wq_max_active_skew;
+	uint64_t compare_wq_starved_with_claimable_work;
 	uint64_t batch_outer_submits;
 	uint64_t batch_child_submits;
 	uint64_t batch_partial_submits;
@@ -214,7 +287,6 @@ struct cdp_dsa_memory_service_profile {
 	uint64_t batch_child_nobof;
 	uint64_t batch_max_active_outer;
 	uint64_t batch_max_active_children;
-
 	/* Filled by the short-lived durable writer after COMPARE_DONE. */
 	uint64_t idx_write_calls;
 	uint64_t idx_bytes;
