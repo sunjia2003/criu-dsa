@@ -548,10 +548,6 @@ struct hot_apply_ctx {
 	u64 profile_sidecar_emit_us;
 	u64 profile_compare_engine_wall_us;
 	u64 profile_compare_engine_cpu_us;
-	u64 profile_parent_prefault_wall_us;
-	u64 profile_parent_prefault_cpu_us;
-	u64 profile_compare_core_wall_us;
-	u64 profile_compare_core_cpu_us;
 	u64 profile_output_wall_us;
 	u64 profile_output_start_us;
 	u64 profile_hot_apply_us;
@@ -565,142 +561,35 @@ struct hot_apply_ctx {
 	u64 profile_max_span_pages;
 	u64 profile_compare_enq_retries;
 	u64 profile_compare_poll_sweeps;
-	u64 profile_compare_not_ready;
-	u64 profile_compare_max_active;
 	u64 profile_batch_outer_submits;
 	u64 profile_batch_child_submits;
 	u64 profile_batch_partial_submits;
 	u64 profile_batch_single_tail_submits;
-	u64 profile_batch_outer_success;
 	u64 profile_batch_outer_fail;
-	u64 profile_batch_child_success;
 	u64 profile_batch_child_nobof;
 	u64 profile_batch_max_active_outer;
 	u64 profile_batch_max_active_children;
-	u64 profile_completions_harvested;
-	u64 profile_completion_timeout_count;
 	u64 profile_max_completion_age_us;
-	u64 profile_write_units;
-	u64 profile_write_unit_max_us;
-	u64 profile_memcmp_calls;
 	u64 profile_memcmp_requested_bytes;
-	u64 profile_memcmp_scalar_bytes;
-	u64 profile_scalar64_calls;
-	u64 profile_scalar64_word_ops;
-	u64 profile_scalar64_refine_bytes;
-	u64 profile_scalar64_tail_bytes;
 	u64 profile_scalar64_bytes_examined;
-	u64 profile_simd_vector_ops;
 	u64 profile_simd_bytes_examined;
-	u64 profile_hybrid_dsa_claim_spans;
-	u64 profile_hybrid_dsa_claim_pages;
-	u64 profile_hybrid_cpu_claim_spans;
-	u64 profile_hybrid_cpu_claim_pages;
-	u64 profile_hybrid_cpu_waves;
-	u64 profile_hybrid_dsa_to_cpu_handoff_spans;
-	u64 profile_hybrid_dsa_to_cpu_handoff_pages;
-	u64 profile_hybrid_dsa_to_cpu_handoff_remaining_bytes;
-	u64 profile_hybrid_unclaimed_empty_count;
 	u64 profile_compare_nobof_faults;
 	u64 profile_compare_nobof_fault_source1;
 	u64 profile_compare_nobof_fault_source2;
-	u64 profile_compare_nobof_equal_prefix_bytes;
-	u64 profile_compare_fault_handoff_spans;
-	u64 profile_compare_fault_handoff_pages;
 	u64 profile_compare_fault_handoff_remaining_bytes;
-	u64 profile_compare_fault_queue_max;
-	u64 profile_compare_fresh_claim_throttles;
-	u64 profile_compare_cpu_fault_waves;
 	u64 profile_dsa_logical_progress_bytes;
-	u64 profile_simd_logical_progress_bytes;
 	u64 profile_normal_simd_logical_progress_bytes;
 	u64 profile_fault_simd_logical_progress_bytes;
 	u64 profile_dsa_fresh_submit_ops;
 	u64 profile_dsa_continuation_submit_ops;
 	u64 profile_dsa_submitted_bytes;
-	u64 profile_simd_progress_while_dsa_active_bytes;
-	u64 profile_simd_quanta_while_dsa_active;
-	u64 profile_dsa_fresh_claim_bytes;
-	u64 profile_dsa_active_zero_while_normal_cpu_work;
-	u64 profile_ready_completions_before_simd;
-	u64 profile_ready_completions_after_simd;
-	u64 profile_scheduler_iterations;
-	u64 profile_dsa_refill_samples;
-	u64 profile_post_refill_active_sum;
-	u64 profile_post_refill_active_lt_32;
-	u64 profile_post_refill_active_lt_64;
-	u64 profile_post_refill_active_lt_96;
-	u64 profile_fresh_refill_spans;
-	u64 profile_fresh_refill_batches;
-	u64 profile_fresh_refill_blocked_fault_debt;
-	u64 profile_dsa_empty_with_claimable_fresh;
-	u64 profile_opportunistic_simd_gate_attempts;
-	u64 profile_opportunistic_simd_gate_success;
-	u64 profile_opportunistic_simd_blocked_partial_above_reserve;
-	u64 profile_opportunistic_simd_blocked_reserve_full;
-	u64 profile_opportunistic_simd_blocked_reserve_partial;
-	u64 profile_opportunistic_simd_blocked_exhausted_ready;
-	u64 profile_opportunistic_simd_blocked_exhausted_inflight;
-	u64 profile_opportunistic_simd_gate_full_above_reserve_ns;
-	u64 profile_opportunistic_simd_gate_partial_above_reserve_ns;
-	u64 profile_opportunistic_simd_gate_reserve_full_ns;
-	u64 profile_opportunistic_simd_gate_reserve_partial_ns;
-	u64 profile_opportunistic_simd_gate_exhausted_ready_ns;
-	u64 profile_opportunistic_simd_gate_exhausted_inflight_ns;
-	u64 profile_opportunistic_simd_reserve_active_outer_sum;
-	u64 profile_opportunistic_simd_reserve_active_children_sum;
-	u64 profile_opportunistic_simd_reserve_min_wq_outer_sum;
-	u64 profile_opportunistic_simd_reserve_min_wq_children_sum;
-	u64 profile_opportunistic_simd_reserve_fresh_spans_min;
-	u64 profile_opportunistic_simd_reserve_fresh_spans_max;
-	u64 profile_opportunistic_simd_reserve_fresh_pages_min;
-	u64 profile_opportunistic_simd_reserve_fresh_pages_max;
-	u64 profile_opportunistic_simd_exhausted_ready_depth_sum;
-	u64 profile_opportunistic_simd_exhausted_ready_depth_max;
-	u64 profile_opportunistic_simd_exhausted_inflight_active_children_sum;
-	u64 profile_opportunistic_simd_exhausted_inflight_min_wq_children_sum;
-	u64 profile_opportunistic_simd_bursts;
-	u64 profile_opportunistic_simd_pages;
-	u64 profile_opportunistic_simd_max_burst_pages;
-	u64 profile_opportunistic_simd_feedback_grow;
-	u64 profile_opportunistic_simd_feedback_hold;
-	u64 profile_opportunistic_simd_feedback_shrink;
-	u64 profile_opportunistic_simd_feedback_reset;
-	u64 profile_opportunistic_simd_max_completed_wq;
-	u64 profile_opportunistic_simd_min_runway_after_burst;
-	u64 profile_opportunistic_simd_feedback_completed_children;
-	u64 profile_opportunistic_simd_feedback_max_completed_children_wq;
-	u64 profile_opportunistic_simd_feedback_min_child_runway_after_burst;
-	u64 profile_opportunistic_simd_feedback_max_completed_children_per_page_x1024;
-	bool poll_probe_enabled;
-	u32 poll_probe_pages_per_pause;
-	u64 profile_poll_probe_bursts;
-	u64 profile_poll_probe_pages;
-	u64 profile_poll_probe_wall_ns;
-	u64 profile_poll_probe_skipped_no_sample;
-	u64 profile_poll_probe_shadow_parent_pages;
-	u64 profile_poll_probe_shadow_patch_pages;
-	u64 profile_poll_probe_shadow_full_pages;
-	u64 profile_poll_probe_followup_harvested_outer;
-	u64 profile_poll_probe_followup_harvested_children;
-	u64 profile_poll_probe_followup_max_harvested_outer_wq;
-	u64 profile_poll_probe_followup_min_outer_runway;
-	u64 profile_poll_probe_followup_zero_runway;
-	u64 profile_assist_enqueued;
+	bool continuation_assist_enabled;
 	u64 profile_assist_overflow_to_dsa;
-	u64 profile_assist_dequeued;
 	u64 profile_assist_pages;
 	u64 profile_assist_bytes;
-	u64 profile_assist_bursts;
 	u64 profile_assist_max_queue_depth;
-	u64 profile_assist_dsa_diff_submits;
-	u64 profile_assist_general_submits;
-	u64 profile_assist_fresh_submits;
 	u64 profile_assist_while_dsa_active_pages;
 	u64 profile_assist_tail_pages;
-	u64 profile_compare_wq_lane_count;
-	u64 profile_compare_wq_max_active_skew;
-	u64 profile_compare_wq_starved_with_claimable_work;
 	/* Set only after this service has promoted a locally staged generation.
 	 * It is a scheduling input, not merely a reporting label. */
 	bool service_parent_mapping_warm;
@@ -711,19 +600,11 @@ struct hot_apply_ctx {
 	u64 profile_prq_pg_requests;
 	u64 profile_prq_thread_cpu_us;
 	int profile_prq_setup_errno;
-	u64 profile_prefault_spans;
-	u64 profile_prefault_pages;
 	u64 profile_parent_pages;
 	u64 profile_patch_ranges;
 	u64 profile_idx_writes;
 	u64 profile_dat_writes;
 	u64 profile_dat_writevs;
-	u64 profile_hot_pwrite_ops;
-	u64 profile_hot_pwrite_bytes;
-	u64 profile_hot_mprotect_ops;
-	u64 profile_hot_memcpy_bytes;
-	u64 profile_pagemap_iovs;
-	u64 profile_pagemap_flushes;
 	u64 profile_pagemap_bytes;
 	u64 profile_pagemap_plan_us;
 	u64 profile_parent_validate_us;
@@ -1968,33 +1849,46 @@ static int hot_fg_select_compare_backend(struct hot_apply_ctx *ctx)
 	return 0;
 }
 
-static int hot_fg_select_poll_probe(struct hot_apply_ctx *ctx)
+static int hot_fg_parse_continuation_assist(bool *enabled)
 {
-	const char *value = getenv("CRIU_DSA_COMPARE_POLL_PROBE_PAGES");
-	char *end = NULL;
-	unsigned long pages;
+	const char *value = getenv("CRIU_DSA_COMPARE_ASSIST");
 
+	if (!enabled)
+		return -1;
+	*enabled = true;
 	if (!value)
 		return 0;
-	if (!value[0]) {
-		pr_err("DSA COMPARE poll probe has an empty page count\n");
+	if (!strcmp(value, "1") || !strcasecmp(value, "true") ||
+	    !strcasecmp(value, "yes") || !strcasecmp(value, "on"))
+		return 0;
+	if (!strcmp(value, "0") || !strcasecmp(value, "false") ||
+	    !strcasecmp(value, "no") || !strcasecmp(value, "off")) {
+		*enabled = false;
+		return 0;
+	}
+	pr_err("Invalid CRIU_DSA_COMPARE_ASSIST (use 0/off or 1/on): %s\n",
+	       value);
+	return -1;
+}
+
+static int hot_fg_select_continuation_assist(struct hot_apply_ctx *ctx)
+{
+	const char *value = getenv("CRIU_DSA_COMPARE_ASSIST");
+
+	/* Production keeps the measured continuation-assist scheduler enabled.
+	 * The explicit false value exists only for the same-binary hardware-BATCH
+	 * ablation; it is not a runtime fallback. */
+	if (value && ctx->fg_compare_backend != HOT_FG_COMPARE_DSA) {
+		pr_err("DSA continuation-assist override requires backend=dsa\n");
 		return -1;
 	}
-	errno = 0;
-	pages = strtoul(value, &end, 10);
-	if (errno || !end || *end ||
-	    (pages != 0 && pages != 1 && pages != 2 && pages != 4 && pages != 8)) {
-		pr_err("DSA COMPARE poll probe pages must be one of 0,1,2,4,8: %s\n",
-		       value);
-		return -1;
+	if (ctx->fg_compare_backend != HOT_FG_COMPARE_DSA &&
+	    ctx->fg_compare_backend != HOT_FG_COMPARE_VALIDATE) {
+		ctx->continuation_assist_enabled = false;
+		return 0;
 	}
-	if (!ctx->profile || ctx->fg_compare_backend != HOT_FG_COMPARE_DSA) {
-		pr_err("DSA COMPARE poll probe requires profile mode and backend=dsa\n");
-		return -1;
-	}
-	ctx->poll_probe_enabled = true;
-	ctx->poll_probe_pages_per_pause = (u32)pages;
-	return 0;
+	return hot_fg_parse_continuation_assist(
+		&ctx->continuation_assist_enabled);
 }
 
 static int hot_fg_open_sidecar(struct hot_apply_ctx *ctx)
@@ -2166,8 +2060,6 @@ static int hot_memstore_owner_make_writable(struct hot_apply_ctx *ctx, size_t in
 		return -1;
 	}
 	owner->map_writable = true;
-	if (ctx->profile)
-		ctx->profile_hot_mprotect_ops++;
 	return 0;
 }
 
@@ -2600,7 +2492,8 @@ static struct hot_apply_ctx *hot_apply_alloc_ctx(int fd_type,
 		(ctx->fine_output || dsa_aligned_full_enabled());
 	ctx->profile = dsa_profile_enabled();
 	if (ctx->fine_output &&
-	    (hot_fg_select_compare_backend(ctx) || hot_fg_select_poll_probe(ctx))) {
+	    (hot_fg_select_compare_backend(ctx) ||
+	     hot_fg_select_continuation_assist(ctx))) {
 		xfree(ctx);
 		return NULL;
 	}
@@ -2783,9 +2676,6 @@ static int hot_memstore_write_to_segments(struct hot_apply_ctx *ctx,
 		memcpy((char *)hot_memstore_owner_map(ctx, seg->owner) + seg->off +
 		       (cur - seg->start),
 		       (const char *)buf + done, chunk);
-		if (ctx->profile) {
-			ctx->profile_hot_memcpy_bytes += chunk;
-		}
 		done += chunk;
 	}
 
@@ -3344,10 +3234,6 @@ static void hot_service_profile_reset_generation(struct hot_apply_ctx *ctx)
 	ctx->profile_sidecar_emit_us = 0;
 	ctx->profile_compare_engine_wall_us = 0;
 	ctx->profile_compare_engine_cpu_us = 0;
-	ctx->profile_parent_prefault_wall_us = 0;
-	ctx->profile_parent_prefault_cpu_us = 0;
-	ctx->profile_compare_core_wall_us = 0;
-	ctx->profile_compare_core_cpu_us = 0;
 	ctx->profile_output_wall_us = 0;
 	ctx->profile_output_start_us = 0;
 	ctx->profile_hot_apply_us = 0;
@@ -3361,153 +3247,41 @@ static void hot_service_profile_reset_generation(struct hot_apply_ctx *ctx)
 	ctx->profile_max_span_pages = 0;
 	ctx->profile_compare_enq_retries = 0;
 	ctx->profile_compare_poll_sweeps = 0;
-	ctx->profile_compare_not_ready = 0;
-	ctx->profile_compare_max_active = 0;
 	ctx->profile_batch_outer_submits = 0;
 	ctx->profile_batch_child_submits = 0;
 	ctx->profile_batch_partial_submits = 0;
 	ctx->profile_batch_single_tail_submits = 0;
-	ctx->profile_batch_outer_success = 0;
 	ctx->profile_batch_outer_fail = 0;
-	ctx->profile_batch_child_success = 0;
 	ctx->profile_batch_child_nobof = 0;
 	ctx->profile_batch_max_active_outer = 0;
 	ctx->profile_batch_max_active_children = 0;
-	ctx->profile_completions_harvested = 0;
-	ctx->profile_completion_timeout_count = 0;
 	ctx->profile_max_completion_age_us = 0;
-	ctx->profile_write_units = 0;
-	ctx->profile_write_unit_max_us = 0;
-	ctx->profile_memcmp_calls = 0;
 	ctx->profile_memcmp_requested_bytes = 0;
-	ctx->profile_memcmp_scalar_bytes = 0;
-	ctx->profile_scalar64_calls = 0;
-	ctx->profile_scalar64_word_ops = 0;
-	ctx->profile_scalar64_refine_bytes = 0;
-	ctx->profile_scalar64_tail_bytes = 0;
 	ctx->profile_scalar64_bytes_examined = 0;
-	ctx->profile_simd_vector_ops = 0;
 	ctx->profile_simd_bytes_examined = 0;
-	ctx->profile_hybrid_dsa_claim_spans = 0;
-	ctx->profile_hybrid_dsa_claim_pages = 0;
-	ctx->profile_hybrid_cpu_claim_spans = 0;
-	ctx->profile_hybrid_cpu_claim_pages = 0;
-	ctx->profile_hybrid_cpu_waves = 0;
-	ctx->profile_hybrid_dsa_to_cpu_handoff_spans = 0;
-	ctx->profile_hybrid_dsa_to_cpu_handoff_pages = 0;
-	ctx->profile_hybrid_dsa_to_cpu_handoff_remaining_bytes = 0;
-	ctx->profile_hybrid_unclaimed_empty_count = 0;
 	ctx->profile_compare_nobof_faults = 0;
 	ctx->profile_compare_nobof_fault_source1 = 0;
 	ctx->profile_compare_nobof_fault_source2 = 0;
-	ctx->profile_compare_nobof_equal_prefix_bytes = 0;
-	ctx->profile_compare_fault_handoff_spans = 0;
-	ctx->profile_compare_fault_handoff_pages = 0;
 	ctx->profile_compare_fault_handoff_remaining_bytes = 0;
-	ctx->profile_compare_fault_queue_max = 0;
-	ctx->profile_compare_fresh_claim_throttles = 0;
-	ctx->profile_compare_cpu_fault_waves = 0;
 	ctx->profile_dsa_logical_progress_bytes = 0;
-	ctx->profile_simd_logical_progress_bytes = 0;
 	ctx->profile_normal_simd_logical_progress_bytes = 0;
 	ctx->profile_fault_simd_logical_progress_bytes = 0;
 	ctx->profile_dsa_fresh_submit_ops = 0;
 	ctx->profile_dsa_continuation_submit_ops = 0;
 	ctx->profile_dsa_submitted_bytes = 0;
-	ctx->profile_simd_progress_while_dsa_active_bytes = 0;
-	ctx->profile_simd_quanta_while_dsa_active = 0;
-	ctx->profile_dsa_fresh_claim_bytes = 0;
-	ctx->profile_dsa_active_zero_while_normal_cpu_work = 0;
-	ctx->profile_ready_completions_before_simd = 0;
-	ctx->profile_ready_completions_after_simd = 0;
-	ctx->profile_scheduler_iterations = 0;
-	ctx->profile_dsa_refill_samples = 0;
-	ctx->profile_post_refill_active_sum = 0;
-	ctx->profile_post_refill_active_lt_32 = 0;
-	ctx->profile_post_refill_active_lt_64 = 0;
-	ctx->profile_post_refill_active_lt_96 = 0;
-	ctx->profile_fresh_refill_spans = 0;
-	ctx->profile_fresh_refill_batches = 0;
-	ctx->profile_fresh_refill_blocked_fault_debt = 0;
-	ctx->profile_dsa_empty_with_claimable_fresh = 0;
-	ctx->profile_opportunistic_simd_gate_attempts = 0;
-	ctx->profile_opportunistic_simd_gate_success = 0;
-	ctx->profile_opportunistic_simd_blocked_partial_above_reserve = 0;
-	ctx->profile_opportunistic_simd_blocked_reserve_full = 0;
-	ctx->profile_opportunistic_simd_blocked_reserve_partial = 0;
-	ctx->profile_opportunistic_simd_blocked_exhausted_ready = 0;
-	ctx->profile_opportunistic_simd_blocked_exhausted_inflight = 0;
-	ctx->profile_opportunistic_simd_gate_full_above_reserve_ns = 0;
-	ctx->profile_opportunistic_simd_gate_partial_above_reserve_ns = 0;
-	ctx->profile_opportunistic_simd_gate_reserve_full_ns = 0;
-	ctx->profile_opportunistic_simd_gate_reserve_partial_ns = 0;
-	ctx->profile_opportunistic_simd_gate_exhausted_ready_ns = 0;
-	ctx->profile_opportunistic_simd_gate_exhausted_inflight_ns = 0;
-	ctx->profile_opportunistic_simd_reserve_active_outer_sum = 0;
-	ctx->profile_opportunistic_simd_reserve_active_children_sum = 0;
-	ctx->profile_opportunistic_simd_reserve_min_wq_outer_sum = 0;
-	ctx->profile_opportunistic_simd_reserve_min_wq_children_sum = 0;
-	ctx->profile_opportunistic_simd_reserve_fresh_spans_min = 0;
-	ctx->profile_opportunistic_simd_reserve_fresh_spans_max = 0;
-	ctx->profile_opportunistic_simd_reserve_fresh_pages_min = 0;
-	ctx->profile_opportunistic_simd_reserve_fresh_pages_max = 0;
-	ctx->profile_opportunistic_simd_exhausted_ready_depth_sum = 0;
-	ctx->profile_opportunistic_simd_exhausted_ready_depth_max = 0;
-	ctx->profile_opportunistic_simd_exhausted_inflight_active_children_sum = 0;
-	ctx->profile_opportunistic_simd_exhausted_inflight_min_wq_children_sum = 0;
-	ctx->profile_opportunistic_simd_bursts = 0;
-	ctx->profile_opportunistic_simd_pages = 0;
-	ctx->profile_opportunistic_simd_max_burst_pages = 0;
-	ctx->profile_opportunistic_simd_feedback_grow = 0;
-	ctx->profile_opportunistic_simd_feedback_hold = 0;
-	ctx->profile_opportunistic_simd_feedback_shrink = 0;
-	ctx->profile_opportunistic_simd_feedback_reset = 0;
-	ctx->profile_opportunistic_simd_max_completed_wq = 0;
-	ctx->profile_opportunistic_simd_min_runway_after_burst = 0;
-	ctx->profile_opportunistic_simd_feedback_completed_children = 0;
-	ctx->profile_opportunistic_simd_feedback_max_completed_children_wq = 0;
-	ctx->profile_opportunistic_simd_feedback_min_child_runway_after_burst = 0;
-	ctx->profile_opportunistic_simd_feedback_max_completed_children_per_page_x1024 = 0;
-	ctx->profile_poll_probe_bursts = 0;
-	ctx->profile_poll_probe_pages = 0;
-	ctx->profile_poll_probe_wall_ns = 0;
-	ctx->profile_poll_probe_skipped_no_sample = 0;
-	ctx->profile_poll_probe_shadow_parent_pages = 0;
-	ctx->profile_poll_probe_shadow_patch_pages = 0;
-	ctx->profile_poll_probe_shadow_full_pages = 0;
-	ctx->profile_poll_probe_followup_harvested_outer = 0;
-	ctx->profile_poll_probe_followup_harvested_children = 0;
-	ctx->profile_poll_probe_followup_max_harvested_outer_wq = 0;
-	ctx->profile_poll_probe_followup_min_outer_runway = 0;
-	ctx->profile_poll_probe_followup_zero_runway = 0;
-	ctx->profile_assist_enqueued = 0;
 	ctx->profile_assist_overflow_to_dsa = 0;
-	ctx->profile_assist_dequeued = 0;
 	ctx->profile_assist_pages = 0;
 	ctx->profile_assist_bytes = 0;
-	ctx->profile_assist_bursts = 0;
 	ctx->profile_assist_max_queue_depth = 0;
-	ctx->profile_assist_dsa_diff_submits = 0;
-	ctx->profile_assist_general_submits = 0;
-	ctx->profile_assist_fresh_submits = 0;
 	ctx->profile_assist_while_dsa_active_pages = 0;
 	ctx->profile_assist_tail_pages = 0;
-	ctx->profile_compare_wq_lane_count = 0;
-	ctx->profile_compare_wq_max_active_skew = 0;
-	ctx->profile_compare_wq_starved_with_claimable_work = 0;
 	ctx->profile_prq_pg_requests = 0;
 	ctx->profile_prq_thread_cpu_us = 0;
-	ctx->profile_prefault_spans = 0;
-	ctx->profile_prefault_pages = 0;
 	ctx->profile_parent_pages = 0;
 	ctx->profile_patch_ranges = 0;
 	ctx->profile_idx_writes = 0;
 	ctx->profile_dat_writes = 0;
 	ctx->profile_dat_writevs = 0;
-	ctx->profile_hot_pwrite_ops = 0;
-	ctx->profile_hot_pwrite_bytes = 0;
-	ctx->profile_hot_mprotect_ops = 0;
-	ctx->profile_hot_memcpy_bytes = 0;
 
 	ctx->fg_pages = 0;
 	ctx->fg_patch_pages = 0;
@@ -3538,37 +3312,24 @@ static void hot_service_profile_snapshot(
 	profile->compare_engine_wall_us = ctx->profile_compare_engine_wall_us;
 	profile->compare_engine_cpu_us = ctx->profile_compare_engine_cpu_us;
 	profile->result_publish_us = ctx->profile_sidecar_emit_us;
-	profile->parent_prefault_wall_us = ctx->profile_parent_prefault_wall_us;
-	profile->parent_prefault_cpu_us = ctx->profile_parent_prefault_cpu_us;
-	profile->compare_core_wall_us = ctx->profile_compare_core_wall_us;
-	profile->compare_core_cpu_us = ctx->profile_compare_core_cpu_us;
 	profile->raw_pages = ctx->profile_raw_pages;
 	profile->raw_bytes = ctx->profile_raw_bytes;
 	profile->capture_runs = ctx->profile_capture_runs;
 	profile->spans = ctx->profile_spans;
 	profile->span_pages = ctx->profile_span_pages;
 	profile->max_span_pages = ctx->profile_max_span_pages;
-	profile->compare_ops = ctx->fg_compare_ops;
 	profile->enq_retries = ctx->profile_compare_enq_retries;
 	profile->poll_sweeps = ctx->profile_compare_poll_sweeps;
-	profile->not_ready = ctx->profile_compare_not_ready;
-	profile->max_active = ctx->profile_compare_max_active;
 	profile->batch_outer_submits = ctx->profile_batch_outer_submits;
 	profile->batch_child_submits = ctx->profile_batch_child_submits;
 	profile->batch_partial_submits = ctx->profile_batch_partial_submits;
 	profile->batch_single_tail_submits =
 		ctx->profile_batch_single_tail_submits;
-	profile->batch_outer_success = ctx->profile_batch_outer_success;
 	profile->batch_outer_fail = ctx->profile_batch_outer_fail;
-	profile->batch_child_success = ctx->profile_batch_child_success;
 	profile->batch_child_nobof = ctx->profile_batch_child_nobof;
 	profile->batch_max_active_outer = ctx->profile_batch_max_active_outer;
 	profile->batch_max_active_children = ctx->profile_batch_max_active_children;
-	profile->completions_harvested = ctx->profile_completions_harvested;
-	profile->completion_timeout_count = ctx->profile_completion_timeout_count;
 	profile->max_completion_age_us = ctx->profile_max_completion_age_us;
-	profile->prefault_spans = ctx->profile_prefault_spans;
-	profile->prefault_pages = ctx->profile_prefault_pages;
 	profile->parent_pages = ctx->profile_parent_pages;
 	profile->patch_pages = ctx->fg_patch_pages;
 	profile->full_pages = ctx->fg_full_pages;
@@ -3576,46 +3337,16 @@ static void hot_service_profile_snapshot(
 	profile->patch_bytes = ctx->fg_patch_bytes;
 	profile->prq_pg_requests = ctx->profile_prq_pg_requests;
 	profile->prq_thread_cpu_us = ctx->profile_prq_thread_cpu_us;
-	profile->memcmp_calls = ctx->profile_memcmp_calls;
 	profile->memcmp_requested_bytes = ctx->profile_memcmp_requested_bytes;
-	profile->memcmp_scalar_bytes = ctx->profile_memcmp_scalar_bytes;
-	profile->scalar64_calls = ctx->profile_scalar64_calls;
-	profile->scalar64_word_ops = ctx->profile_scalar64_word_ops;
-	profile->scalar64_refine_bytes = ctx->profile_scalar64_refine_bytes;
-	profile->scalar64_tail_bytes = ctx->profile_scalar64_tail_bytes;
 	profile->scalar64_bytes_examined = ctx->profile_scalar64_bytes_examined;
-	profile->simd_vector_ops = ctx->profile_simd_vector_ops;
 	profile->simd_bytes_examined = ctx->profile_simd_bytes_examined;
-	profile->hybrid_dsa_claim_spans = ctx->profile_hybrid_dsa_claim_spans;
-	profile->hybrid_dsa_claim_pages = ctx->profile_hybrid_dsa_claim_pages;
-	profile->hybrid_cpu_claim_spans = ctx->profile_hybrid_cpu_claim_spans;
-	profile->hybrid_cpu_claim_pages = ctx->profile_hybrid_cpu_claim_pages;
-	profile->hybrid_cpu_waves = ctx->profile_hybrid_cpu_waves;
-	profile->hybrid_dsa_to_cpu_handoff_spans =
-		ctx->profile_hybrid_dsa_to_cpu_handoff_spans;
-	profile->hybrid_dsa_to_cpu_handoff_pages =
-		ctx->profile_hybrid_dsa_to_cpu_handoff_pages;
-	profile->hybrid_dsa_to_cpu_handoff_remaining_bytes =
-		ctx->profile_hybrid_dsa_to_cpu_handoff_remaining_bytes;
-	profile->hybrid_unclaimed_empty_count =
-		ctx->profile_hybrid_unclaimed_empty_count;
 	profile->compare_nobof_faults = ctx->profile_compare_nobof_faults;
 	profile->compare_nobof_fault_source1 = ctx->profile_compare_nobof_fault_source1;
 	profile->compare_nobof_fault_source2 = ctx->profile_compare_nobof_fault_source2;
-	profile->compare_nobof_equal_prefix_bytes =
-		ctx->profile_compare_nobof_equal_prefix_bytes;
-	profile->compare_fault_handoff_spans = ctx->profile_compare_fault_handoff_spans;
-	profile->compare_fault_handoff_pages = ctx->profile_compare_fault_handoff_pages;
 	profile->compare_fault_handoff_remaining_bytes =
 		ctx->profile_compare_fault_handoff_remaining_bytes;
-	profile->compare_fault_queue_max = ctx->profile_compare_fault_queue_max;
-	profile->compare_fresh_claim_throttles =
-		ctx->profile_compare_fresh_claim_throttles;
-	profile->compare_cpu_fault_waves = ctx->profile_compare_cpu_fault_waves;
 	profile->dsa_logical_progress_bytes =
 		ctx->profile_dsa_logical_progress_bytes;
-	profile->simd_logical_progress_bytes =
-		ctx->profile_simd_logical_progress_bytes;
 	profile->normal_simd_logical_progress_bytes =
 		ctx->profile_normal_simd_logical_progress_bytes;
 	profile->fault_simd_logical_progress_bytes =
@@ -3624,146 +3355,14 @@ static void hot_service_profile_snapshot(
 	profile->dsa_continuation_submit_ops =
 		ctx->profile_dsa_continuation_submit_ops;
 	profile->dsa_submitted_bytes = ctx->profile_dsa_submitted_bytes;
-	profile->simd_progress_while_dsa_active_bytes =
-		ctx->profile_simd_progress_while_dsa_active_bytes;
-	profile->simd_quanta_while_dsa_active =
-		ctx->profile_simd_quanta_while_dsa_active;
-	profile->dsa_fresh_claim_bytes = ctx->profile_dsa_fresh_claim_bytes;
-	profile->dsa_active_zero_while_normal_cpu_work =
-		ctx->profile_dsa_active_zero_while_normal_cpu_work;
-	profile->ready_completions_before_simd =
-		ctx->profile_ready_completions_before_simd;
-	profile->ready_completions_after_simd =
-		ctx->profile_ready_completions_after_simd;
-	profile->scheduler_iterations = ctx->profile_scheduler_iterations;
-	profile->dsa_refill_samples = ctx->profile_dsa_refill_samples;
-	profile->post_refill_active_sum = ctx->profile_post_refill_active_sum;
-	profile->post_refill_active_lt_32 = ctx->profile_post_refill_active_lt_32;
-	profile->post_refill_active_lt_64 = ctx->profile_post_refill_active_lt_64;
-	profile->post_refill_active_lt_96 = ctx->profile_post_refill_active_lt_96;
-	profile->fresh_refill_spans = ctx->profile_fresh_refill_spans;
-	profile->fresh_refill_batches = ctx->profile_fresh_refill_batches;
-	profile->fresh_refill_blocked_fault_debt =
-		ctx->profile_fresh_refill_blocked_fault_debt;
-	profile->dsa_empty_with_claimable_fresh =
-		ctx->profile_dsa_empty_with_claimable_fresh;
-	profile->opportunistic_simd_gate_attempts =
-		ctx->profile_opportunistic_simd_gate_attempts;
-	profile->opportunistic_simd_gate_success =
-		ctx->profile_opportunistic_simd_gate_success;
-	profile->opportunistic_simd_blocked_partial_above_reserve =
-		ctx->profile_opportunistic_simd_blocked_partial_above_reserve;
-	profile->opportunistic_simd_blocked_reserve_full =
-		ctx->profile_opportunistic_simd_blocked_reserve_full;
-	profile->opportunistic_simd_blocked_reserve_partial =
-		ctx->profile_opportunistic_simd_blocked_reserve_partial;
-	profile->opportunistic_simd_blocked_exhausted_ready =
-		ctx->profile_opportunistic_simd_blocked_exhausted_ready;
-	profile->opportunistic_simd_blocked_exhausted_inflight =
-		ctx->profile_opportunistic_simd_blocked_exhausted_inflight;
-	profile->opportunistic_simd_gate_full_above_reserve_ns =
-		ctx->profile_opportunistic_simd_gate_full_above_reserve_ns;
-	profile->opportunistic_simd_gate_partial_above_reserve_ns =
-		ctx->profile_opportunistic_simd_gate_partial_above_reserve_ns;
-	profile->opportunistic_simd_gate_reserve_full_ns =
-		ctx->profile_opportunistic_simd_gate_reserve_full_ns;
-	profile->opportunistic_simd_gate_reserve_partial_ns =
-		ctx->profile_opportunistic_simd_gate_reserve_partial_ns;
-	profile->opportunistic_simd_gate_exhausted_ready_ns =
-		ctx->profile_opportunistic_simd_gate_exhausted_ready_ns;
-	profile->opportunistic_simd_gate_exhausted_inflight_ns =
-		ctx->profile_opportunistic_simd_gate_exhausted_inflight_ns;
-	profile->opportunistic_simd_reserve_active_outer_sum =
-		ctx->profile_opportunistic_simd_reserve_active_outer_sum;
-	profile->opportunistic_simd_reserve_active_children_sum =
-		ctx->profile_opportunistic_simd_reserve_active_children_sum;
-	profile->opportunistic_simd_reserve_min_wq_outer_sum =
-		ctx->profile_opportunistic_simd_reserve_min_wq_outer_sum;
-	profile->opportunistic_simd_reserve_min_wq_children_sum =
-		ctx->profile_opportunistic_simd_reserve_min_wq_children_sum;
-	profile->opportunistic_simd_reserve_fresh_spans_min =
-		ctx->profile_opportunistic_simd_reserve_fresh_spans_min;
-	profile->opportunistic_simd_reserve_fresh_spans_max =
-		ctx->profile_opportunistic_simd_reserve_fresh_spans_max;
-	profile->opportunistic_simd_reserve_fresh_pages_min =
-		ctx->profile_opportunistic_simd_reserve_fresh_pages_min;
-	profile->opportunistic_simd_reserve_fresh_pages_max =
-		ctx->profile_opportunistic_simd_reserve_fresh_pages_max;
-	profile->opportunistic_simd_exhausted_ready_depth_sum =
-		ctx->profile_opportunistic_simd_exhausted_ready_depth_sum;
-	profile->opportunistic_simd_exhausted_ready_depth_max =
-		ctx->profile_opportunistic_simd_exhausted_ready_depth_max;
-	profile->opportunistic_simd_exhausted_inflight_active_children_sum =
-		ctx->profile_opportunistic_simd_exhausted_inflight_active_children_sum;
-	profile->opportunistic_simd_exhausted_inflight_min_wq_children_sum =
-		ctx->profile_opportunistic_simd_exhausted_inflight_min_wq_children_sum;
-	profile->opportunistic_simd_bursts =
-		ctx->profile_opportunistic_simd_bursts;
-	profile->opportunistic_simd_pages =
-		ctx->profile_opportunistic_simd_pages;
-	profile->opportunistic_simd_max_burst_pages =
-		ctx->profile_opportunistic_simd_max_burst_pages;
-	profile->opportunistic_simd_feedback_grow =
-		ctx->profile_opportunistic_simd_feedback_grow;
-	profile->opportunistic_simd_feedback_hold =
-		ctx->profile_opportunistic_simd_feedback_hold;
-	profile->opportunistic_simd_feedback_shrink =
-		ctx->profile_opportunistic_simd_feedback_shrink;
-	profile->opportunistic_simd_feedback_reset =
-		ctx->profile_opportunistic_simd_feedback_reset;
-	profile->opportunistic_simd_max_completed_wq =
-		ctx->profile_opportunistic_simd_max_completed_wq;
-	profile->opportunistic_simd_min_runway_after_burst =
-		ctx->profile_opportunistic_simd_min_runway_after_burst;
-	profile->opportunistic_simd_feedback_completed_children =
-		ctx->profile_opportunistic_simd_feedback_completed_children;
-	profile->opportunistic_simd_feedback_max_completed_children_wq =
-		ctx->profile_opportunistic_simd_feedback_max_completed_children_wq;
-	profile->opportunistic_simd_feedback_min_child_runway_after_burst =
-		ctx->profile_opportunistic_simd_feedback_min_child_runway_after_burst;
-	profile->opportunistic_simd_feedback_max_completed_children_per_page_x1024 =
-		ctx->profile_opportunistic_simd_feedback_max_completed_children_per_page_x1024;
-	profile->poll_probe_enabled = ctx->poll_probe_enabled ? 1 : 0;
-	profile->poll_probe_pages_per_pause = ctx->poll_probe_pages_per_pause;
-	profile->poll_probe_bursts = ctx->profile_poll_probe_bursts;
-	profile->poll_probe_pages = ctx->profile_poll_probe_pages;
-	profile->poll_probe_wall_ns = ctx->profile_poll_probe_wall_ns;
-	profile->poll_probe_skipped_no_sample =
-		ctx->profile_poll_probe_skipped_no_sample;
-	profile->poll_probe_shadow_parent_pages =
-		ctx->profile_poll_probe_shadow_parent_pages;
-	profile->poll_probe_shadow_patch_pages =
-		ctx->profile_poll_probe_shadow_patch_pages;
-	profile->poll_probe_shadow_full_pages =
-		ctx->profile_poll_probe_shadow_full_pages;
-	profile->poll_probe_followup_harvested_outer =
-		ctx->profile_poll_probe_followup_harvested_outer;
-	profile->poll_probe_followup_harvested_children =
-		ctx->profile_poll_probe_followup_harvested_children;
-	profile->poll_probe_followup_max_harvested_outer_wq =
-		ctx->profile_poll_probe_followup_max_harvested_outer_wq;
-	profile->poll_probe_followup_min_outer_runway =
-		ctx->profile_poll_probe_followup_min_outer_runway;
-	profile->poll_probe_followup_zero_runway =
-		ctx->profile_poll_probe_followup_zero_runway;
-	profile->assist_enqueued = ctx->profile_assist_enqueued;
+	profile->assist_enabled = ctx->continuation_assist_enabled ? 1 : 0;
 	profile->assist_overflow_to_dsa = ctx->profile_assist_overflow_to_dsa;
-	profile->assist_dequeued = ctx->profile_assist_dequeued;
 	profile->assist_pages = ctx->profile_assist_pages;
 	profile->assist_bytes = ctx->profile_assist_bytes;
-	profile->assist_bursts = ctx->profile_assist_bursts;
 	profile->assist_max_queue_depth = ctx->profile_assist_max_queue_depth;
-	profile->assist_dsa_diff_submits = ctx->profile_assist_dsa_diff_submits;
-	profile->assist_general_submits = ctx->profile_assist_general_submits;
-	profile->assist_fresh_submits = ctx->profile_assist_fresh_submits;
 	profile->assist_while_dsa_active_pages =
 		ctx->profile_assist_while_dsa_active_pages;
 	profile->assist_tail_pages = ctx->profile_assist_tail_pages;
-	profile->compare_wq_lane_count = ctx->profile_compare_wq_lane_count;
-	profile->compare_wq_max_active_skew =
-		ctx->profile_compare_wq_max_active_skew;
-	profile->compare_wq_starved_with_claimable_work =
-		ctx->profile_compare_wq_starved_with_claimable_work;
 }
 
 static void hot_profile_emit(struct hot_apply_ctx *ctx, int ret)
@@ -3790,66 +3389,52 @@ static void hot_profile_emit(struct hot_apply_ctx *ctx, int ret)
 	dat_bytes = ctx->fg_dat_off >= 0 ? (u64)ctx->fg_dat_off : 0;
 
 	ctx->profile_emitted = true;
-	pr_info("DSA_POST_THAW_PROFILE_TIME: version=5 pages_id=%u backend=%s ret=%d total_us=%" PRIu64 " post_prepare_us=%" PRIu64 " materialize_us=%" PRIu64 " raw_index_us=%" PRIu64 " span_build_us=%" PRIu64 " compare_output_pipeline_wall_us=%" PRIu64 " compare_engine_wall_us=%" PRIu64 " compare_engine_cpu_us=%" PRIu64 " compare_breakdown=%u parent_prefault_wall_us=%" PRIu64 " parent_prefault_cpu_us=%" PRIu64 " compare_core_wall_us=%" PRIu64 " compare_core_cpu_us=%" PRIu64 " control_thread_cpu_us=%" PRIu64 " output_wall_us=%" PRIu64 " hot_apply_us=%" PRIu64 " pagemap_us=%" PRIu64 " pagemap_plan_us=%" PRIu64 " parent_validate_us=%" PRIu64 " pagemap_pack_us=%" PRIu64 " finish_us=%" PRIu64 " accounted_us=%" PRIu64 " unaccounted_us=%" PRIu64 " ledger_overrun=%u\n",
+	pr_info("DSA_POST_THAW_PROFILE_TIME: version=15 pages_id=%u backend=%s ret=%d total_us=%" PRIu64 " post_prepare_us=%" PRIu64 " materialize_us=%" PRIu64 " raw_index_us=%" PRIu64 " span_build_us=%" PRIu64 " compare_output_pipeline_wall_us=%" PRIu64 " compare_engine_wall_us=%" PRIu64 " compare_engine_cpu_us=%" PRIu64 " control_thread_cpu_us=%" PRIu64 " output_wall_us=%" PRIu64 " hot_apply_us=%" PRIu64 " pagemap_us=%" PRIu64 " pagemap_plan_us=%" PRIu64 " parent_validate_us=%" PRIu64 " pagemap_pack_us=%" PRIu64 " finish_us=%" PRIu64 " accounted_us=%" PRIu64 " unaccounted_us=%" PRIu64 " ledger_overrun=%u\n",
 		ctx->pages_id, backend, ret, total_us, ctx->profile_post_prepare_us,
 		ctx->profile_materialize_us, ctx->profile_raw_index_us,
 		ctx->profile_span_build_us, ctx->profile_compare_wall_us,
 		ctx->profile_compare_engine_wall_us,
 		ctx->profile_compare_engine_cpu_us,
-		0U,
-		ctx->profile_parent_prefault_wall_us,
-		ctx->profile_parent_prefault_cpu_us,
-		ctx->profile_compare_core_wall_us,
-		ctx->profile_compare_core_cpu_us, ctx->profile_compare_cpu_us,
+		ctx->profile_compare_cpu_us,
 		ctx->profile_output_wall_us, ctx->profile_hot_apply_us,
 		ctx->profile_pagemap_us, ctx->profile_pagemap_plan_us,
 		ctx->profile_parent_validate_us, ctx->profile_pagemap_pack_us,
 		ctx->profile_finish_us, accounted_us,
 		unaccounted_us, accounted_us > total_us ? 1 : 0);
-	pr_info("DSA_POST_THAW_PROFILE_COUNT: version=5 pages_id=%u backend=%s ret=%d raw_pages=%" PRIu64 " raw_bytes=%" PRIu64 " capture_runs=%" PRIu64 " spans=%" PRIu64 " span_pages=%" PRIu64 " max_span_pages=%" PRIu64 " compare_ops=%" PRIu64 " memcmp_calls=%" PRIu64 " memcmp_requested_bytes=%" PRIu64 " memcmp_scalar_bytes=%" PRIu64 " scalar64_calls=%" PRIu64 " scalar64_word_ops=%" PRIu64 " scalar64_refine_bytes=%" PRIu64 " scalar64_tail_bytes=%" PRIu64 " scalar64_bytes_examined=%" PRIu64 " simd_vector_ops=%" PRIu64 " simd_bytes_examined=%" PRIu64 " hybrid_dsa_claim_spans=%" PRIu64 " hybrid_dsa_claim_pages=%" PRIu64 " hybrid_cpu_claim_spans=%" PRIu64 " hybrid_cpu_claim_pages=%" PRIu64 " hybrid_cpu_waves=%" PRIu64 " hybrid_dsa_to_cpu_handoff_spans=%" PRIu64 " hybrid_dsa_to_cpu_handoff_pages=%" PRIu64 " hybrid_dsa_to_cpu_handoff_remaining_bytes=%" PRIu64 " hybrid_unclaimed_empty_count=%" PRIu64 " prq_profile_available=%u prq_profile_sources=%u prq_pg_requests=%" PRIu64 " prq_thread_cpu_us=%" PRIu64 " prq_setup_errno=%d enq_retries=%" PRIu64 " poll_sweeps=%" PRIu64 " not_ready=%" PRIu64 " max_active=%" PRIu64 " completions_harvested=%" PRIu64 " completion_timeout_count=%" PRIu64 " max_completion_age_us=%" PRIu64 " write_units=%" PRIu64 " write_unit_max_us=%" PRIu64 " prefault_spans=%" PRIu64 " prefault_pages=%" PRIu64 " parent_pages=%" PRIu64 " patch_pages=%" PRIu64 " full_pages=%" PRIu64 " patch_ranges=%" PRIu64 " patch_bytes=%" PRIu64 " idx_write_calls=%" PRIu64 " idx_bytes=%" PRIu64 " dat_write_calls=%" PRIu64 " dat_writev_calls=%" PRIu64 " dat_bytes=%" PRIu64 " hot_pwrite_ops=%" PRIu64 " hot_pwrite_bytes=%" PRIu64 " hot_mprotect_ops=%" PRIu64 " hot_memcpy_bytes=%" PRIu64 " pagemap_iovs=%" PRIu64 " pagemap_input_records=%" PRIu64 " pagemap_records=%zu pagemap_merged_records=%" PRIu64 " pagemap_present_pages=%" PRIu64 " pagemap_fg_pages=%" PRIu64 " pagemap_bytes=%" PRIu64 " pagemap_flushes=%" PRIu64 "\n",
-		ctx->pages_id, backend, ret, ctx->profile_raw_pages, ctx->profile_raw_bytes,
-		ctx->profile_capture_runs, ctx->profile_spans,
+	pr_info("DSA_POST_THAW_PROFILE_COUNT: version=15 pages_id=%u backend=%s ret=%d raw_pages=%" PRIu64 " raw_bytes=%" PRIu64 " capture_runs=%" PRIu64 " spans=%" PRIu64 " span_pages=%" PRIu64 " max_span_pages=%" PRIu64 " memcmp_requested_bytes=%" PRIu64 " scalar64_bytes_examined=%" PRIu64 " simd_bytes_examined=%" PRIu64 " compare_nobof_faults=%" PRIu64 " compare_nobof_fault_source1=%" PRIu64 " compare_nobof_fault_source2=%" PRIu64 " compare_fault_handoff_remaining_bytes=%" PRIu64 " dsa_logical_progress_bytes=%" PRIu64 " normal_simd_logical_progress_bytes=%" PRIu64 " fault_simd_logical_progress_bytes=%" PRIu64 " dsa_fresh_submit_ops=%" PRIu64 " dsa_continuation_submit_ops=%" PRIu64 " dsa_submitted_bytes=%" PRIu64 " assist_enabled=%u assist_overflow_to_dsa=%" PRIu64 " assist_pages=%" PRIu64 " assist_bytes=%" PRIu64 " assist_max_queue_depth=%" PRIu64 " assist_while_dsa_active_pages=%" PRIu64 " assist_tail_pages=%" PRIu64 " batch_outer_submits=%" PRIu64 " batch_child_submits=%" PRIu64 " batch_partial_submits=%" PRIu64 " batch_single_tail_submits=%" PRIu64 " batch_outer_fail=%" PRIu64 " batch_child_nobof=%" PRIu64 " batch_max_active_outer=%" PRIu64 " batch_max_active_children=%" PRIu64 " prq_profile_available=%u prq_profile_sources=%u prq_pg_requests=%" PRIu64 " prq_thread_cpu_us=%" PRIu64 " prq_setup_errno=%d enq_retries=%" PRIu64 " poll_sweeps=%" PRIu64 " max_completion_age_us=%" PRIu64 " parent_pages=%" PRIu64 " patch_pages=%" PRIu64 " full_pages=%" PRIu64 " patch_ranges=%" PRIu64 " patch_bytes=%" PRIu64 " idx_write_calls=%" PRIu64 " idx_bytes=%" PRIu64 " dat_write_calls=%" PRIu64 " dat_writev_calls=%" PRIu64 " dat_bytes=%" PRIu64 " pagemap_records=%zu pagemap_bytes=%" PRIu64 "\n",
+		ctx->pages_id, backend, ret, ctx->profile_raw_pages,
+		ctx->profile_raw_bytes, ctx->profile_capture_runs, ctx->profile_spans,
 		ctx->profile_span_pages, ctx->profile_max_span_pages,
-		ctx->fg_compare_ops, ctx->profile_memcmp_calls,
 		ctx->profile_memcmp_requested_bytes,
-		ctx->profile_memcmp_scalar_bytes, ctx->profile_scalar64_calls,
-		ctx->profile_scalar64_word_ops, ctx->profile_scalar64_refine_bytes,
-		ctx->profile_scalar64_tail_bytes, ctx->profile_scalar64_bytes_examined,
-		ctx->profile_simd_vector_ops,
-		ctx->profile_simd_bytes_examined,
-		ctx->profile_hybrid_dsa_claim_spans,
-		ctx->profile_hybrid_dsa_claim_pages,
-		ctx->profile_hybrid_cpu_claim_spans,
-		ctx->profile_hybrid_cpu_claim_pages,
-		ctx->profile_hybrid_cpu_waves,
-		ctx->profile_hybrid_dsa_to_cpu_handoff_spans,
-		ctx->profile_hybrid_dsa_to_cpu_handoff_pages,
-		ctx->profile_hybrid_dsa_to_cpu_handoff_remaining_bytes,
-		ctx->profile_hybrid_unclaimed_empty_count,
-		ctx->profile_prq_available ? 1 : 0,
-		ctx->profile_nr_prq_sources,
-		ctx->profile_prq_pg_requests,
-		ctx->profile_prq_thread_cpu_us,
-		ctx->profile_prq_setup_errno,
-		ctx->profile_compare_enq_retries,
-		ctx->profile_compare_poll_sweeps, ctx->profile_compare_not_ready,
-		ctx->profile_compare_max_active, ctx->profile_completions_harvested,
-		ctx->profile_completion_timeout_count,
-		ctx->profile_max_completion_age_us,
-		ctx->profile_write_units, ctx->profile_write_unit_max_us,
-		ctx->profile_prefault_spans,
-		ctx->profile_prefault_pages, ctx->profile_parent_pages,
-		ctx->fg_patch_pages, ctx->fg_full_pages, ctx->profile_patch_ranges,
-		ctx->fg_patch_bytes, ctx->profile_idx_writes, idx_bytes,
-		ctx->profile_dat_writes, ctx->profile_dat_writevs, dat_bytes,
-		ctx->profile_hot_pwrite_ops, ctx->profile_hot_pwrite_bytes,
-		ctx->profile_hot_mprotect_ops, ctx->profile_hot_memcpy_bytes,
-		ctx->profile_pagemap_iovs, ctx->pagemap_plan_input_records,
-		ctx->nr_pagemap_plan,
-		ctx->pagemap_plan_input_records >= ctx->nr_pagemap_plan ?
-			ctx->pagemap_plan_input_records - ctx->nr_pagemap_plan : 0,
-		ctx->pagemap_plan_present_pages, ctx->pagemap_plan_fg_pages,
-		ctx->profile_pagemap_bytes, ctx->profile_pagemap_flushes);
+		ctx->profile_scalar64_bytes_examined, ctx->profile_simd_bytes_examined,
+		ctx->profile_compare_nobof_faults,
+		ctx->profile_compare_nobof_fault_source1,
+		ctx->profile_compare_nobof_fault_source2,
+		ctx->profile_compare_fault_handoff_remaining_bytes,
+		ctx->profile_dsa_logical_progress_bytes,
+		ctx->profile_normal_simd_logical_progress_bytes,
+		ctx->profile_fault_simd_logical_progress_bytes,
+		ctx->profile_dsa_fresh_submit_ops,
+		ctx->profile_dsa_continuation_submit_ops,
+		ctx->profile_dsa_submitted_bytes,
+		ctx->continuation_assist_enabled ? 1U : 0U,
+		ctx->profile_assist_overflow_to_dsa, ctx->profile_assist_pages,
+		ctx->profile_assist_bytes, ctx->profile_assist_max_queue_depth,
+		ctx->profile_assist_while_dsa_active_pages,
+		ctx->profile_assist_tail_pages, ctx->profile_batch_outer_submits,
+		ctx->profile_batch_child_submits, ctx->profile_batch_partial_submits,
+		ctx->profile_batch_single_tail_submits, ctx->profile_batch_outer_fail,
+		ctx->profile_batch_child_nobof, ctx->profile_batch_max_active_outer,
+		ctx->profile_batch_max_active_children,
+		ctx->profile_prq_available ? 1U : 0U, ctx->profile_nr_prq_sources,
+		ctx->profile_prq_pg_requests, ctx->profile_prq_thread_cpu_us,
+		ctx->profile_prq_setup_errno, ctx->profile_compare_enq_retries,
+		ctx->profile_compare_poll_sweeps, ctx->profile_max_completion_age_us,
+		ctx->profile_parent_pages, ctx->fg_patch_pages, ctx->fg_full_pages,
+		ctx->profile_patch_ranges, ctx->fg_patch_bytes,
+		ctx->profile_idx_writes, idx_bytes, ctx->profile_dat_writes,
+		ctx->profile_dat_writevs, dat_bytes, ctx->nr_pagemap_plan,
+		ctx->profile_pagemap_bytes);
 }
 
 static void dsa_memory_service_profile_emit(struct page_xfer *xfer, int ret)
@@ -3886,28 +3471,18 @@ static void dsa_memory_service_profile_emit(struct page_xfer *xfer, int ret)
 		xfer->dsa_fg_profile_ipc_apply_us >= p->hot_apply_us ?
 		xfer->dsa_fg_profile_ipc_apply_us - p->hot_apply_us : 0;
 
-	pr_info("DSA_POST_THAW_PROFILE_TIME: version=14 pages_id=%u backend=%s ret=%d service_enabled=1 service_profile_enabled=%u service_mapping_warm=%u total_us=%" PRIu64 " result_request_publish_us=%" PRIu64 " ipc_compare_us=%" PRIu64 " ipc_compare_overhead_us=%" PRIu64 " service_compare_wall_us=%" PRIu64 " service_compare_cpu_us=%" PRIu64 " service_hot_reconcile_us=%" PRIu64 " service_raw_index_us=%" PRIu64 " service_span_build_us=%" PRIu64 " raw_index_us=%" PRIu64 " span_build_us=%" PRIu64 " service_cold_prepare_us=0 compare_wall_us=%" PRIu64 " compare_thread_cpu_us=%" PRIu64 " compare_engine_wall_us=%" PRIu64 " compare_engine_cpu_us=%" PRIu64 " service_result_publish_us=%" PRIu64 " compare_breakdown=%u parent_prefault_wall_us=%" PRIu64 " parent_prefault_cpu_us=%" PRIu64 " compare_core_wall_us=%" PRIu64 " compare_core_cpu_us=%" PRIu64 " sidecar_us=%" PRIu64 " output_wall_us=%" PRIu64 " sidecar_preflight_us=%" PRIu64 " sidecar_serialize_us=%" PRIu64 " sidecar_idx_write_us=%" PRIu64 " sidecar_dat_write_us=%" PRIu64 " pagemap_us=%" PRIu64 " finish_us=%" PRIu64 " ipc_apply_us=%" PRIu64 " ipc_apply_overhead_us=%" PRIu64 " service_hot_apply_us=%" PRIu64 " service_hot_apply_cpu_us=%" PRIu64 " service_apply_validate_us=%" PRIu64 " service_apply_materialize_us=%" PRIu64 " service_apply_store_us=%" PRIu64 " service_apply_manifest_finish_us=%" PRIu64 " service_apply_manifest_close_us=%" PRIu64 " accounted_us=%" PRIu64 " unaccounted_us=%" PRIu64 " ledger_overrun=%u\n",
+	pr_info("DSA_POST_THAW_PROFILE_TIME: version=15 pages_id=%u backend=%s ret=%d service_enabled=1 service_profile_enabled=%u service_mapping_warm=%u total_us=%" PRIu64 " result_request_publish_us=%" PRIu64 " ipc_compare_us=%" PRIu64 " ipc_compare_overhead_us=%" PRIu64 " service_compare_wall_us=%" PRIu64 " service_compare_cpu_us=%" PRIu64 " service_hot_reconcile_us=%" PRIu64 " raw_index_us=%" PRIu64 " span_build_us=%" PRIu64 " compare_engine_wall_us=%" PRIu64 " compare_engine_cpu_us=%" PRIu64 " service_result_publish_us=%" PRIu64 " sidecar_us=%" PRIu64 " sidecar_preflight_us=%" PRIu64 " sidecar_serialize_us=%" PRIu64 " sidecar_idx_write_us=%" PRIu64 " sidecar_dat_write_us=%" PRIu64 " pagemap_us=%" PRIu64 " finish_us=%" PRIu64 " ipc_apply_us=%" PRIu64 " ipc_apply_overhead_us=%" PRIu64 " service_hot_apply_us=%" PRIu64 " service_hot_apply_cpu_us=%" PRIu64 " service_apply_validate_us=%" PRIu64 " service_apply_materialize_us=%" PRIu64 " service_apply_store_us=%" PRIu64 " service_apply_manifest_finish_us=%" PRIu64 " service_apply_manifest_close_us=%" PRIu64 " accounted_us=%" PRIu64 " unaccounted_us=%" PRIu64 " ledger_overrun=%u\n",
 		xfer->pages_id, backend, ret, p->enabled, p->mapping_warm, total_us,
 		xfer->dsa_fg_profile_request_publish_us,
-		xfer->dsa_fg_profile_ipc_compare_us,
-		ipc_compare_overhead_us,
+		xfer->dsa_fg_profile_ipc_compare_us, ipc_compare_overhead_us,
 		p->service_compare_wall_us, p->service_compare_cpu_us,
 		p->hot_reconcile_us, p->raw_index_us, p->span_build_us,
-		p->raw_index_us, p->span_build_us,
 		p->compare_engine_wall_us, p->compare_engine_cpu_us,
-		p->compare_engine_wall_us, p->compare_engine_cpu_us,
-		p->result_publish_us,
-		0U,
-		p->parent_prefault_wall_us, p->parent_prefault_cpu_us,
-		p->compare_core_wall_us, p->compare_core_cpu_us,
-		xfer->dsa_fg_profile_sidecar_us,
-		xfer->dsa_fg_profile_sidecar_us,
+		p->result_publish_us, xfer->dsa_fg_profile_sidecar_us,
 		p->sidecar_preflight_us, p->sidecar_serialize_us,
 		p->sidecar_idx_write_us, p->sidecar_dat_write_us,
-		xfer->dsa_fg_profile_pagemap_us,
-		xfer->dsa_fg_profile_finish_us,
-		xfer->dsa_fg_profile_ipc_apply_us,
-		ipc_apply_overhead_us,
+		xfer->dsa_fg_profile_pagemap_us, xfer->dsa_fg_profile_finish_us,
+		xfer->dsa_fg_profile_ipc_apply_us, ipc_apply_overhead_us,
 		p->hot_apply_us, p->hot_apply_cpu_us,
 		xfer->dsa_fg_service_diag.apply_validate_wall_us,
 		xfer->dsa_fg_service_diag.apply_materialize_wall_us,
@@ -3915,137 +3490,36 @@ static void dsa_memory_service_profile_emit(struct page_xfer *xfer, int ret)
 		xfer->dsa_fg_service_diag.apply_manifest_finish_wall_us,
 		xfer->dsa_fg_service_diag.apply_manifest_close_wall_us,
 		accounted_us, unaccounted_us, accounted_us > total_us ? 1 : 0);
-	if (xfer->dsa_fine_grained &&
-	    (backend_id == HOT_FG_COMPARE_DSA ||
-	     backend_id == HOT_FG_COMPARE_VALIDATE)) {
-		pr_info("DSA_COMPARE_OPPORTUNISTIC_PROFILE: version=4 pages_id=%u gate_attempts=%" PRIu64 " gate_success=%" PRIu64 " blocked_partial_above_reserve=%" PRIu64 " blocked_reserve_full=%" PRIu64 " blocked_reserve_partial=%" PRIu64 " blocked_exhausted_ready=%" PRIu64 " blocked_exhausted_inflight=%" PRIu64 " gate_full_above_reserve_ns=%" PRIu64 " gate_partial_above_reserve_ns=%" PRIu64 " gate_reserve_full_ns=%" PRIu64 " gate_reserve_partial_ns=%" PRIu64 " gate_exhausted_ready_ns=%" PRIu64 " gate_exhausted_inflight_ns=%" PRIu64 " reserve_active_outer_sum=%" PRIu64 " reserve_active_children_sum=%" PRIu64 " reserve_min_wq_outer_sum=%" PRIu64 " reserve_min_wq_children_sum=%" PRIu64 " reserve_fresh_spans_min=%" PRIu64 " reserve_fresh_spans_max=%" PRIu64 " reserve_fresh_pages_min=%" PRIu64 " reserve_fresh_pages_max=%" PRIu64 " exhausted_ready_depth_sum=%" PRIu64 " exhausted_ready_depth_max=%" PRIu64 " exhausted_inflight_active_children_sum=%" PRIu64 " exhausted_inflight_min_wq_children_sum=%" PRIu64 " bursts=%" PRIu64 " pages=%" PRIu64 " max_burst_pages=%" PRIu64 " feedback_grow=%" PRIu64 " feedback_hold=%" PRIu64 " feedback_shrink=%" PRIu64 " feedback_reset=%" PRIu64 " max_completed_wq=%" PRIu64 " min_runway_after_burst=%" PRIu64 " feedback_completed_children=%" PRIu64 " feedback_max_completed_children_wq=%" PRIu64 " feedback_min_child_runway_after_burst=%" PRIu64 " feedback_max_completed_children_per_page_x1024=%" PRIu64 "\n",
-			xfer->pages_id,
-			p->opportunistic_simd_gate_attempts,
-			p->opportunistic_simd_gate_success,
-			p->opportunistic_simd_blocked_partial_above_reserve,
-			p->opportunistic_simd_blocked_reserve_full,
-			p->opportunistic_simd_blocked_reserve_partial,
-			p->opportunistic_simd_blocked_exhausted_ready,
-			p->opportunistic_simd_blocked_exhausted_inflight,
-			p->opportunistic_simd_gate_full_above_reserve_ns,
-			p->opportunistic_simd_gate_partial_above_reserve_ns,
-			p->opportunistic_simd_gate_reserve_full_ns,
-			p->opportunistic_simd_gate_reserve_partial_ns,
-			p->opportunistic_simd_gate_exhausted_ready_ns,
-			p->opportunistic_simd_gate_exhausted_inflight_ns,
-			p->opportunistic_simd_reserve_active_outer_sum,
-			p->opportunistic_simd_reserve_active_children_sum,
-			p->opportunistic_simd_reserve_min_wq_outer_sum,
-			p->opportunistic_simd_reserve_min_wq_children_sum,
-			p->opportunistic_simd_reserve_fresh_spans_min,
-			p->opportunistic_simd_reserve_fresh_spans_max,
-			p->opportunistic_simd_reserve_fresh_pages_min,
-			p->opportunistic_simd_reserve_fresh_pages_max,
-			p->opportunistic_simd_exhausted_ready_depth_sum,
-			p->opportunistic_simd_exhausted_ready_depth_max,
-			p->opportunistic_simd_exhausted_inflight_active_children_sum,
-			p->opportunistic_simd_exhausted_inflight_min_wq_children_sum,
-			p->opportunistic_simd_bursts,
-			p->opportunistic_simd_pages,
-			p->opportunistic_simd_max_burst_pages,
-			p->opportunistic_simd_feedback_grow,
-			p->opportunistic_simd_feedback_hold,
-			p->opportunistic_simd_feedback_shrink,
-			p->opportunistic_simd_feedback_reset,
-			p->opportunistic_simd_max_completed_wq,
-			p->opportunistic_simd_min_runway_after_burst,
-			p->opportunistic_simd_feedback_completed_children,
-			p->opportunistic_simd_feedback_max_completed_children_wq,
-			p->opportunistic_simd_feedback_min_child_runway_after_burst,
-			p->opportunistic_simd_feedback_max_completed_children_per_page_x1024);
-		pr_info("DSA_COMPARE_POLL_PROBE_PROFILE: version=1 pages_id=%u enabled=%" PRIu64 " pages_per_pause=%" PRIu64 " bursts=%" PRIu64 " pages=%" PRIu64 " wall_ns=%" PRIu64 " skipped_no_sample=%" PRIu64 " shadow_parent_pages=%" PRIu64 " shadow_patch_pages=%" PRIu64 " shadow_full_pages=%" PRIu64 " followup_harvested_outer=%" PRIu64 " followup_harvested_children=%" PRIu64 " followup_max_harvested_outer_wq=%" PRIu64 " followup_min_outer_runway=%" PRIu64 " followup_zero_runway=%" PRIu64 "\n",
-			xfer->pages_id, p->poll_probe_enabled,
-			p->poll_probe_pages_per_pause, p->poll_probe_bursts,
-			p->poll_probe_pages, p->poll_probe_wall_ns,
-			p->poll_probe_skipped_no_sample,
-			p->poll_probe_shadow_parent_pages,
-			p->poll_probe_shadow_patch_pages,
-			p->poll_probe_shadow_full_pages,
-			p->poll_probe_followup_harvested_outer,
-			p->poll_probe_followup_harvested_children,
-			p->poll_probe_followup_max_harvested_outer_wq,
-			p->poll_probe_followup_min_outer_runway,
-			p->poll_probe_followup_zero_runway);
-		pr_info("DSA_COMPARE_ASSIST_PROFILE: version=1 pages_id=%u enabled=%u queue_capacity=%u burst_pages=%u enqueued=%" PRIu64 " overflow_to_dsa=%" PRIu64 " dequeued=%" PRIu64 " pages=%" PRIu64 " bytes=%" PRIu64 " bursts=%" PRIu64 " max_queue_depth=%" PRIu64 " dsa_diff_submits=%" PRIu64 " general_submits=%" PRIu64 " fresh_submits=%" PRIu64 " while_dsa_active_pages=%" PRIu64 " tail_pages=%" PRIu64 "\n",
-			xfer->pages_id, p->poll_probe_enabled ? 0U : 1U,
-			HOT_DSA_COMPARE_ASSIST_QUEUE_CAPACITY,
-			HOT_DSA_COMPARE_ASSIST_BURST_PAGES,
-			p->assist_enqueued, p->assist_overflow_to_dsa,
-			p->assist_dequeued, p->assist_pages, p->assist_bytes,
-			p->assist_bursts, p->assist_max_queue_depth,
-			p->assist_dsa_diff_submits, p->assist_general_submits,
-			p->assist_fresh_submits,
-			p->assist_while_dsa_active_pages,
-			p->assist_tail_pages);
-		pr_info("DSA_COMPARE_WQ_PROFILE: version=1 pages_id=%u wq_count=%" PRIu64 " max_active_skew=%" PRIu64 " starved_with_claimable_work=%" PRIu64 "\n",
-			xfer->pages_id, p->compare_wq_lane_count,
-			p->compare_wq_max_active_skew,
-			p->compare_wq_starved_with_claimable_work);
-	}
-	pr_info("DSA_POST_THAW_PROFILE_COUNT: version=14 pages_id=%u backend=%s ret=%d service_enabled=1 service_profile_enabled=%u service_mapping_warm=%u raw_pages=%" PRIu64 " raw_bytes=%" PRIu64 " capture_runs=%" PRIu64 " spans=%" PRIu64 " span_pages=%" PRIu64 " max_span_pages=%" PRIu64 " compare_ops=%" PRIu64 " dsa_compare_ops=%" PRIu64 " memcmp_calls=%" PRIu64 " memcmp_requested_bytes=%" PRIu64 " memcmp_scalar_bytes=%" PRIu64 " scalar64_calls=%" PRIu64 " scalar64_word_ops=%" PRIu64 " scalar64_refine_bytes=%" PRIu64 " scalar64_tail_bytes=%" PRIu64 " scalar64_bytes_examined=%" PRIu64 " simd_vector_ops=%" PRIu64 " simd_bytes_examined=%" PRIu64 " hybrid_dsa_claim_spans=%" PRIu64 " hybrid_dsa_claim_pages=%" PRIu64 " hybrid_cpu_claim_spans=%" PRIu64 " hybrid_cpu_claim_pages=%" PRIu64 " hybrid_cpu_waves=%" PRIu64 " hybrid_dsa_to_cpu_handoff_spans=%" PRIu64 " hybrid_dsa_to_cpu_handoff_pages=%" PRIu64 " hybrid_dsa_to_cpu_handoff_remaining_bytes=%" PRIu64 " hybrid_unclaimed_empty_count=%" PRIu64 " compare_nobof_faults=%" PRIu64 " compare_nobof_fault_source1=%" PRIu64 " compare_nobof_fault_source2=%" PRIu64 " compare_nobof_equal_prefix_bytes=%" PRIu64 " compare_fault_handoff_spans=%" PRIu64 " compare_fault_handoff_pages=%" PRIu64 " compare_fault_handoff_remaining_bytes=%" PRIu64 " compare_fault_queue_max=%" PRIu64 " compare_fresh_claim_throttles=%" PRIu64 " compare_cpu_fault_waves=%" PRIu64 " dsa_logical_progress_bytes=%" PRIu64 " simd_logical_progress_bytes=%" PRIu64 " normal_simd_logical_progress_bytes=%" PRIu64 " fault_simd_logical_progress_bytes=%" PRIu64 " dsa_fresh_submit_ops=%" PRIu64 " dsa_continuation_submit_ops=%" PRIu64 " dsa_submitted_bytes=%" PRIu64 " simd_progress_while_dsa_active_bytes=%" PRIu64 " simd_quanta_while_dsa_active=%" PRIu64 " dsa_fresh_claim_bytes=%" PRIu64 " dsa_active_zero_while_normal_cpu_work=%" PRIu64 " ready_completions_before_simd=%" PRIu64 " ready_completions_after_simd=%" PRIu64 " scheduler_iterations=%" PRIu64 " dsa_refill_samples=%" PRIu64 " post_refill_active_sum=%" PRIu64 " post_refill_active_lt_32=%" PRIu64 " post_refill_active_lt_64=%" PRIu64 " post_refill_active_lt_96=%" PRIu64 " fresh_refill_spans=%" PRIu64 " fresh_refill_batches=%" PRIu64 " fresh_refill_blocked_fault_debt=%" PRIu64 " dsa_empty_with_claimable_fresh=%" PRIu64 " batch_outer_submits=%" PRIu64 " batch_child_submits=%" PRIu64 " batch_partial_submits=%" PRIu64 " batch_single_tail_submits=%" PRIu64 " batch_outer_success=%" PRIu64 " batch_outer_fail=%" PRIu64 " batch_child_success=%" PRIu64 " batch_child_nobof=%" PRIu64 " batch_max_active_outer=%" PRIu64 " batch_max_active_children=%" PRIu64 " prq_profile_available=%u prq_profile_sources=%u prq_pg_requests=%" PRIu64 " prq_thread_cpu_us=%" PRIu64 " prq_setup_errno=%d enq_retries=%" PRIu64 " poll_sweeps=%" PRIu64 " not_ready=%" PRIu64 " max_active=%" PRIu64 " completions_harvested=%" PRIu64 " completion_timeout_count=%" PRIu64 " max_completion_age_us=%" PRIu64 " prefault_spans=%" PRIu64 " prefault_pages=%" PRIu64 " parent_pages=%" PRIu64 " patch_pages=%" PRIu64 " full_pages=%" PRIu64 " patch_ranges=%" PRIu64 " patch_bytes=%" PRIu64 " idx_write_calls=%" PRIu64 " idx_bytes=%" PRIu64 " dat_write_calls=%" PRIu64 " dat_writev_calls=%" PRIu64 " dat_bytes=%" PRIu64 " idx_write_syscalls=%" PRIu64 " dat_write_syscalls=%" PRIu64 " dat_writev_syscalls=%" PRIu64 " sidecar_lseek_syscalls=%" PRIu64 " pagemap_records=%" PRIu64 " pagemap_bytes=%" PRIu64 "\n",
+	pr_info("DSA_POST_THAW_PROFILE_COUNT: version=15 pages_id=%u backend=%s ret=%d service_enabled=1 service_profile_enabled=%u service_mapping_warm=%u raw_pages=%" PRIu64 " raw_bytes=%" PRIu64 " capture_runs=%" PRIu64 " spans=%" PRIu64 " span_pages=%" PRIu64 " max_span_pages=%" PRIu64 " memcmp_requested_bytes=%" PRIu64 " scalar64_bytes_examined=%" PRIu64 " simd_bytes_examined=%" PRIu64 " compare_nobof_faults=%" PRIu64 " compare_nobof_fault_source1=%" PRIu64 " compare_nobof_fault_source2=%" PRIu64 " compare_fault_handoff_remaining_bytes=%" PRIu64 " dsa_logical_progress_bytes=%" PRIu64 " normal_simd_logical_progress_bytes=%" PRIu64 " fault_simd_logical_progress_bytes=%" PRIu64 " dsa_fresh_submit_ops=%" PRIu64 " dsa_continuation_submit_ops=%" PRIu64 " dsa_submitted_bytes=%" PRIu64 " assist_enabled=%" PRIu64 " assist_overflow_to_dsa=%" PRIu64 " assist_pages=%" PRIu64 " assist_bytes=%" PRIu64 " assist_max_queue_depth=%" PRIu64 " assist_while_dsa_active_pages=%" PRIu64 " assist_tail_pages=%" PRIu64 " batch_outer_submits=%" PRIu64 " batch_child_submits=%" PRIu64 " batch_partial_submits=%" PRIu64 " batch_single_tail_submits=%" PRIu64 " batch_outer_fail=%" PRIu64 " batch_child_nobof=%" PRIu64 " batch_max_active_outer=%" PRIu64 " batch_max_active_children=%" PRIu64 " prq_profile_available=%u prq_profile_sources=%u prq_pg_requests=%" PRIu64 " prq_thread_cpu_us=%" PRIu64 " prq_setup_errno=%d enq_retries=%" PRIu64 " poll_sweeps=%" PRIu64 " max_completion_age_us=%" PRIu64 " parent_pages=%" PRIu64 " patch_pages=%" PRIu64 " full_pages=%" PRIu64 " patch_ranges=%" PRIu64 " patch_bytes=%" PRIu64 " idx_write_calls=%" PRIu64 " idx_bytes=%" PRIu64 " dat_write_calls=%" PRIu64 " dat_writev_calls=%" PRIu64 " dat_bytes=%" PRIu64 " idx_write_syscalls=%" PRIu64 " dat_write_syscalls=%" PRIu64 " dat_writev_syscalls=%" PRIu64 " sidecar_lseek_syscalls=%" PRIu64 " pagemap_records=%" PRIu64 " pagemap_bytes=%" PRIu64 "\n",
 		xfer->pages_id, backend, ret, p->enabled, p->mapping_warm,
 		p->raw_pages, p->raw_bytes, p->capture_runs, p->spans,
-		p->span_pages, p->max_span_pages, p->compare_ops, p->compare_ops,
-		p->memcmp_calls, p->memcmp_requested_bytes, p->memcmp_scalar_bytes,
-		p->scalar64_calls, p->scalar64_word_ops, p->scalar64_refine_bytes,
-		p->scalar64_tail_bytes, p->scalar64_bytes_examined,
-		p->simd_vector_ops, p->simd_bytes_examined,
-		p->hybrid_dsa_claim_spans, p->hybrid_dsa_claim_pages,
-		p->hybrid_cpu_claim_spans, p->hybrid_cpu_claim_pages,
-		p->hybrid_cpu_waves, p->hybrid_dsa_to_cpu_handoff_spans,
-		p->hybrid_dsa_to_cpu_handoff_pages,
-		p->hybrid_dsa_to_cpu_handoff_remaining_bytes,
-		p->hybrid_unclaimed_empty_count,
-		p->compare_nobof_faults, p->compare_nobof_fault_source1,
-		p->compare_nobof_fault_source2, p->compare_nobof_equal_prefix_bytes,
-		p->compare_fault_handoff_spans, p->compare_fault_handoff_pages,
-		p->compare_fault_handoff_remaining_bytes, p->compare_fault_queue_max,
-		p->compare_fresh_claim_throttles, p->compare_cpu_fault_waves,
-		p->dsa_logical_progress_bytes, p->simd_logical_progress_bytes,
-		p->normal_simd_logical_progress_bytes,
-		p->fault_simd_logical_progress_bytes,
-		p->dsa_fresh_submit_ops, p->dsa_continuation_submit_ops,
-		p->dsa_submitted_bytes,
-		p->simd_progress_while_dsa_active_bytes,
-		p->simd_quanta_while_dsa_active,
-		p->dsa_fresh_claim_bytes,
-		p->dsa_active_zero_while_normal_cpu_work,
-		p->ready_completions_before_simd,
-		p->ready_completions_after_simd,
-		p->scheduler_iterations, p->dsa_refill_samples,
-		p->post_refill_active_sum,
-		p->post_refill_active_lt_32,
-		p->post_refill_active_lt_64,
-		p->post_refill_active_lt_96,
-		p->fresh_refill_spans, p->fresh_refill_batches,
-		p->fresh_refill_blocked_fault_debt,
-		p->dsa_empty_with_claimable_fresh,
+		p->span_pages, p->max_span_pages,
+		p->memcmp_requested_bytes, p->scalar64_bytes_examined,
+		p->simd_bytes_examined, p->compare_nobof_faults,
+		p->compare_nobof_fault_source1, p->compare_nobof_fault_source2,
+		p->compare_fault_handoff_remaining_bytes,
+		p->dsa_logical_progress_bytes, p->normal_simd_logical_progress_bytes,
+		p->fault_simd_logical_progress_bytes, p->dsa_fresh_submit_ops,
+		p->dsa_continuation_submit_ops, p->dsa_submitted_bytes,
+		p->assist_enabled, p->assist_overflow_to_dsa, p->assist_pages,
+		p->assist_bytes, p->assist_max_queue_depth,
+		p->assist_while_dsa_active_pages, p->assist_tail_pages,
 		p->batch_outer_submits, p->batch_child_submits,
 		p->batch_partial_submits, p->batch_single_tail_submits,
-		p->batch_outer_success, p->batch_outer_fail,
-		p->batch_child_success, p->batch_child_nobof,
+		p->batch_outer_fail, p->batch_child_nobof,
 		p->batch_max_active_outer, p->batch_max_active_children,
-		p->prq_profile_available,
-		p->prq_profile_sources, p->prq_pg_requests,
-		p->prq_thread_cpu_us, p->prq_setup_errno, p->enq_retries,
-		p->poll_sweeps, p->not_ready, p->max_active,
-		p->completions_harvested, p->completion_timeout_count,
-		p->max_completion_age_us, p->prefault_spans, p->prefault_pages,
-		p->parent_pages, p->patch_pages, p->full_pages,
-		p->patch_ranges, p->patch_bytes, p->idx_write_calls,
-		p->idx_bytes, p->dat_write_calls, p->dat_writev_calls,
-		p->dat_bytes, p->idx_write_syscalls, p->dat_write_syscalls,
-		p->dat_writev_syscalls, p->sidecar_lseek_syscalls,
-		xfer->write_profile_pagemap_records,
+		p->prq_profile_available, p->prq_profile_sources,
+		p->prq_pg_requests, p->prq_thread_cpu_us, p->prq_setup_errno,
+		p->enq_retries, p->poll_sweeps, p->max_completion_age_us,
+		p->parent_pages,
+		p->patch_pages, p->full_pages, p->patch_ranges, p->patch_bytes,
+		p->idx_write_calls, p->idx_bytes, p->dat_write_calls,
+		p->dat_writev_calls, p->dat_bytes, p->idx_write_syscalls,
+		p->dat_write_syscalls, p->dat_writev_syscalls,
+		p->sidecar_lseek_syscalls, xfer->write_profile_pagemap_records,
 		xfer->write_profile_pagemap_bytes);
 	xfer->dsa_fg_profile_total_start_us = 0;
 }
-
 static int hot_apply_init_xfer(struct page_xfer *xfer, int fd_type,
 			       unsigned long img_id, u32 pages_id)
 {
@@ -4836,8 +4310,6 @@ static int hot_fg_pagemap_emit(struct page_xfer *xfer)
 				pr_perror("DSA fine-grained pagemap batch write failed");
 				goto out;
 			}
-			if (ctx->profile)
-				ctx->profile_pagemap_flushes++;
 			used = 0;
 		}
 		memcpy(buf + used, &size, sizeof(size));
@@ -4861,8 +4333,6 @@ static int hot_fg_pagemap_emit(struct page_xfer *xfer)
 			pr_perror("DSA fine-grained pagemap final batch write failed");
 			goto out;
 		}
-		if (ctx->profile)
-			ctx->profile_pagemap_flushes++;
 	}
 	ret = 0;
 out:
@@ -4970,8 +4440,6 @@ struct dsa_fg_sidecar_stats {
 	u64 *dat_write_calls;
 	u64 *dat_writev_calls;
 	u64 *dat_bytes;
-	u64 *write_units;
-	u64 *write_unit_max_us;
 	u64 *idx_write_syscalls;
 	u64 *dat_write_syscalls;
 	u64 *dat_writev_syscalls;
@@ -5259,7 +4727,6 @@ static int dsa_fg_sidecar_sink_flush(struct dsa_fg_sidecar_sink *sink)
 		dsa_fg_sidecar_stats_add(sink->stats.idx_write_calls, 1);
 		dsa_fg_sidecar_stats_add(sink->stats.idx_bytes,
 					 sink->nr_metas * sizeof(sink->metas[0]));
-		dsa_fg_sidecar_stats_add(sink->stats.write_units, 1);
 	}
 	while (sink->iov_head < sink->nr_iov) {
 		u64 bytes = 0;
@@ -5294,11 +4761,7 @@ static int dsa_fg_sidecar_sink_flush(struct dsa_fg_sidecar_sink *sink)
 							  dsa_profile_wall_now_us());
 
 			dsa_fg_sidecar_stats_add(sink->stats.dat_writev_calls, 1);
-			dsa_fg_sidecar_stats_add(sink->stats.write_units, 1);
 			dsa_fg_sidecar_stats_add(sink->stats.dat_write_us, elapsed);
-			if (sink->stats.write_unit_max_us &&
-			    elapsed > *sink->stats.write_unit_max_us)
-				*sink->stats.write_unit_max_us = elapsed;
 		}
 	}
 	dsa_fg_sidecar_sink_reset_chunk(sink);
@@ -6133,93 +5596,6 @@ out:
 	return ret;
 }
 
-static int hot_fg_compare_submit(struct hot_apply_ctx *ctx,
-				  struct hot_fg_compare_slot *slot,
-				  struct hot_fg_compare_span *span,
-				  u64 submit_sequence, u64 submit_ns)
-{
-	unsigned int wq_idx;
-	unsigned long portal_mask;
-	unsigned long off;
-	uint32_t retry;
-
-	if (!span->parent || span->state != HOT_FG_SPAN_READY ||
-	    span->cursor >= span->length || !ctx->dsa_wq_count ||
-	    !ctx->dsa_max_transfer_size)
-		return -1;
-	wq_idx = ctx->dsa_next_wq++ % (unsigned int)ctx->dsa_wq_count;
-	portal_mask = ((unsigned long)ctx->dsa_portals[wq_idx]) & ~0xfffUL;
-	memset(&slot->desc, 0, sizeof(slot->desc));
-	memset((void *)&slot->comp, 0, sizeof(slot->comp));
-	slot->submitted_cursor = span->cursor;
-	slot->submitted_len = span->length - span->cursor;
-	if (slot->submitted_len > ctx->dsa_max_transfer_size)
-		slot->submitted_len = ctx->dsa_max_transfer_size;
-	if (!slot->submitted_len)
-		return -1;
-	slot->wq_idx = wq_idx;
-	slot->span = span;
-	slot->submit_sequence = submit_sequence;
-	slot->submit_ns = submit_ns;
-	slot->completion_deadline_ns = submit_ns + HOT_DSA_COMPLETION_TIMEOUT_NS;
-	slot->desc.opcode = DSA_OPCODE_COMPARE;
-	slot->desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
-	slot->desc.src_addr = (uint64_t)(unsigned long)(span->raw + span->cursor);
-	slot->desc.src2_addr = (uint64_t)(unsigned long)(span->parent + span->cursor);
-	slot->desc.xfer_size = slot->submitted_len;
-	slot->desc.completion_addr = (uint64_t)(unsigned long)&slot->comp;
-
-	hot_dsa_release_descriptors();
-	for (retry = 0; retry < HOT_DSA_MAX_ENQ_RETRY; retry++) {
-		void *portal_slot;
-
-		off = ((ctx->dsa_portal_offset[wq_idx]++ << 6) & 0xfffUL);
-		portal_slot = (void *)(portal_mask | off);
-		if (hot_dsa_enqcmd(portal_slot, &slot->desc) == 0)
-			break;
-		hot_dsa_cpu_relax();
-	}
-	if (retry == HOT_DSA_MAX_ENQ_RETRY) {
-		pr_err("DSA fine-grained compare wavefront enqcmd timed out\n");
-		return -1;
-	}
-	if (ctx->profile) {
-		ctx->fg_compare_ops++;
-		ctx->dsa_enqcmd++;
-		ctx->profile_compare_enq_retries += retry;
-		ctx->profile_dsa_submitted_bytes += slot->submitted_len;
-		if (slot->submitted_cursor)
-			ctx->profile_dsa_continuation_submit_ops++;
-		else
-			ctx->profile_dsa_fresh_submit_ops++;
-	}
-	slot->active = true;
-	span->state = HOT_FG_SPAN_ACTIVE;
-	return 0;
-}
-
-static __attribute__((noreturn)) void
-hot_fg_completion_timeout_fatal(const struct hot_fg_compare_slot *slot,
-				 size_t active, u64 now_ns, const char *stage)
-{
-	u64 age_us = now_ns >= slot->submit_ns ?
-		(now_ns - slot->submit_ns) / 1000ULL : 0;
-
-	pr_err("CDP_DSA_COMPLETION_TIMEOUT: stage=%s exit=%u wq=%u sequence=%" PRIu64
-	       " age_us=%" PRIu64 " active=%zu opcode=%u length=%u src=%" PRIx64
-	       " dst=%" PRIx64 " status=%u\n",
-	       stage, CDP_DSA_COMPLETION_TIMEOUT_EXIT, slot->wq_idx,
-	       slot->submit_sequence, age_us, active, slot->desc.opcode,
-	       slot->submitted_len, slot->desc.src_addr, slot->desc.src2_addr,
-	       (unsigned int)__atomic_load_n(&slot->comp.status, __ATOMIC_ACQUIRE));
-	/* Do not return through page-xfer cleanup while the descriptor may still
-	 * reference its completion record or the raw arena.  Process exit closes
-	 * the idxd user-WQ fds; the driver drains this PASID before unbinding SVA.
-	 */
-	_exit(CDP_DSA_COMPLETION_TIMEOUT_EXIT);
-}
-
-
 enum hot_fg_nobof_completion {
 	HOT_FG_NOBOF_NOT_READY = 0,
 	HOT_FG_NOBOF_EQUAL,
@@ -6227,8 +5603,6 @@ enum hot_fg_nobof_completion {
 	HOT_FG_NOBOF_PAGE_FAULT,
 };
 
-/* The caller has acquire-loaded status before using the rest of the record.
- * A page fault completion has result=0; it is not an equal completion. */
 static int hot_fg_compare_complete_nobof(struct hot_fg_compare_slot *slot,
 					 enum hot_fg_nobof_completion *kind,
 					 u32 *first_diff)
@@ -6336,15 +5710,8 @@ static int hot_fg_span_record_diff(struct hot_fg_compare_span *span,
 }
 
 struct hot_fg_cpu_scan_stats {
-	u64 memcmp_calls;
 	u64 memcmp_requested_bytes;
-	u64 memcmp_scalar_bytes;
-	u64 scalar64_calls;
-	u64 scalar64_word_ops;
-	u64 scalar64_refine_bytes;
-	u64 scalar64_tail_bytes;
 	u64 scalar64_bytes_examined;
-	u64 vector_ops;
 	u64 bytes_examined;
 };
 
@@ -6370,10 +5737,8 @@ static int hot_fg_memcmp_first_diff(const unsigned char *raw,
 {
 	u32 diff;
 
-	if (stats) {
-		stats->memcmp_calls++;
+	if (stats)
 		stats->memcmp_requested_bytes += length;
-	}
 	if (hot_fg_libc_memcmp(raw, parent, length) == 0) {
 		*equal = true;
 		*first_diff = length;
@@ -6385,8 +5750,6 @@ static int hot_fg_memcmp_first_diff(const unsigned char *raw,
 		pr_err("DSA fine-grained memcmp backend couldn't recover first difference\n");
 		return -1;
 	}
-	if (stats)
-		stats->memcmp_scalar_bytes += diff + 1;
 	*equal = false;
 	*first_diff = diff;
 	return 0;
@@ -6457,10 +5820,6 @@ account:
 			word_ops = length / sizeof(u64);
 			tail_bytes = *first_diff - word_region + 1;
 		}
-		stats->scalar64_calls++;
-		stats->scalar64_word_ops += word_ops;
-		stats->scalar64_refine_bytes += refine_bytes;
-		stats->scalar64_tail_bytes += tail_bytes;
 		stats->scalar64_bytes_examined += word_ops * sizeof(u64) +
 			refine_bytes + tail_bytes;
 	}
@@ -6488,7 +5847,6 @@ static void hot_fg_account_simd_scan(struct hot_fg_cpu_scan_stats *stats,
 		vector_ops = length / vector_bytes;
 		tail_bytes = first_diff - vector_region + 1;
 	}
-	stats->vector_ops += vector_ops;
 	stats->bytes_examined += vector_ops * vector_bytes + tail_bytes;
 }
 
@@ -6609,7 +5967,7 @@ static int hot_fg_compare_cpu_span(struct hot_apply_ctx *ctx,
 	    span->state != HOT_FG_SPAN_UNPREFAULTED)
 		return -1;
 	/* A CPU-owned span faults on its first useful load; there is no separate
-	 * residency pass outside compare-breakdown mode. */
+	 * residency pass in the production compare path. */
 	span->state = HOT_FG_SPAN_ACTIVE;
 	while (span->cursor < span->length) {
 		bool equal;
@@ -6642,15 +6000,8 @@ static void hot_fg_cpu_scan_stats_add(struct hot_apply_ctx *ctx,
 {
 	if (!ctx->profile || !stats)
 		return;
-	ctx->profile_memcmp_calls += stats->memcmp_calls;
 	ctx->profile_memcmp_requested_bytes += stats->memcmp_requested_bytes;
-	ctx->profile_memcmp_scalar_bytes += stats->memcmp_scalar_bytes;
-	ctx->profile_scalar64_calls += stats->scalar64_calls;
-	ctx->profile_scalar64_word_ops += stats->scalar64_word_ops;
-	ctx->profile_scalar64_refine_bytes += stats->scalar64_refine_bytes;
-	ctx->profile_scalar64_tail_bytes += stats->scalar64_tail_bytes;
 	ctx->profile_scalar64_bytes_examined += stats->scalar64_bytes_examined;
-	ctx->profile_simd_vector_ops += stats->vector_ops;
 	ctx->profile_simd_bytes_examined += stats->bytes_examined;
 }
 
@@ -6740,84 +6091,7 @@ static int hot_fg_validate_compare_metadata(const struct hot_fg_raw_page *dsa_pa
 	return 0;
 }
 
-static int hot_fg_wavefront_fill(struct hot_apply_ctx *ctx,
-				 struct hot_fg_compare_slot *slots,
-				 struct hot_fg_ready_queue *ready,
-				 size_t *active, u64 *submit_sequence,
-				 u64 submit_ns)
-{
-	size_t i;
-
-	for (i = 0; i < HOT_DSA_COMPARE_INFLIGHT &&
-	     *active < HOT_DSA_COMPARE_INFLIGHT; i++) {
-		struct hot_fg_compare_span *span;
-		size_t span_idx;
-
-		if (slots[i].active)
-			continue;
-		if (!ready->nr)
-			break;
-		if (hot_fg_ready_queue_pop(ready, &span_idx))
-			return -1;
-		span = &ready->spans[span_idx];
-		if (span->state != HOT_FG_SPAN_READY) {
-			pr_err("DSA fine-grained compare ready queue state=%u span=%zu\n",
-			       span->state, span_idx);
-			return -1;
-		}
-		if (hot_fg_compare_submit(ctx, &slots[i], span,
-					  ++*submit_sequence, submit_ns))
-			return -1;
-		(*active)++;
-	}
-	return 0;
-}
-
-static int hot_fg_wavefront_drain_slots(struct hot_fg_compare_slot *slots,
-					 size_t *active)
-{
-	u64 sweeps = 0;
-
-	while (*active) {
-		size_t i;
-		bool progress = false;
-
-		for (i = 0; i < HOT_DSA_COMPARE_INFLIGHT; i++) {
-			if (!slots[i].active ||
-			    __atomic_load_n(&slots[i].comp.status, __ATOMIC_ACQUIRE) == 0)
-				continue;
-			slots[i].active = false;
-			(*active)--;
-			progress = true;
-		}
-		if (!*active)
-			return 0;
-		if (!progress && (++sweeps & 0xfffULL) == 0) {
-			u64 now_ns = hot_dsa_watchdog_now_ns();
-
-			for (i = 0; i < HOT_DSA_COMPARE_INFLIGHT; i++) {
-				if (!slots[i].active)
-					continue;
-				if (!now_ns)
-					hot_fg_completion_timeout_fatal(&slots[i], *active,
-						slots[i].completion_deadline_ns,
-						"error-drain-clock");
-				if (now_ns >= slots[i].completion_deadline_ns)
-					hot_fg_completion_timeout_fatal(&slots[i], *active,
-						now_ns, "error-drain");
-			}
-		}
-		hot_dsa_cpu_relax();
-	}
-	return 0;
-}
-
-/*
- * A no-BOF fault does not change ownership of the extent.  First touch the
- * exact operand page reported by the completion (it need not be the compare
- * frontier), then let AVX-512 classify the page containing the next
- * unprocessed byte.  The page-aligned suffix returns to the DSA ready FIFO.
- */
+/* no-BOF recovery keeps the DSA span and resolves one exact page on CPU. */
 static int hot_fg_compare_fault_page_simd(struct hot_apply_ctx *ctx,
 					  struct hot_fg_raw_page *pages,
 					  struct hot_fg_compare_span *span,
@@ -6927,209 +6201,19 @@ static int hot_fg_compare_fault_page_simd(struct hot_apply_ctx *ctx,
 	simd_progress = PAGE_SIZE - start;
 	if (ctx->profile) {
 		ctx->profile_compare_nobof_faults++;
-		ctx->profile_compare_nobof_equal_prefix_bytes += partial;
 		if (operand == HOT_DSA_FAULT_OPERAND_SRC1)
 			ctx->profile_compare_nobof_fault_source1++;
 		else
 			ctx->profile_compare_nobof_fault_source2++;
-		ctx->profile_compare_fault_handoff_spans++;
-		ctx->profile_compare_fault_handoff_pages++;
 		ctx->profile_compare_fault_handoff_remaining_bytes += simd_progress;
-		ctx->profile_compare_cpu_fault_waves++;
-		ctx->profile_hybrid_dsa_to_cpu_handoff_spans++;
-		ctx->profile_hybrid_dsa_to_cpu_handoff_pages++;
-		ctx->profile_hybrid_dsa_to_cpu_handoff_remaining_bytes += simd_progress;
-		if (ctx->profile_compare_fault_queue_max < 1)
-			ctx->profile_compare_fault_queue_max = 1;
 		ctx->profile_dsa_logical_progress_bytes += partial;
-		ctx->profile_simd_logical_progress_bytes += simd_progress;
 		ctx->profile_fault_simd_logical_progress_bytes += simd_progress;
-		ctx->profile_simd_vector_ops += stats.vector_ops;
 		ctx->profile_simd_bytes_examined += stats.bytes_examined;
 	}
 	return 0;
 }
 
-static int __attribute__((unused)) hot_fg_compare_wavefront(struct hot_apply_ctx *ctx,
-				    struct hot_fg_raw_page *pages,
-				    struct hot_fg_compare_span *spans, size_t nr_spans)
-{
-	struct hot_fg_compare_slot slots[HOT_DSA_COMPARE_INFLIGHT] = {};
-	struct hot_fg_ready_queue ready;
-	size_t done = 0;
-	size_t active = 0;
-	u64 submit_sequence = 0;
-	size_t i;
-	int ret = -1;
-
-	if (!nr_spans)
-		return 0;
-	if (hot_fg_ready_queue_init(&ready, spans, nr_spans))
-		return -1;
-	for (i = 0; i < nr_spans; i++) {
-		if (spans[i].state == HOT_FG_SPAN_UNPREFAULTED)
-			spans[i].state = HOT_FG_SPAN_READY;
-		else {
-			pr_err("DSA no-BOF compare has invalid initial span=%zu state=%u\n",
-			       i, spans[i].state);
-			goto out;
-		}
-		if (hot_fg_ready_queue_push(&ready, i)) {
-			pr_err("DSA no-BOF compare initial ready queue failed span=%zu\n",
-			       i);
-			goto out;
-		}
-	}
-
-	while (done < nr_spans) {
-		u64 now_ns = hot_dsa_watchdog_now_ns();
-		struct hot_fg_compare_slot *expired_slot = NULL;
-		size_t harvested = 0;
-		bool had_active = active != 0;
-
-		if (!now_ns) {
-			if (active) {
-				for (i = 0; i < HOT_DSA_COMPARE_INFLIGHT; i++)
-					if (slots[i].active)
-						hot_fg_completion_timeout_fatal(
-							&slots[i], active,
-							slots[i].completion_deadline_ns,
-							"scheduler-clock");
-			}
-			pr_perror("DSA no-BOF completion watchdog clock failed");
-			goto out;
-		}
-		if (had_active && ctx->profile) {
-			ctx->profile_compare_poll_sweeps++;
-			if (active > ctx->profile_compare_max_active)
-				ctx->profile_compare_max_active = active;
-		}
-
-		for (i = 0; i < HOT_DSA_COMPARE_INFLIGHT; i++) {
-			struct hot_fg_compare_slot *slot = &slots[i];
-			struct hot_fg_compare_span *span;
-			enum hot_fg_nobof_completion kind;
-			u32 diff = 0;
-			u32 old_cursor;
-
-			if (!slot->active)
-				continue;
-			if (hot_fg_compare_complete_nobof(slot, &kind, &diff)) {
-				if (__atomic_load_n(&slot->comp.status,
-						    __ATOMIC_ACQUIRE)) {
-					slot->active = false;
-					active--;
-				}
-				goto out;
-			}
-			if (kind == HOT_FG_NOBOF_NOT_READY) {
-				if (ctx->profile)
-					ctx->profile_compare_not_ready++;
-				if (!expired_slot &&
-				    now_ns >= slot->completion_deadline_ns)
-					expired_slot = slot;
-				continue;
-			}
-			span = slot->span;
-			if (!span || span->state != HOT_FG_SPAN_ACTIVE ||
-			    slot->submitted_cursor != span->cursor) {
-				pr_err("DSA no-BOF completion has stale span cursor\n");
-				slot->active = false;
-				active--;
-				goto out;
-			}
-			slot->active = false;
-			active--;
-			harvested++;
-			if (ctx->profile && now_ns >= slot->submit_ns) {
-				u64 age_us = (now_ns - slot->submit_ns) / 1000ULL;
-
-				if (age_us > ctx->profile_max_completion_age_us)
-					ctx->profile_max_completion_age_us = age_us;
-			}
-
-			old_cursor = span->cursor;
-			if (kind == HOT_FG_NOBOF_EQUAL) {
-				span->cursor += slot->submitted_len;
-				if (hot_fg_span_finalize(span, pages, span->cursor))
-					goto out;
-				if (ctx->profile)
-					ctx->profile_dsa_logical_progress_bytes +=
-						slot->submitted_len;
-			} else if (kind == HOT_FG_NOBOF_DIFFERENT) {
-				diff += slot->submitted_cursor;
-				if (hot_fg_span_record_diff(span, pages, diff))
-					goto out;
-				if (ctx->profile)
-					ctx->profile_dsa_logical_progress_bytes +=
-						span->cursor - old_cursor;
-			} else if (hot_fg_compare_fault_page_simd(ctx, pages,
-								  span, slot)) {
-				goto out;
-			}
-
-			if (span->cursor == span->length) {
-				if (hot_fg_span_finalize(span, pages, span->length))
-					goto out;
-				if (span->finalized_pages != span->page_count) {
-					pr_err("DSA no-BOF span ended with unfinished pages\n");
-					goto out;
-				}
-				span->state = HOT_FG_SPAN_DONE;
-				done++;
-			} else {
-				span->state = HOT_FG_SPAN_READY;
-				if (hot_fg_ready_queue_push(&ready,
-							(size_t)(span - spans))) {
-					pr_err("DSA no-BOF ready queue overflow\n");
-					goto out;
-				}
-			}
-		}
-
-		if (expired_slot &&
-		    __atomic_load_n(&expired_slot->comp.status,
-				    __ATOMIC_ACQUIRE) == 0) {
-			if (ctx->profile)
-				ctx->profile_completion_timeout_count++;
-			hot_fg_completion_timeout_fatal(expired_slot, active, now_ns,
-							"compare");
-		}
-		if (had_active && ctx->profile)
-			ctx->profile_completions_harvested += harvested;
-
-		if (hot_fg_wavefront_fill(ctx, slots, &ready, &active,
-					  &submit_sequence, now_ns))
-			goto out;
-		if (ctx->profile && active > ctx->profile_compare_max_active)
-			ctx->profile_compare_max_active = active;
-		if (!active && done < nr_spans) {
-			pr_err("DSA no-BOF compare lost work done=%zu ready=%zu total=%zu\n",
-			       done, ready.nr, nr_spans);
-			goto out;
-		}
-		if (active)
-			hot_dsa_cpu_relax();
-	}
-
-	for (i = 0; i < nr_spans; i++) {
-		if (spans[i].state != HOT_FG_SPAN_DONE ||
-		    spans[i].cursor != spans[i].length ||
-		    spans[i].finalized_pages != spans[i].page_count) {
-			pr_err("DSA no-BOF final span mismatch span=%zu state=%u cursor=%u length=%u finalized=%zu pages=%zu\n",
-			       i, spans[i].state, spans[i].cursor, spans[i].length,
-			       spans[i].finalized_pages, spans[i].page_count);
-			goto out;
-		}
-	}
-	ret = 0;
-out:
-	if (active && hot_fg_wavefront_drain_slots(slots, &active))
-		ret = -1;
-	hot_fg_ready_queue_fini(&ready);
-	return ret;
-}
-
+/* Hardware-BATCH construction and shared-WQ submission helpers. */
 static int hot_fg_compare_batch_prepare_child(
 	struct hot_apply_ctx *ctx, struct hot_fg_compare_batch *batch, u32 child,
 	struct hot_fg_compare_span *span, u64 sequence)
@@ -7317,18 +6401,14 @@ static int hot_fg_compare_batch_harvest(
 			span->cursor += meta->submitted_len;
 			if (hot_fg_span_finalize(span, pages, span->cursor))
 				return -1;
-			if (ctx->profile) {
+			if (ctx->profile)
 				ctx->profile_dsa_logical_progress_bytes += meta->submitted_len;
-				ctx->profile_batch_child_success++;
-			}
 		} else if (kind == HOT_FG_NOBOF_DIFFERENT) {
 			diff += meta->submitted_cursor;
 			if (hot_fg_span_record_diff(span, pages, diff))
 				return -1;
-			if (ctx->profile) {
+			if (ctx->profile)
 				ctx->profile_dsa_logical_progress_bytes += span->cursor - old_cursor;
-				ctx->profile_batch_child_success++;
-			}
 		} else {
 			saw_nobof = true;
 			if (hot_fg_compare_fault_page_simd(ctx, pages, span, &view))
@@ -7356,7 +6436,6 @@ static int hot_fg_compare_batch_harvest(
 					    HOT_FG_SPAN_CPU_ASSIST_READY))
 					return -1;
 				if (ctx->profile) {
-					ctx->profile_assist_enqueued++;
 					if (cpu_assist->nr >
 					    ctx->profile_assist_max_queue_depth)
 						ctx->profile_assist_max_queue_depth =
@@ -7382,12 +6461,8 @@ static int hot_fg_compare_batch_harvest(
 			       outer_code, saw_nobof ? 1U : 0U);
 			return -1;
 		}
-		if (ctx->profile) {
-			if (outer_code == DSA_COMP_SUCCESS)
-				ctx->profile_batch_outer_success++;
-			else
-				ctx->profile_batch_outer_fail++;
-		}
+		if (ctx->profile && outer_code != DSA_COMP_SUCCESS)
+			ctx->profile_batch_outer_fail++;
 	}
 	batch->active = false;
 	batch->child_count = 0;
@@ -7452,7 +6527,6 @@ static int hot_fg_compare_assist_current_page(
 	}
 	if (ctx->profile) {
 		hot_fg_cpu_scan_stats_add(ctx, &stats);
-		ctx->profile_simd_logical_progress_bytes += *progress_bytes;
 		ctx->profile_normal_simd_logical_progress_bytes += *progress_bytes;
 	}
 	return 0;
@@ -7495,98 +6569,8 @@ static int hot_fg_compare_claim_fresh(
 	span->owner = HOT_FG_SPAN_OWNER_DSA;
 	span->state = HOT_FG_SPAN_READY;
 	(*dsa_spans)++;
-	if (ctx->profile) {
-		ctx->profile_hybrid_dsa_claim_spans++;
-		ctx->profile_hybrid_dsa_claim_pages += span->page_count;
-		ctx->profile_dsa_fresh_claim_bytes += span->length;
-	}
 	return 0;
 }
-
-/* Execute one real AVX-512 page comparison without changing the production
- * ownership graph.  Samples come only from DSA-completed spans, so the probe
- * cannot pre-touch or cache-warm work that DSA still has to execute. */
-static int hot_fg_compare_poll_probe_page(
-	struct hot_apply_ctx *ctx, struct hot_fg_raw_page *pages,
-	struct hot_fg_compare_span *spans, size_t nr_spans,
-	const size_t *samples, size_t sample_count, size_t *sample_read,
-	size_t *page_cursor)
-{
-	struct hot_fg_raw_page shadow_page = {};
-	struct hot_fg_compare_span shadow_span = {};
-	struct hot_fg_compare_span *sample;
-	struct hot_fg_raw_page *source;
-	size_t sample_idx;
-	size_t page_off;
-
-	if (!ctx || !pages || !spans || !nr_spans || !samples ||
-	    !sample_count || sample_count > nr_spans ||
-	    !sample_read || !page_cursor)
-		return -1;
-	if (*sample_read >= sample_count)
-		return 1;
-	sample_idx = samples[*sample_read];
-	if (sample_idx >= nr_spans)
-		return -1;
-	sample = &spans[sample_idx];
-	if (sample->owner != HOT_FG_SPAN_OWNER_DSA ||
-	    sample->state != HOT_FG_SPAN_DONE || !sample->page_count ||
-	    sample->cursor != sample->length ||
-	    sample->finalized_pages != sample->page_count)
-		return 1;
-	page_off = *page_cursor;
-	if (page_off >= sample->page_count)
-		return -1;
-	source = &pages[sample->first_page + page_off];
-	if (!source->raw || !source->parent ||
-	    (source->state != HOT_FG_RAW_PARENT &&
-	     source->state != HOT_FG_RAW_PATCH &&
-	     source->state != HOT_FG_RAW_FULL))
-		return -1;
-	shadow_page.vaddr = source->vaddr;
-	shadow_page.raw = source->raw;
-	shadow_page.parent = source->parent;
-	shadow_page.state = HOT_FG_RAW_PENDING;
-	shadow_span.raw = source->raw;
-	shadow_span.parent = source->parent;
-	shadow_span.first_page = 0;
-	shadow_span.page_count = 1;
-	shadow_span.length = PAGE_SIZE;
-	shadow_span.state = HOT_FG_SPAN_UNPREFAULTED;
-	shadow_span.owner = HOT_FG_SPAN_OWNER_SIMD;
-	if (hot_fg_compare_cpu_span(ctx, &shadow_page, &shadow_span,
-				    HOT_FG_COMPARE_SIMD_AVX512, NULL))
-		return -1;
-	switch (shadow_page.state) {
-	case HOT_FG_RAW_PARENT:
-		ctx->profile_poll_probe_shadow_parent_pages++;
-		break;
-	case HOT_FG_RAW_PATCH:
-		ctx->profile_poll_probe_shadow_patch_pages++;
-		break;
-	case HOT_FG_RAW_FULL:
-		ctx->profile_poll_probe_shadow_full_pages++;
-		break;
-	default:
-		return -1;
-	}
-	(*page_cursor)++;
-	if (*page_cursor == sample->page_count) {
-		(*sample_read)++;
-		*page_cursor = 0;
-	}
-	return 0;
-}
-
-enum hot_fg_simd_gate_profile_state {
-	HOT_FG_SIMD_GATE_PROFILE_NONE = 0,
-	HOT_FG_SIMD_GATE_PROFILE_FULL_ABOVE_RESERVE,
-	HOT_FG_SIMD_GATE_PROFILE_PARTIAL_ABOVE_RESERVE,
-	HOT_FG_SIMD_GATE_PROFILE_RESERVE_FULL,
-	HOT_FG_SIMD_GATE_PROFILE_RESERVE_PARTIAL,
-	HOT_FG_SIMD_GATE_PROFILE_EXHAUSTED_READY,
-	HOT_FG_SIMD_GATE_PROFILE_EXHAUSTED_INFLIGHT,
-};
 
 static int hot_fg_compare_hw_batch(struct hot_apply_ctx *ctx,
 				   struct hot_fg_raw_page *pages,
@@ -7598,24 +6582,13 @@ static int hot_fg_compare_hw_batch(struct hot_apply_ctx *ctx,
 	struct hot_fg_ready_queue dsa_diff_ready = {};
 	struct hot_fg_ready_queue cpu_assist = {};
 	size_t active_wq[HOT_DSA_MAX_WQ] = {};
-	size_t active_children_wq[HOT_DSA_MAX_WQ] = {};
 	size_t active_outer = 0;
 	size_t active_children = 0;
 	size_t dsa_spans = 0;
 	size_t fresh_head = 0;
 	size_t fresh_tail = nr_spans;
-	size_t fresh_pages_remaining = ctx->profile ?
-		(size_t)ctx->profile_span_pages : 0;
 	size_t done = 0;
-	bool poll_probe_feedback_pending = false;
-	u64 poll_probe_start_ns = 0;
-	size_t *poll_probe_samples = NULL;
-	size_t poll_probe_sample_count = 0;
-	size_t poll_probe_sample_read = 0;
-	size_t poll_probe_page_cursor = 0;
-	enum hot_fg_simd_gate_profile_state gate_profile_state =
-		HOT_FG_SIMD_GATE_PROFILE_NONE;
-	u64 gate_profile_start_ns = 0;
+	bool assist_enabled = ctx->continuation_assist_enabled;
 	u64 sequence = 0;
 	size_t i;
 	int ret = -1;
@@ -7635,7 +6608,7 @@ static int hot_fg_compare_hw_batch(struct hot_apply_ctx *ctx,
 	batches = ctx->compare_batches;
 	for (i = 0; i < HOT_DSA_COMPARE_INFLIGHT; i++) {
 		if (batches[i].active || batches[i].child_count) {
-			pr_err("DSA opportunistic scheduler pool still owns outer=%zu active=%u children=%u\n",
+			pr_err("DSA continuation-assist scheduler pool still owns outer=%zu active=%u children=%u\n",
 			       i, batches[i].active ? 1U : 0U,
 			       batches[i].child_count);
 			return -1;
@@ -7647,13 +6620,6 @@ static int hot_fg_compare_hw_batch(struct hot_apply_ctx *ctx,
 		 * backlog skew hidden by cumulative round-robin counts. */
 		batches[i].wq_idx = (u32)(i % (size_t)ctx->dsa_wq_count);
 	}
-	if (ctx->poll_probe_enabled) {
-		poll_probe_samples = xmalloc(nr_spans * sizeof(*poll_probe_samples));
-		if (!poll_probe_samples)
-			return -1;
-	}
-	if (ctx->profile)
-		ctx->profile_compare_wq_lane_count = (u64)ctx->dsa_wq_count;
 	if (hot_fg_ready_queue_init(&ready, spans, nr_spans) ||
 	    hot_fg_ready_queue_init(&dsa_diff_ready, spans, nr_spans) ||
 	    hot_fg_ready_queue_init_capacity(
@@ -7663,7 +6629,6 @@ static int hot_fg_compare_hw_batch(struct hot_apply_ctx *ctx,
 		hot_fg_ready_queue_fini(&ready);
 		hot_fg_ready_queue_fini(&dsa_diff_ready);
 		hot_fg_ready_queue_fini(&cpu_assist);
-		xfree(poll_probe_samples);
 		return -1;
 	}
 	while (done < nr_spans) {
@@ -7671,66 +6636,14 @@ static int hot_fg_compare_hw_batch(struct hot_apply_ctx *ctx,
 		u32 prepared[HOT_DSA_COMPARE_INFLIGHT];
 		size_t prepared_count = 0;
 		size_t harvested = 0;
-		size_t harvested_wq[HOT_DSA_MAX_WQ] = {};
-		size_t harvested_children_wq[HOT_DSA_MAX_WQ] = {};
-		size_t fresh_prepared = 0;
-		size_t fresh_batches = 0;
-		size_t profile_min_wq_outer = 0;
-		size_t profile_min_wq_children = 0;
 		bool submitted = false;
 
 		now_ns = hot_dsa_watchdog_now_ns();
 
 		if (!now_ns)
 			goto out_queue;
-		if (poll_probe_feedback_pending && poll_probe_start_ns) {
-			if (now_ns < poll_probe_start_ns)
-				goto out_queue;
-			ctx->profile_poll_probe_wall_ns +=
-				now_ns - poll_probe_start_ns;
-			poll_probe_start_ns = 0;
-		}
-		if (ctx->profile &&
-		    gate_profile_state != HOT_FG_SIMD_GATE_PROFILE_NONE) {
-			u64 elapsed_ns = now_ns >= gate_profile_start_ns ?
-				now_ns - gate_profile_start_ns : 0;
-
-			switch (gate_profile_state) {
-			case HOT_FG_SIMD_GATE_PROFILE_FULL_ABOVE_RESERVE:
-				ctx->profile_opportunistic_simd_gate_full_above_reserve_ns +=
-					elapsed_ns;
-				break;
-			case HOT_FG_SIMD_GATE_PROFILE_PARTIAL_ABOVE_RESERVE:
-				ctx->profile_opportunistic_simd_gate_partial_above_reserve_ns +=
-					elapsed_ns;
-				break;
-			case HOT_FG_SIMD_GATE_PROFILE_RESERVE_FULL:
-				ctx->profile_opportunistic_simd_gate_reserve_full_ns +=
-					elapsed_ns;
-				break;
-			case HOT_FG_SIMD_GATE_PROFILE_RESERVE_PARTIAL:
-				ctx->profile_opportunistic_simd_gate_reserve_partial_ns +=
-					elapsed_ns;
-				break;
-			case HOT_FG_SIMD_GATE_PROFILE_EXHAUSTED_READY:
-				ctx->profile_opportunistic_simd_gate_exhausted_ready_ns +=
-					elapsed_ns;
-				break;
-			case HOT_FG_SIMD_GATE_PROFILE_EXHAUSTED_INFLIGHT:
-				ctx->profile_opportunistic_simd_gate_exhausted_inflight_ns +=
-					elapsed_ns;
-				break;
-			default:
-				goto out_queue;
-			}
-			gate_profile_state = HOT_FG_SIMD_GATE_PROFILE_NONE;
-			gate_profile_start_ns = 0;
-		}
-		if (ctx->profile) {
-			ctx->profile_scheduler_iterations++;
-			if (active_outer)
-				ctx->profile_compare_poll_sweeps++;
-		}
+		if (ctx->profile && active_outer)
+			ctx->profile_compare_poll_sweeps++;
 		for (i = 0; i < HOT_DSA_COMPARE_INFLIGHT; i++) {
 			struct hot_fg_compare_batch *batch = &batches[i];
 			size_t completed_children;
@@ -7739,8 +6652,6 @@ static int hot_fg_compare_hw_batch(struct hot_apply_ctx *ctx,
 			if (!batch->active)
 				continue;
 			if (!hot_fg_compare_batch_ready(batch)) {
-				if (ctx->profile)
-					ctx->profile_compare_not_ready++;
 				if (now_ns >= batch->completion_deadline_ns)
 					hot_fg_compare_batch_timeout(batch, active_outer,
 								     now_ns);
@@ -7749,92 +6660,29 @@ static int hot_fg_compare_hw_batch(struct hot_apply_ctx *ctx,
 			completed_children = batch->child_count;
 			rc = hot_fg_compare_batch_harvest(
 				ctx, batch, pages, spans, &ready, &dsa_diff_ready,
-				&cpu_assist, !ctx->poll_probe_enabled, &done, now_ns);
+				&cpu_assist, assist_enabled, &done, now_ns);
 			if (rc < 0)
 				goto out_queue;
 			if (rc > 0) {
-				u32 child;
-
-				/* Build the probe sample set only in the explicit experiment.
-				 * The child metadata survives harvest even though child_count is
-				 * cleared, so this adds O(completed children) work to an already
-				 * completed batch and never scans the global span table. */
-				if (ctx->poll_probe_enabled &&
-				    poll_probe_sample_count < nr_spans) {
-					for (child = 0; child < completed_children &&
-					     poll_probe_sample_count < nr_spans;
-					     child++) {
-						struct hot_fg_compare_span *sample =
-							batch->child[child].span;
-
-						if (!sample || sample < spans ||
-						    sample >= spans + nr_spans)
-							goto out_queue;
-						if (sample->state != HOT_FG_SPAN_DONE)
-							continue;
-						poll_probe_samples[poll_probe_sample_count++] =
-							(size_t)(sample - spans);
-					}
-				}
 				if (batch->wq_idx >= (u32)ctx->dsa_wq_count ||
 				    !active_wq[batch->wq_idx] ||
-				    (ctx->profile &&
-				     active_children_wq[batch->wq_idx] < completed_children)) {
+				    active_children < completed_children) {
 					pr_err("DSA COMPARE fixed lane active count underflow wq=%u\n",
 					       batch->wq_idx);
 					goto out_queue;
 				}
 				active_wq[batch->wq_idx]--;
-				harvested_wq[batch->wq_idx]++;
-				if (ctx->profile) {
-					active_children_wq[batch->wq_idx] -= completed_children;
-					harvested_children_wq[batch->wq_idx] +=
-						completed_children;
-				}
 				active_outer--;
+				active_children -= completed_children;
 				harvested++;
 			}
 		}
-
-		if (poll_probe_feedback_pending) {
-			size_t harvested_children = 0;
-			size_t max_harvested_wq = 0;
-			size_t min_runway = SIZE_MAX;
-			size_t wq;
-
-			for (wq = 0; wq < (size_t)ctx->dsa_wq_count; wq++) {
-				harvested_children += harvested_children_wq[wq];
-				if (harvested_wq[wq] > max_harvested_wq)
-					max_harvested_wq = harvested_wq[wq];
-				if (active_wq[wq] < min_runway)
-					min_runway = active_wq[wq];
-			}
-			ctx->profile_poll_probe_followup_harvested_outer += harvested;
-			ctx->profile_poll_probe_followup_harvested_children +=
-				harvested_children;
-			if (max_harvested_wq >
-			    ctx->profile_poll_probe_followup_max_harvested_outer_wq)
-				ctx->profile_poll_probe_followup_max_harvested_outer_wq =
-					max_harvested_wq;
-			if (ctx->profile_poll_probe_bursts == 1 ||
-			    min_runway < ctx->profile_poll_probe_followup_min_outer_runway)
-				ctx->profile_poll_probe_followup_min_outer_runway = min_runway;
-			if (!min_runway)
-				ctx->profile_poll_probe_followup_zero_runway++;
-			poll_probe_feedback_pending = false;
-		}
-
-		active_children = 0;
-		for (i = 0; i < HOT_DSA_COMPARE_INFLIGHT; i++)
-			if (batches[i].active)
-				active_children += batches[i].child_count;
 
 		for (i = 0; i < HOT_DSA_COMPARE_INFLIGHT &&
 		     (fresh_head < fresh_tail || ready.nr || dsa_diff_ready.nr); i++) {
 			struct hot_fg_compare_batch *batch = &batches[i];
 			size_t available;
 			u32 count;
-			u32 fresh = 0;
 			u32 j;
 
 			if (batch->active)
@@ -7852,7 +6700,6 @@ static int hot_fg_compare_hw_batch(struct hot_apply_ctx *ctx,
 			for (j = 0; j < count; j++) {
 				size_t span_idx;
 				struct hot_fg_compare_span *span;
-				bool claimed_fresh = false;
 
 				/* A READY entry is a known dependency: DSA has already
 				 * found a difference (or completed fault recovery) and the
@@ -7863,13 +6710,9 @@ static int hot_fg_compare_hw_batch(struct hot_apply_ctx *ctx,
 					if (hot_fg_ready_queue_pop(&dsa_diff_ready,
 								   &span_idx))
 						goto out_queue;
-					if (ctx->profile)
-						ctx->profile_assist_dsa_diff_submits++;
 				} else if (ready.nr) {
 					if (hot_fg_ready_queue_pop(&ready, &span_idx))
 						goto out_queue;
-					if (ctx->profile)
-						ctx->profile_assist_general_submits++;
 				} else {
 					int claim_rc = hot_fg_compare_claim_fresh(
 						ctx, spans, &fresh_head, fresh_tail, &span_idx,
@@ -7877,21 +6720,10 @@ static int hot_fg_compare_hw_batch(struct hot_apply_ctx *ctx,
 
 					if (claim_rc)
 						goto out_queue;
-					claimed_fresh = true;
-					if (ctx->profile)
-						ctx->profile_assist_fresh_submits++;
 				}
 				span = &spans[span_idx];
 				if (span->owner != HOT_FG_SPAN_OWNER_DSA)
 					goto out_queue;
-				if (claimed_fresh) {
-					if (ctx->profile) {
-						if (fresh_pages_remaining < span->page_count)
-							goto out_queue;
-						fresh_pages_remaining -= span->page_count;
-					}
-					fresh++;
-				}
 				if (hot_fg_compare_batch_prepare_child(
 					    ctx, batch, j, span, ++sequence))
 					goto out_queue;
@@ -7899,9 +6731,6 @@ static int hot_fg_compare_hw_batch(struct hot_apply_ctx *ctx,
 			if (hot_fg_compare_batch_prepare_outer(ctx, batch))
 				goto out_queue;
 			prepared[prepared_count++] = (u32)i;
-			fresh_prepared += fresh;
-			if (fresh)
-				fresh_batches++;
 		}
 		if (prepared_count) {
 			/* One release fence covers every immutable descriptor prepared
@@ -7915,180 +6744,18 @@ static int hot_fg_compare_hw_batch(struct hot_apply_ctx *ctx,
 									 now_ns))
 					goto out_queue;
 				active_wq[batch->wq_idx]++;
-				if (ctx->profile)
-					active_children_wq[batch->wq_idx] +=
-						batch->child_count;
 				active_outer++;
 				active_children += batch->child_count;
 			}
 			submitted = true;
 			if (ctx->profile) {
-				ctx->profile_dsa_refill_samples++;
-				ctx->profile_post_refill_active_sum += active_children;
-				if (active_children < 32)
-					ctx->profile_post_refill_active_lt_32++;
-				if (active_children < 64)
-					ctx->profile_post_refill_active_lt_64++;
-				if (active_children < 96)
-					ctx->profile_post_refill_active_lt_96++;
-				ctx->profile_fresh_refill_spans += fresh_prepared;
-				ctx->profile_fresh_refill_batches += fresh_batches;
+				if (active_outer > ctx->profile_batch_max_active_outer)
+					ctx->profile_batch_max_active_outer = active_outer;
+				if (active_children > ctx->profile_batch_max_active_children)
+					ctx->profile_batch_max_active_children = active_children;
 			}
 		}
-		if (ctx->profile) {
-			size_t wq_min = SIZE_MAX;
-			size_t wq_child_min = SIZE_MAX;
-			size_t wq_max = 0;
-			size_t wq_sum = 0;
-			size_t wq_child_sum = 0;
-			size_t wq;
-
-			ctx->profile_completions_harvested += harvested;
-			if (active_outer > ctx->profile_batch_max_active_outer)
-				ctx->profile_batch_max_active_outer = active_outer;
-			if (active_children > ctx->profile_batch_max_active_children)
-				ctx->profile_batch_max_active_children = active_children;
-			if (active_children > ctx->profile_compare_max_active)
-				ctx->profile_compare_max_active = active_children;
-			for (wq = 0; wq < (size_t)ctx->dsa_wq_count; wq++) {
-				if (active_wq[wq] < wq_min)
-					wq_min = active_wq[wq];
-				if (active_wq[wq] > wq_max)
-					wq_max = active_wq[wq];
-				if (active_children_wq[wq] < wq_child_min)
-					wq_child_min = active_children_wq[wq];
-				wq_sum += active_wq[wq];
-				wq_child_sum += active_children_wq[wq];
-			}
-			if (wq_sum != active_outer || wq_child_sum != active_children) {
-				pr_err("DSA COMPARE fixed lane ledger mismatch lanes=%zu active=%zu children=%zu active_children=%zu\n",
-				       wq_sum, active_outer, wq_child_sum,
-				       active_children);
-				goto out_queue;
-			}
-			if (wq_max - wq_min >
-			    ctx->profile_compare_wq_max_active_skew)
-				ctx->profile_compare_wq_max_active_skew = wq_max - wq_min;
-			if ((fresh_head < fresh_tail || ready.nr || dsa_diff_ready.nr) &&
-			    !wq_min && wq_max)
-				ctx->profile_compare_wq_starved_with_claimable_work++;
-			profile_min_wq_outer = wq_min;
-			profile_min_wq_children = wq_child_min;
-		}
-		if (active_outer && !submitted && !harvested) {
-			size_t fresh_spans = fresh_tail - fresh_head;
-			bool above_reserve =
-				fresh_spans > HOT_DSA_COMPARE_MAX_CHILDREN;
-
-			if (ctx->profile)
-				ctx->profile_opportunistic_simd_gate_attempts++;
-			if (ctx->profile) {
-				if (above_reserve) {
-					ctx->profile_opportunistic_simd_blocked_partial_above_reserve++;
-					gate_profile_state =
-						HOT_FG_SIMD_GATE_PROFILE_PARTIAL_ABOVE_RESERVE;
-				} else if (fresh_spans) {
-					u64 reserve_events;
-
-					if (!fresh_pages_remaining)
-						goto out_queue;
-					if (active_outer == HOT_DSA_COMPARE_INFLIGHT) {
-						ctx->profile_opportunistic_simd_blocked_reserve_full++;
-						gate_profile_state =
-							HOT_FG_SIMD_GATE_PROFILE_RESERVE_FULL;
-					} else {
-						ctx->profile_opportunistic_simd_blocked_reserve_partial++;
-						gate_profile_state =
-							HOT_FG_SIMD_GATE_PROFILE_RESERVE_PARTIAL;
-					}
-					reserve_events =
-						ctx->profile_opportunistic_simd_blocked_reserve_full +
-						ctx->profile_opportunistic_simd_blocked_reserve_partial;
-					ctx->profile_opportunistic_simd_reserve_active_outer_sum +=
-						active_outer;
-					ctx->profile_opportunistic_simd_reserve_active_children_sum +=
-						active_children;
-					ctx->profile_opportunistic_simd_reserve_min_wq_outer_sum +=
-						profile_min_wq_outer;
-					ctx->profile_opportunistic_simd_reserve_min_wq_children_sum +=
-						profile_min_wq_children;
-					if (reserve_events == 1 ||
-					    fresh_spans <
-						    ctx->profile_opportunistic_simd_reserve_fresh_spans_min)
-						ctx->profile_opportunistic_simd_reserve_fresh_spans_min =
-							fresh_spans;
-					if (fresh_spans >
-					    ctx->profile_opportunistic_simd_reserve_fresh_spans_max)
-						ctx->profile_opportunistic_simd_reserve_fresh_spans_max =
-							fresh_spans;
-					if (reserve_events == 1 || fresh_pages_remaining <
-					    ctx->profile_opportunistic_simd_reserve_fresh_pages_min)
-						ctx->profile_opportunistic_simd_reserve_fresh_pages_min =
-							fresh_pages_remaining;
-					if (fresh_pages_remaining >
-					    ctx->profile_opportunistic_simd_reserve_fresh_pages_max)
-						ctx->profile_opportunistic_simd_reserve_fresh_pages_max =
-							fresh_pages_remaining;
-				} else if (ready.nr || dsa_diff_ready.nr) {
-					size_t dsa_ready_depth = ready.nr + dsa_diff_ready.nr;
-
-					if (fresh_pages_remaining)
-						goto out_queue;
-					ctx->profile_opportunistic_simd_blocked_exhausted_ready++;
-					ctx->profile_opportunistic_simd_exhausted_ready_depth_sum +=
-						dsa_ready_depth;
-					if (dsa_ready_depth >
-					    ctx->profile_opportunistic_simd_exhausted_ready_depth_max)
-						ctx->profile_opportunistic_simd_exhausted_ready_depth_max =
-							dsa_ready_depth;
-					gate_profile_state =
-						HOT_FG_SIMD_GATE_PROFILE_EXHAUSTED_READY;
-				} else {
-					if (fresh_pages_remaining)
-						goto out_queue;
-					ctx->profile_opportunistic_simd_blocked_exhausted_inflight++;
-					ctx->profile_opportunistic_simd_exhausted_inflight_active_children_sum +=
-						active_children;
-					ctx->profile_opportunistic_simd_exhausted_inflight_min_wq_children_sum +=
-						profile_min_wq_children;
-					gate_profile_state =
-						HOT_FG_SIMD_GATE_PROFILE_EXHAUSTED_INFLIGHT;
-				}
-				gate_profile_start_ns = now_ns;
-			}
-			if (ctx->poll_probe_enabled &&
-			    ctx->poll_probe_pages_per_pause) {
-				size_t probe_done = 0;
-
-				while (probe_done < ctx->poll_probe_pages_per_pause) {
-					int probe_rc;
-
-					if (!poll_probe_sample_count)
-						break;
-					probe_rc = hot_fg_compare_poll_probe_page(
-						ctx, pages, spans, nr_spans,
-						poll_probe_samples,
-						poll_probe_sample_count,
-						&poll_probe_sample_read,
-						&poll_probe_page_cursor);
-
-					if (probe_rc < 0)
-						goto out_queue;
-					if (probe_rc > 0)
-						break;
-					probe_done++;
-				}
-				if (probe_done) {
-					ctx->profile_poll_probe_bursts++;
-					ctx->profile_poll_probe_pages += probe_done;
-					poll_probe_feedback_pending = true;
-					poll_probe_start_ns = now_ns;
-					continue;
-				}
-				ctx->profile_poll_probe_skipped_no_sample++;
-			}
-		}
-		if (!ctx->poll_probe_enabled && !submitted && !harvested &&
+		if (assist_enabled && !submitted && !harvested &&
 		    cpu_assist.nr) {
 			size_t assist_done = 0;
 			bool dsa_was_active = active_outer != 0;
@@ -8105,21 +6772,14 @@ static int hot_fg_compare_hw_batch(struct hot_apply_ctx *ctx,
 					goto out_queue;
 				assist_done++;
 				if (ctx->profile) {
-					ctx->profile_assist_dequeued++;
 					ctx->profile_assist_pages++;
 					ctx->profile_assist_bytes += progress_bytes;
-					if (dsa_was_active) {
+					if (dsa_was_active)
 						ctx->profile_assist_while_dsa_active_pages++;
-						ctx->profile_simd_progress_while_dsa_active_bytes +=
-							progress_bytes;
-						ctx->profile_simd_quanta_while_dsa_active++;
-					} else {
+					else
 						ctx->profile_assist_tail_pages++;
-					}
 				}
 			}
-			if (ctx->profile)
-				ctx->profile_assist_bursts++;
 			continue;
 		}
 		if (!active_outer && done < nr_spans &&
@@ -8143,201 +6803,48 @@ static int hot_fg_compare_hw_batch(struct hot_apply_ctx *ctx,
 	if (fresh_head != fresh_tail || ready.nr || dsa_diff_ready.nr ||
 	    cpu_assist.nr)
 		goto out_queue;
-	if (poll_probe_feedback_pending || poll_probe_start_ns)
-		goto out_queue;
 	for (i = 0; i < (size_t)ctx->dsa_wq_count; i++)
-		if (active_wq[i] || (ctx->profile && active_children_wq[i]))
+		if (active_wq[i])
 			goto out_queue;
 	if (ctx->profile &&
-	    (ctx->profile_poll_probe_pages !=
-		     ctx->profile_poll_probe_shadow_parent_pages +
-		     ctx->profile_poll_probe_shadow_patch_pages +
-		     ctx->profile_poll_probe_shadow_full_pages ||
-	     (ctx->poll_probe_enabled && ctx->poll_probe_pages_per_pause &&
-	      ctx->profile_poll_probe_pages >
-		      ctx->profile_poll_probe_bursts *
-		      (u64)ctx->poll_probe_pages_per_pause) ||
-	     (ctx->poll_probe_enabled && !ctx->poll_probe_pages_per_pause &&
-	      (ctx->profile_poll_probe_bursts ||
-	       ctx->profile_poll_probe_pages ||
-	       ctx->profile_poll_probe_wall_ns ||
-	       ctx->profile_poll_probe_skipped_no_sample ||
-	       ctx->profile_poll_probe_shadow_parent_pages ||
-	       ctx->profile_poll_probe_shadow_patch_pages ||
-	       ctx->profile_poll_probe_shadow_full_pages ||
-	       ctx->profile_poll_probe_followup_harvested_outer ||
-	       ctx->profile_poll_probe_followup_harvested_children ||
-	       ctx->profile_poll_probe_followup_max_harvested_outer_wq ||
-	       ctx->profile_poll_probe_followup_min_outer_runway ||
-	       ctx->profile_poll_probe_followup_zero_runway)) ||
-	     (!ctx->poll_probe_enabled &&
-	      (ctx->profile_poll_probe_bursts ||
-	       ctx->profile_poll_probe_pages ||
-	       ctx->profile_poll_probe_wall_ns ||
-	       ctx->profile_poll_probe_skipped_no_sample ||
-	       ctx->profile_poll_probe_shadow_parent_pages ||
-	       ctx->profile_poll_probe_shadow_patch_pages ||
-	       ctx->profile_poll_probe_shadow_full_pages ||
-	       ctx->profile_poll_probe_followup_harvested_outer ||
-	       ctx->profile_poll_probe_followup_harvested_children ||
-	       ctx->profile_poll_probe_followup_max_harvested_outer_wq ||
-	       ctx->profile_poll_probe_followup_min_outer_runway ||
-	       ctx->profile_poll_probe_followup_zero_runway)))) {
-		pr_err("DSA poll-probe profile invariant failed enabled=%u pages_per_pause=%u bursts=%" PRIu64
-		       " pages=%" PRIu64 " wall_ns=%" PRIu64 " outcomes=%" PRIu64 "\n",
-		       ctx->poll_probe_enabled ? 1U : 0U,
-		       ctx->poll_probe_pages_per_pause,
-		       ctx->profile_poll_probe_bursts,
-		       ctx->profile_poll_probe_pages,
-		       ctx->profile_poll_probe_wall_ns,
-		       ctx->profile_poll_probe_shadow_parent_pages +
-		       ctx->profile_poll_probe_shadow_patch_pages +
-		       ctx->profile_poll_probe_shadow_full_pages);
-		goto out_queue;
-	}
-	if (ctx->profile &&
-	    (fresh_pages_remaining ||
-	     ctx->profile_hybrid_dsa_claim_pages +
-		     ctx->profile_hybrid_cpu_claim_pages !=
-		     ctx->profile_span_pages ||
-	     ctx->profile_normal_simd_logical_progress_bytes !=
-		     ctx->profile_opportunistic_simd_pages * (u64)PAGE_SIZE +
-		     ctx->profile_assist_bytes ||
-	     ctx->profile_dsa_fresh_submit_ops != dsa_spans ||
+	    (ctx->profile_dsa_fresh_submit_ops != dsa_spans ||
 	     ctx->profile_dsa_fresh_submit_ops +
 		     ctx->profile_dsa_continuation_submit_ops !=
 		     ctx->profile_batch_child_submits ||
-	     ctx->profile_assist_fresh_submits !=
-		     ctx->profile_dsa_fresh_submit_ops ||
-	     ctx->profile_assist_dsa_diff_submits +
-		     ctx->profile_assist_general_submits !=
-		     ctx->profile_dsa_continuation_submit_ops ||
-	     ctx->profile_batch_child_success +
-		     ctx->profile_batch_child_nobof !=
-		     ctx->profile_batch_child_submits ||
-	     ctx->profile_normal_simd_logical_progress_bytes +
-		     ctx->profile_fault_simd_logical_progress_bytes !=
-		     ctx->profile_simd_logical_progress_bytes ||
 	     ctx->profile_dsa_logical_progress_bytes +
-		     ctx->profile_simd_logical_progress_bytes !=
+		     ctx->profile_normal_simd_logical_progress_bytes +
+		     ctx->profile_fault_simd_logical_progress_bytes !=
 		     ctx->profile_span_pages * (u64)PAGE_SIZE ||
-	     ctx->profile_dsa_fresh_claim_bytes !=
-		     ctx->profile_hybrid_dsa_claim_pages * (u64)PAGE_SIZE ||
-	     ctx->profile_hybrid_dsa_to_cpu_handoff_spans !=
-		     ctx->profile_compare_fault_handoff_spans ||
-	     ctx->profile_hybrid_dsa_to_cpu_handoff_pages !=
-		     ctx->profile_compare_fault_handoff_pages ||
-	     ctx->profile_hybrid_dsa_to_cpu_handoff_remaining_bytes !=
-		     ctx->profile_compare_fault_handoff_remaining_bytes ||
-	     ctx->profile_opportunistic_simd_pages !=
-		     ctx->profile_hybrid_cpu_claim_pages ||
-	     ctx->profile_assist_enqueued != ctx->profile_assist_dequeued ||
-	     ctx->profile_assist_dequeued != ctx->profile_assist_pages ||
+	     ctx->profile_compare_nobof_faults !=
+		     ctx->profile_compare_nobof_fault_source1 +
+		     ctx->profile_compare_nobof_fault_source2 ||
+	     ctx->profile_compare_nobof_faults !=
+		     ctx->profile_batch_child_nobof ||
+	     ctx->profile_compare_fault_handoff_remaining_bytes !=
+		     ctx->profile_fault_simd_logical_progress_bytes ||
+	     ctx->profile_normal_simd_logical_progress_bytes !=
+		     ctx->profile_assist_bytes ||
 	     ctx->profile_assist_while_dsa_active_pages +
-		     ctx->profile_assist_tail_pages != ctx->profile_assist_pages ||
+		     ctx->profile_assist_tail_pages !=
+		     ctx->profile_assist_pages ||
 	     ctx->profile_assist_max_queue_depth >
 		     HOT_DSA_COMPARE_ASSIST_QUEUE_CAPACITY ||
-	     (!ctx->poll_probe_enabled &&
-	      ctx->profile_assist_overflow_to_dsa !=
-		      ctx->profile_assist_dsa_diff_submits) ||
-	     (ctx->poll_probe_enabled &&
-	      (ctx->profile_assist_enqueued ||
-	       ctx->profile_assist_overflow_to_dsa ||
-	       ctx->profile_assist_dequeued || ctx->profile_assist_pages ||
-	       ctx->profile_assist_bytes || ctx->profile_assist_bursts ||
+	     (!assist_enabled &&
+	      (ctx->profile_assist_overflow_to_dsa ||
+	       ctx->profile_assist_pages || ctx->profile_assist_bytes ||
 	       ctx->profile_assist_max_queue_depth ||
 	       ctx->profile_assist_while_dsa_active_pages ||
-	       ctx->profile_assist_tail_pages)) ||
-	     ctx->profile_opportunistic_simd_gate_success !=
-		     ctx->profile_opportunistic_simd_bursts ||
-	     ctx->profile_opportunistic_simd_feedback_grow +
-		     ctx->profile_opportunistic_simd_feedback_hold +
-		     ctx->profile_opportunistic_simd_feedback_shrink +
-		     ctx->profile_opportunistic_simd_feedback_reset !=
-		     ctx->profile_opportunistic_simd_bursts ||
-	     ctx->profile_opportunistic_simd_gate_attempts !=
-		     ctx->profile_opportunistic_simd_gate_success +
-		     ctx->profile_opportunistic_simd_blocked_partial_above_reserve +
-		     ctx->profile_opportunistic_simd_blocked_reserve_full +
-		     ctx->profile_opportunistic_simd_blocked_reserve_partial +
-		     ctx->profile_opportunistic_simd_blocked_exhausted_ready +
-		     ctx->profile_opportunistic_simd_blocked_exhausted_inflight ||
-	     (!ctx->profile_opportunistic_simd_blocked_partial_above_reserve &&
-	      ctx->profile_opportunistic_simd_gate_partial_above_reserve_ns) ||
-	     (!(ctx->profile_opportunistic_simd_blocked_reserve_full +
-		ctx->profile_opportunistic_simd_blocked_reserve_partial) &&
-	      (ctx->profile_opportunistic_simd_gate_reserve_full_ns ||
-	       ctx->profile_opportunistic_simd_gate_reserve_partial_ns ||
-	       ctx->profile_opportunistic_simd_reserve_active_outer_sum ||
-	       ctx->profile_opportunistic_simd_reserve_active_children_sum ||
-	       ctx->profile_opportunistic_simd_reserve_min_wq_outer_sum ||
-	       ctx->profile_opportunistic_simd_reserve_min_wq_children_sum ||
-	       ctx->profile_opportunistic_simd_reserve_fresh_spans_min ||
-	       ctx->profile_opportunistic_simd_reserve_fresh_spans_max ||
-	       ctx->profile_opportunistic_simd_reserve_fresh_pages_min ||
-	       ctx->profile_opportunistic_simd_reserve_fresh_pages_max)) ||
-	     ((ctx->profile_opportunistic_simd_blocked_reserve_full +
-	       ctx->profile_opportunistic_simd_blocked_reserve_partial) &&
-	      (!ctx->profile_opportunistic_simd_reserve_fresh_spans_min ||
-	       ctx->profile_opportunistic_simd_reserve_fresh_spans_min >
-		       HOT_DSA_COMPARE_MAX_CHILDREN ||
-	       ctx->profile_opportunistic_simd_reserve_fresh_spans_max <
-		       ctx->profile_opportunistic_simd_reserve_fresh_spans_min ||
-	       !ctx->profile_opportunistic_simd_reserve_fresh_pages_min ||
-	       ctx->profile_opportunistic_simd_reserve_fresh_pages_max <
-		       ctx->profile_opportunistic_simd_reserve_fresh_pages_min ||
-	       ctx->profile_opportunistic_simd_reserve_active_children_sum <
-		       ctx->profile_opportunistic_simd_reserve_active_outer_sum ||
-	       ctx->profile_opportunistic_simd_reserve_min_wq_outer_sum *
-		       (u64)ctx->dsa_wq_count >
-		       ctx->profile_opportunistic_simd_reserve_active_outer_sum ||
-	       ctx->profile_opportunistic_simd_reserve_min_wq_children_sum *
-		       (u64)ctx->dsa_wq_count >
-		       ctx->profile_opportunistic_simd_reserve_active_children_sum)) ||
-	     (!ctx->profile_opportunistic_simd_blocked_exhausted_ready &&
-	      (ctx->profile_opportunistic_simd_gate_exhausted_ready_ns ||
-	       ctx->profile_opportunistic_simd_exhausted_ready_depth_sum ||
-	       ctx->profile_opportunistic_simd_exhausted_ready_depth_max)) ||
-	     (ctx->profile_opportunistic_simd_blocked_exhausted_ready &&
-	      (!ctx->profile_opportunistic_simd_exhausted_ready_depth_max ||
-	       ctx->profile_opportunistic_simd_exhausted_ready_depth_sum <
-		       ctx->profile_opportunistic_simd_blocked_exhausted_ready ||
-	       ctx->profile_opportunistic_simd_exhausted_ready_depth_max >
-		       ctx->profile_opportunistic_simd_exhausted_ready_depth_sum)) ||
-	     (!ctx->profile_opportunistic_simd_blocked_exhausted_inflight &&
-	      (ctx->profile_opportunistic_simd_gate_exhausted_inflight_ns ||
-	       ctx->profile_opportunistic_simd_exhausted_inflight_active_children_sum ||
-	       ctx->profile_opportunistic_simd_exhausted_inflight_min_wq_children_sum)) ||
-	     (ctx->profile_opportunistic_simd_blocked_exhausted_inflight &&
-	      (ctx->profile_opportunistic_simd_exhausted_inflight_active_children_sum <
-		       ctx->profile_opportunistic_simd_blocked_exhausted_inflight ||
-	       ctx->profile_opportunistic_simd_exhausted_inflight_min_wq_children_sum *
-		       (u64)ctx->dsa_wq_count >
-		       ctx->profile_opportunistic_simd_exhausted_inflight_active_children_sum)) ||
-	     (!ctx->profile_opportunistic_simd_bursts &&
-	      (ctx->profile_opportunistic_simd_gate_full_above_reserve_ns ||
-	       ctx->profile_opportunistic_simd_feedback_completed_children ||
-	       ctx->profile_opportunistic_simd_feedback_max_completed_children_wq ||
-	       ctx->profile_opportunistic_simd_feedback_min_child_runway_after_burst ||
-	       ctx->profile_opportunistic_simd_feedback_max_completed_children_per_page_x1024)))) {
+	       ctx->profile_assist_tail_pages)))) {
 		pr_err("DSA continuation-assist profile invariant failed spans=%zu dsa_spans=%zu fresh=%" PRIu64
-		       " continuation=%" PRIu64 " child_submits=%" PRIu64
-		       " dsa_pages=%" PRIu64 " simd_pages=%" PRIu64
-		       " dsa_progress=%" PRIu64 " simd_progress=%" PRIu64
-		       " assist_enqueued=%" PRIu64 " assist_dequeued=%" PRIu64
-		       " assist_bytes=%" PRIu64 " diff_submits=%" PRIu64 "\n",
-		       nr_spans, dsa_spans,
-		       ctx->profile_dsa_fresh_submit_ops,
+		       " continuation=%" PRIu64 " children=%" PRIu64
+		       " dsa_bytes=%" PRIu64 " assist_bytes=%" PRIu64
+		       " fault_bytes=%" PRIu64 "\n",
+		       nr_spans, dsa_spans, ctx->profile_dsa_fresh_submit_ops,
 		       ctx->profile_dsa_continuation_submit_ops,
 		       ctx->profile_batch_child_submits,
-		       ctx->profile_hybrid_dsa_claim_pages,
-		       ctx->profile_hybrid_cpu_claim_pages,
 		       ctx->profile_dsa_logical_progress_bytes,
-		       ctx->profile_simd_logical_progress_bytes,
-		       ctx->profile_assist_enqueued,
-		       ctx->profile_assist_dequeued,
 		       ctx->profile_assist_bytes,
-		       ctx->profile_assist_dsa_diff_submits);
+		       ctx->profile_fault_simd_logical_progress_bytes);
 		goto out_queue;
 	}
 	ret = 0;
@@ -8370,7 +6877,6 @@ out_queue:
 	hot_fg_ready_queue_fini(&ready);
 	hot_fg_ready_queue_fini(&dsa_diff_ready);
 	hot_fg_ready_queue_fini(&cpu_assist);
-	xfree(poll_probe_samples);
 	return ret;
 }
 
@@ -8915,8 +7421,6 @@ static int hot_fg_encode_raw_wavefront(struct page_xfer *xfer,
 			.idx_write_calls = &ctx->profile_idx_writes,
 			.dat_write_calls = &ctx->profile_dat_writes,
 			.dat_writev_calls = &ctx->profile_dat_writevs,
-			.write_units = &ctx->profile_write_units,
-			.write_unit_max_us = &ctx->profile_write_unit_max_us,
 		};
 		if (hot_fg_output_drain(output))
 			goto err;
@@ -9901,8 +8405,6 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 			if ((flags & PE_PRESENT) && !(flags & PE_DSA_FG) &&
 			    xfer->write_pages(xfer, ppb->p[0], iov.iov_len))
 				goto out;
-			if (profile_ctx && profile_ctx->profile)
-				profile_ctx->profile_pagemap_iovs++;
 		}
 	}
 

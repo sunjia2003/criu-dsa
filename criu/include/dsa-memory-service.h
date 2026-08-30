@@ -11,7 +11,7 @@
 #include <stdint.h>
 
 #define CDP_DSA_MEMORY_SERVICE_MAGIC   0x4350444dU /* "CDPM" */
-#define CDP_DSA_MEMORY_SERVICE_VERSION 19U
+#define CDP_DSA_MEMORY_SERVICE_VERSION 20U
 #define CDP_DSA_MEMORY_SERVICE_DIAG_MAGIC 0x43445044U /* "CDPD" */
 #define CDP_DSA_MEMORY_SERVICE_DIAG_VERSION 1U
 #define CDP_DSA_MS_DIAG_INVALID_OBJECT UINT64_MAX
@@ -115,10 +115,6 @@ struct cdp_dsa_memory_service_profile {
 	uint64_t compare_engine_wall_us;
 	uint64_t compare_engine_cpu_us;
 	uint64_t result_publish_us;
-	uint64_t parent_prefault_wall_us;
-	uint64_t parent_prefault_cpu_us;
-	uint64_t compare_core_wall_us;
-	uint64_t compare_core_cpu_us;
 	uint64_t hot_apply_us;
 	uint64_t hot_apply_cpu_us;
 
@@ -128,16 +124,9 @@ struct cdp_dsa_memory_service_profile {
 	uint64_t spans;
 	uint64_t span_pages;
 	uint64_t max_span_pages;
-	uint64_t compare_ops;
 	uint64_t enq_retries;
 	uint64_t poll_sweeps;
-	uint64_t not_ready;
-	uint64_t max_active;
-	uint64_t completions_harvested;
-	uint64_t completion_timeout_count;
 	uint64_t max_completion_age_us;
-	uint64_t prefault_spans;
-	uint64_t prefault_pages;
 	uint64_t parent_pages;
 	uint64_t patch_pages;
 	uint64_t full_pages;
@@ -146,144 +135,32 @@ struct cdp_dsa_memory_service_profile {
 	uint64_t prq_pg_requests;
 	uint64_t prq_thread_cpu_us;
 
-	uint64_t memcmp_calls;
 	uint64_t memcmp_requested_bytes;
-	uint64_t memcmp_scalar_bytes;
-	uint64_t scalar64_calls;
-	uint64_t scalar64_word_ops;
-	uint64_t scalar64_refine_bytes;
-	uint64_t scalar64_tail_bytes;
 	uint64_t scalar64_bytes_examined;
-	uint64_t simd_vector_ops;
 	uint64_t simd_bytes_examined;
-	uint64_t hybrid_dsa_claim_spans;
-	uint64_t hybrid_dsa_claim_pages;
-	uint64_t hybrid_cpu_claim_spans;
-	uint64_t hybrid_cpu_claim_pages;
-	uint64_t hybrid_cpu_waves;
-	uint64_t hybrid_dsa_to_cpu_handoff_spans;
-	uint64_t hybrid_dsa_to_cpu_handoff_pages;
-	uint64_t hybrid_dsa_to_cpu_handoff_remaining_bytes;
-	uint64_t hybrid_unclaimed_empty_count;
 	uint64_t compare_nobof_faults;
 	uint64_t compare_nobof_fault_source1;
 	uint64_t compare_nobof_fault_source2;
-	uint64_t compare_nobof_equal_prefix_bytes;
-	uint64_t compare_fault_handoff_spans;
-	uint64_t compare_fault_handoff_pages;
 	uint64_t compare_fault_handoff_remaining_bytes;
-	uint64_t compare_fault_queue_max;
-	uint64_t compare_fresh_claim_throttles;
-	uint64_t compare_cpu_fault_waves;
 	uint64_t dsa_logical_progress_bytes;
-	uint64_t simd_logical_progress_bytes;
 	uint64_t normal_simd_logical_progress_bytes;
 	uint64_t fault_simd_logical_progress_bytes;
 	uint64_t dsa_fresh_submit_ops;
-	/* Profile schema v10+: page-aligned extent suffix probes.  The field name
-	 * is retained to keep the fixed-width service record layout stable. */
 	uint64_t dsa_continuation_submit_ops;
 	uint64_t dsa_submitted_bytes;
-	uint64_t simd_progress_while_dsa_active_bytes;
-	uint64_t simd_quanta_while_dsa_active;
-	uint64_t dsa_fresh_claim_bytes;
-	uint64_t dsa_active_zero_while_normal_cpu_work;
-	/* Profile schema v12: aggregate ready slots immediately before and after
-	 * each whole SIMD wave.  This is never sampled per page. */
-	uint64_t ready_completions_before_simd;
-	uint64_t ready_completions_after_simd;
-	/* Dual-granularity extent/page scheduler diagnostics.  These are populated
-	 * only when the task explicitly enables the profile path. */
-	uint64_t scheduler_iterations;
-	uint64_t dsa_refill_samples;
-	uint64_t post_refill_active_sum;
-	uint64_t post_refill_active_lt_32;
-	uint64_t post_refill_active_lt_64;
-	uint64_t post_refill_active_lt_96;
-	uint64_t fresh_refill_spans;
-	uint64_t fresh_refill_batches;
-	uint64_t fresh_refill_blocked_fault_debt;
-	uint64_t dsa_empty_with_claimable_fresh;
-	uint64_t opportunistic_simd_gate_attempts;
-	uint64_t opportunistic_simd_gate_success;
-	/* Profile schema v17: exhaustive, mutually exclusive idle-gate states. */
-	uint64_t opportunistic_simd_blocked_partial_above_reserve;
-	uint64_t opportunistic_simd_blocked_reserve_full;
-	uint64_t opportunistic_simd_blocked_reserve_partial;
-	uint64_t opportunistic_simd_blocked_exhausted_ready;
-	uint64_t opportunistic_simd_blocked_exhausted_inflight;
-	uint64_t opportunistic_simd_gate_full_above_reserve_ns;
-	uint64_t opportunistic_simd_gate_partial_above_reserve_ns;
-	uint64_t opportunistic_simd_gate_reserve_full_ns;
-	uint64_t opportunistic_simd_gate_reserve_partial_ns;
-	uint64_t opportunistic_simd_gate_exhausted_ready_ns;
-	uint64_t opportunistic_simd_gate_exhausted_inflight_ns;
-	uint64_t opportunistic_simd_reserve_active_outer_sum;
-	uint64_t opportunistic_simd_reserve_active_children_sum;
-	uint64_t opportunistic_simd_reserve_min_wq_outer_sum;
-	uint64_t opportunistic_simd_reserve_min_wq_children_sum;
-	uint64_t opportunistic_simd_reserve_fresh_spans_min;
-	uint64_t opportunistic_simd_reserve_fresh_spans_max;
-	uint64_t opportunistic_simd_reserve_fresh_pages_min;
-	uint64_t opportunistic_simd_reserve_fresh_pages_max;
-	uint64_t opportunistic_simd_exhausted_ready_depth_sum;
-	uint64_t opportunistic_simd_exhausted_ready_depth_max;
-	uint64_t opportunistic_simd_exhausted_inflight_active_children_sum;
-	uint64_t opportunistic_simd_exhausted_inflight_min_wq_children_sum;
-	/* Profile schema v15+: feedback-controlled opportunistic SIMD bursts. */
-	uint64_t opportunistic_simd_bursts;
-	uint64_t opportunistic_simd_pages;
-	uint64_t opportunistic_simd_max_burst_pages;
-	uint64_t opportunistic_simd_feedback_grow;
-	uint64_t opportunistic_simd_feedback_hold;
-	uint64_t opportunistic_simd_feedback_shrink;
-	uint64_t opportunistic_simd_feedback_reset;
-	uint64_t opportunistic_simd_max_completed_wq;
-	uint64_t opportunistic_simd_min_runway_after_burst;
-	/* Profile schema v16: child-descriptor runway consumed by a burst. */
-	uint64_t opportunistic_simd_feedback_completed_children;
-	uint64_t opportunistic_simd_feedback_max_completed_children_wq;
-	uint64_t opportunistic_simd_feedback_min_child_runway_after_burst;
-	uint64_t opportunistic_simd_feedback_max_completed_children_per_page_x1024;
-	/* Profile schema v18: explicit poll-substitution experiment. */
-	uint64_t poll_probe_enabled;
-	uint64_t poll_probe_pages_per_pause;
-	uint64_t poll_probe_bursts;
-	uint64_t poll_probe_pages;
-	uint64_t poll_probe_wall_ns;
-	uint64_t poll_probe_skipped_no_sample;
-	uint64_t poll_probe_shadow_parent_pages;
-	uint64_t poll_probe_shadow_patch_pages;
-	uint64_t poll_probe_shadow_full_pages;
-	uint64_t poll_probe_followup_harvested_outer;
-	uint64_t poll_probe_followup_harvested_children;
-	uint64_t poll_probe_followup_max_harvested_outer_wq;
-	uint64_t poll_probe_followup_min_outer_runway;
-	uint64_t poll_probe_followup_zero_runway;
-	/* Profile schema v19: production continuation-assist scheduler. */
-	uint64_t assist_enqueued;
+	/* Profile schema v20: minimal production continuation-assist ledger. */
+	uint64_t assist_enabled;
 	uint64_t assist_overflow_to_dsa;
-	uint64_t assist_dequeued;
 	uint64_t assist_pages;
 	uint64_t assist_bytes;
-	uint64_t assist_bursts;
 	uint64_t assist_max_queue_depth;
-	uint64_t assist_dsa_diff_submits;
-	uint64_t assist_general_submits;
-	uint64_t assist_fresh_submits;
 	uint64_t assist_while_dsa_active_pages;
 	uint64_t assist_tail_pages;
-	/* Profile schema v15: fixed-WQ-lane scheduler diagnostics. */
-	uint64_t compare_wq_lane_count;
-	uint64_t compare_wq_max_active_skew;
-	uint64_t compare_wq_starved_with_claimable_work;
 	uint64_t batch_outer_submits;
 	uint64_t batch_child_submits;
 	uint64_t batch_partial_submits;
 	uint64_t batch_single_tail_submits;
-	uint64_t batch_outer_success;
 	uint64_t batch_outer_fail;
-	uint64_t batch_child_success;
 	uint64_t batch_child_nobof;
 	uint64_t batch_max_active_outer;
 	uint64_t batch_max_active_children;
