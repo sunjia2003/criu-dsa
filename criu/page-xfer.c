@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include <dml/dml.h>
 
 #if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
@@ -78,6 +79,7 @@
 
 enum hot_fg_compare_backend {
 	HOT_FG_COMPARE_DSA = 0,
+	HOT_FG_COMPARE_DML,
 	HOT_FG_COMPARE_MEMCMP,
 	HOT_FG_COMPARE_SCALAR64,
 	HOT_FG_COMPARE_SIMD_AVX2,
@@ -110,6 +112,38 @@ static bool dsa_profile_enabled(void)
 
 	enabled = value && (!strcmp(value, "1") || !strcasecmp(value, "true") ||
 				    !strcasecmp(value, "yes"));
+	return enabled;
+}
+
+static bool dsa_timing_enabled(void)
+{
+	static int enabled = -1;
+	const char *value = getenv("CRIU_DSA_TIMING");
+
+	if (enabled >= 0)
+		return enabled;
+	enabled = dsa_profile_enabled() ||
+		(value && (!strcmp(value, "1") || !strcasecmp(value, "true") ||
+			   !strcasecmp(value, "yes")));
+	return enabled;
+}
+
+static bool dsa_transport_breakdown_enabled(void)
+{
+	static int enabled = -1;
+	const char *value = getenv("CRIU_DSA_TRANSPORT_BREAKDOWN");
+
+	if (enabled >= 0)
+		return enabled;
+	if (!dsa_profile_enabled()) {
+		enabled = 0;
+		return enabled;
+	}
+	/* Preserve the diagnostic profile's historical default while allowing a
+	 * same-binary, no-sampling control run. */
+	enabled = !value || !value[0] || !strcmp(value, "1") ||
+		  !strcasecmp(value, "true") || !strcasecmp(value, "yes") ||
+		  !strcasecmp(value, "on");
 	return enabled;
 }
 
@@ -454,13 +488,18 @@ struct hot_prq_profile_source {
 };
 
 struct hot_fg_compare_batch;
+struct hot_apply_ctx;
+static int hot_dml_compare_open(struct hot_apply_ctx *ctx);
+static void hot_dml_compare_close(struct hot_apply_ctx *ctx);
 
 struct hot_apply_ctx {
 	bool enabled;
 	bool memstore;
 	bool fine_grained;
 	bool fine_output;
+	bool timing;
 	bool profile;
+	bool transport_breakdown;
 	enum hot_fg_compare_backend fg_compare_backend;
 	bool finished;
 	int pipefd[2];
@@ -528,14 +567,16 @@ struct hot_apply_ctx {
 	int dsa_wq_fds[HOT_DSA_MAX_WQ];
 	void *dsa_portals[HOT_DSA_MAX_WQ];
 	unsigned long dsa_portal_offset[HOT_DSA_MAX_WQ];
+	int dsa_wq_numa[HOT_DSA_MAX_WQ];
 	unsigned int dsa_next_wq;
 	u32 dsa_max_transfer_size;
 	/* Task-service lifetime pool: descriptor/completion pages remain resident
 	 * across generations; individual submissions rewrite only used slots. */
 	struct hot_fg_compare_batch *compare_batches;
 	struct hot_apply_extent pending;
-	/* Aggregate-only profile data.  It is populated only when
-	 * CRIU_DSA_PROFILE=1; no timer is read from page/range/descriptor loops. */
+	/* timing reads only the COMPARE outer boundary.  profile enables the
+	 * detailed diagnostic ledger; transport_breakdown additionally enables
+	 * sampled clocks inside the scheduler. */
 	bool profile_started;
 	bool profile_emitted;
 	u64 profile_total_start_us;
@@ -569,6 +610,27 @@ struct hot_apply_ctx {
 	u64 profile_batch_child_nobof;
 	u64 profile_batch_max_active_outer;
 	u64 profile_batch_max_active_children;
+	u64 profile_dml_setter_calls;
+	u64 profile_dml_submit_calls;
+	u64 profile_dml_submit_retries;
+	u64 profile_dml_check_calls;
+	u64 profile_dml_completion_reads;
+	u64 profile_dml_padding_nops;
+	u64 profile_dml_prepare_groups;
+	u64 profile_dml_prepare_sample_groups;
+	u64 profile_dml_prepare_sample_tasks;
+	u64 profile_dml_prepare_sample_ns;
+	u64 profile_transport_submit_calls;
+	u64 profile_transport_submit_sample_calls;
+	u64 profile_transport_submit_sample_ns;
+	u64 profile_transport_probe_calls;
+	u64 profile_transport_probe_sample_calls;
+	u64 profile_transport_probe_sample_ns;
+	u64 profile_dml_completion_groups;
+	u64 profile_dml_completion_sample_groups;
+	u64 profile_dml_completion_sample_children;
+	u64 profile_dml_completion_sample_ns;
+	u64 profile_transport_timer_overhead_ns;
 	u64 profile_max_completion_age_us;
 	u64 profile_memcmp_requested_bytes;
 	u64 profile_scalar64_bytes_examined;
@@ -590,6 +652,10 @@ struct hot_apply_ctx {
 	u64 profile_assist_max_queue_depth;
 	u64 profile_assist_while_dsa_active_pages;
 	u64 profile_assist_tail_pages;
+	u64 profile_assist_diff_ranges_found;
+	u64 profile_assist_pages_became_full;
+	u64 profile_assist_pages_finished_span;
+	u64 profile_assist_pages_returned_to_dsa;
 	/* Set only after this service has promoted a locally staged generation.
 	 * It is a scheduling input, not merely a reporting label. */
 	bool service_parent_mapping_warm;
@@ -736,6 +802,39 @@ static u64 hot_dsa_watchdog_now_ns(void)
 	if (clock_gettime(CLOCK_MONOTONIC, &ts))
 		return 0;
 	return (u64)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+#define HOT_DML_PREPARE_SAMPLE_INTERVAL 16ULL
+#define HOT_TRANSPORT_SUBMIT_SAMPLE_INTERVAL 16ULL
+#define HOT_TRANSPORT_PROBE_SAMPLE_INTERVAL 32ULL
+#define HOT_DML_COMPLETION_SAMPLE_INTERVAL 16ULL
+#define HOT_TRANSPORT_TIMER_CALIBRATION_PAIRS 32U
+
+static u64 hot_transport_timer_overhead_ns(void)
+{
+	u64 best = UINT64_MAX;
+	u32 i;
+
+	for (i = 0; i < HOT_TRANSPORT_TIMER_CALIBRATION_PAIRS; i++) {
+		u64 begin = hot_dsa_watchdog_now_ns();
+		u64 end = hot_dsa_watchdog_now_ns();
+
+		if (begin && end >= begin && end - begin < best)
+			best = end - begin;
+	}
+	return best == UINT64_MAX ? 0 : best;
+}
+
+static u64 hot_transport_sample_delta_ns(const struct hot_apply_ctx *ctx,
+					 u64 begin, u64 end)
+{
+	u64 delta;
+
+	if (!begin || end < begin)
+		return 0;
+	delta = end - begin;
+	return delta > ctx->profile_transport_timer_overhead_ns ?
+		delta - ctx->profile_transport_timer_overhead_ns : 0;
 }
 
 static void hot_dsa_prefault_range(void *addr, unsigned long bytes, bool write)
@@ -1428,6 +1527,34 @@ static int hot_dsa_wq_supports_ats(const char *path)
 	return 0;
 }
 
+static int hot_dsa_wq_numa_node(const char *path, int *node)
+{
+	const char *name = strrchr(path, '/');
+	char sysfs[PATH_MAX];
+	char value[32];
+	char *end = NULL;
+	unsigned long device;
+	long parsed;
+
+	if (!name || strncmp(name + 1, "wq", 2) || !node)
+		return -1;
+	errno = 0;
+	device = strtoul(name + 3, &end, 10);
+	if (errno || end == name + 3 || *end != '.' || device > UINT_MAX)
+		return -1;
+	if (snprintf(sysfs, sizeof(sysfs),
+		     "/sys/bus/dsa/devices/dsa%lu/numa_node", device) >=
+	    (int)sizeof(sysfs) ||
+	    hot_read_small_file(sysfs, value, sizeof(value)))
+		return -1;
+	errno = 0;
+	parsed = strtol(value, &end, 10);
+	if (errno || end == value || parsed < 0 || parsed > INT_MAX)
+		return -1;
+	*node = (int)parsed;
+	return 0;
+}
+
 static void hot_dsa_close(struct hot_apply_ctx *ctx)
 {
 	int i;
@@ -1457,6 +1584,7 @@ static int hot_dsa_open(struct hot_apply_ctx *ctx)
 		ctx->dsa_wq_fds[i] = -1;
 		ctx->dsa_portals[i] = MAP_FAILED;
 		ctx->dsa_portal_offset[i] = 0;
+		ctx->dsa_wq_numa[i] = -1;
 	}
 
 	nr = hot_dsa_collect_workqueues(paths);
@@ -1479,6 +1607,7 @@ static int hot_dsa_open(struct hot_apply_ctx *ctx)
 			goto err;
 		}
 		if ((ctx->fg_compare_backend == HOT_FG_COMPARE_DSA ||
+		     ctx->fg_compare_backend == HOT_FG_COMPARE_DML ||
 		     ctx->fg_compare_backend == HOT_FG_COMPARE_VALIDATE) &&
 		    hot_dsa_wq_supports_ats(paths[i])) {
 			pr_err("DSA no-BOF compare requires ats_disable=0: %s\n", paths[i]);
@@ -1491,6 +1620,12 @@ static int hot_dsa_open(struct hot_apply_ctx *ctx)
 		}
 		if (wq_max_xfer < max_xfer)
 			max_xfer = wq_max_xfer;
+		if (ctx->fg_compare_backend == HOT_FG_COMPARE_DML &&
+		    hot_dsa_wq_numa_node(paths[i], &ctx->dsa_wq_numa[i])) {
+			pr_err("DSA hot apply can't determine NUMA node for %s\n",
+			       paths[i]);
+			goto err;
+		}
 		ctx->dsa_wq_fds[i] = open(paths[i], O_RDWR | O_CLOEXEC);
 		if (ctx->dsa_wq_fds[i] < 0) {
 			pr_perror("DSA hot apply can't open workqueue %s", paths[i]);
@@ -1772,6 +1907,8 @@ static const char *hot_fg_compare_backend_name(enum hot_fg_compare_backend backe
 	switch (backend) {
 	case HOT_FG_COMPARE_DSA:
 		return "dsa";
+	case HOT_FG_COMPARE_DML:
+		return "dml";
 	case HOT_FG_COMPARE_MEMCMP:
 		return "memcmp";
 	case HOT_FG_COMPARE_SCALAR64:
@@ -1817,6 +1954,8 @@ static int hot_fg_select_compare_backend(struct hot_apply_ctx *ctx)
 	if (value && value[0]) {
 		if (!strcasecmp(value, "dsa"))
 			backend = HOT_FG_COMPARE_DSA;
+		else if (!strcasecmp(value, "dml"))
+			backend = HOT_FG_COMPARE_DML;
 		else if (!strcasecmp(value, "memcmp"))
 			backend = HOT_FG_COMPARE_MEMCMP;
 		else if (!strcasecmp(value, "scalar64"))
@@ -1838,6 +1977,7 @@ static int hot_fg_select_compare_backend(struct hot_apply_ctx *ctx)
 		return -1;
 	}
 	if ((backend == HOT_FG_COMPARE_DSA ||
+	     backend == HOT_FG_COMPARE_DML ||
 	     backend == HOT_FG_COMPARE_SIMD_AVX512 ||
 	     backend == HOT_FG_COMPARE_VALIDATE) && !hot_fg_cpu_supports_avx512()) {
 		pr_err("DSA fine-grained %s backend requires AVX-512F/BW/VL\n",
@@ -1875,12 +2015,21 @@ static int hot_fg_select_continuation_assist(struct hot_apply_ctx *ctx)
 {
 	const char *value = getenv("CRIU_DSA_COMPARE_ASSIST");
 
-	/* Production keeps the measured continuation-assist scheduler enabled.
-	 * The explicit false value exists only for the same-binary hardware-BATCH
-	 * ablation; it is not a runtime fallback. */
-	if (value && ctx->fg_compare_backend != HOT_FG_COMPARE_DSA) {
-		pr_err("DSA continuation-assist override requires backend=dsa\n");
+	/* Production direct IDXD keeps continuation assist enabled.  The DML
+	 * transport shares the same scheduler, but its comparison preset disables
+	 * assist explicitly so transport overhead is the only changed variable. */
+	if (value && ctx->fg_compare_backend != HOT_FG_COMPARE_DSA &&
+	    ctx->fg_compare_backend != HOT_FG_COMPARE_DML) {
+		pr_err("DSA continuation-assist override requires backend=dsa or dml\n");
 		return -1;
+	}
+	if (ctx->fg_compare_backend == HOT_FG_COMPARE_DML) {
+		if (!value) {
+			ctx->continuation_assist_enabled = false;
+			return 0;
+		}
+		return hot_fg_parse_continuation_assist(
+			&ctx->continuation_assist_enabled);
 	}
 	if (ctx->fg_compare_backend != HOT_FG_COMPARE_DSA &&
 	    ctx->fg_compare_backend != HOT_FG_COMPARE_VALIDATE) {
@@ -2490,7 +2639,9 @@ static struct hot_apply_ctx *hot_apply_alloc_ctx(int fd_type,
 	 * but it never creates PARENT/PATCH/FULL compare results. */
 	ctx->fine_grained = ctx->memstore &&
 		(ctx->fine_output || dsa_aligned_full_enabled());
+	ctx->timing = dsa_timing_enabled();
 	ctx->profile = dsa_profile_enabled();
+	ctx->transport_breakdown = dsa_transport_breakdown_enabled();
 	if (ctx->fine_output &&
 	    (hot_fg_select_compare_backend(ctx) ||
 	     hot_fg_select_continuation_assist(ctx))) {
@@ -2571,8 +2722,12 @@ int page_xfer_hot_prepare_before_freeze(unsigned long img_id)
 	if (ctx->profile)
 		phase_start_us = dsa_profile_wall_now_us();
 	if ((ctx->fg_compare_backend == HOT_FG_COMPARE_DSA ||
+	     ctx->fg_compare_backend == HOT_FG_COMPARE_DML ||
 	     ctx->fg_compare_backend == HOT_FG_COMPARE_VALIDATE) &&
 	    hot_dsa_open(ctx))
+		goto err;
+	if (ctx->fg_compare_backend == HOT_FG_COMPARE_DML &&
+	    hot_dml_compare_open(ctx))
 		goto err;
 	if (ctx->profile)
 		wq_us = dsa_profile_delta_us(phase_start_us, dsa_profile_wall_now_us());
@@ -3006,6 +3161,7 @@ static void hot_apply_abort(struct page_xfer *xfer)
 	}
 	if (!ctx->finished)
 		(void)hot_apply_write_manifest(ctx->manifest_path, "failed");
+	hot_dml_compare_close(ctx);
 	hot_dsa_close(ctx);
 	if (ctx->pipefd[0] >= 0)
 		close(ctx->pipefd[0]);
@@ -3111,8 +3267,13 @@ static int hot_apply_prepare_post_thaw(struct hot_apply_ctx *ctx)
 			return -1;
 		if (!ctx->pre_freeze_ready &&
 		    (ctx->fg_compare_backend == HOT_FG_COMPARE_DSA ||
+		     ctx->fg_compare_backend == HOT_FG_COMPARE_DML ||
 		     ctx->fg_compare_backend == HOT_FG_COMPARE_VALIDATE) &&
 		    hot_dsa_open(ctx))
+			return -1;
+		if (!ctx->pre_freeze_ready &&
+		    ctx->fg_compare_backend == HOT_FG_COMPARE_DML &&
+		    hot_dml_compare_open(ctx))
 			return -1;
 	}
 	if (!ctx->memory_next_path || !ctx->memory_next_path[0]) {
@@ -3219,7 +3380,12 @@ static void hot_profile_begin(struct hot_apply_ctx *ctx)
  */
 static void hot_service_profile_reset_generation(struct hot_apply_ctx *ctx)
 {
-	if (!ctx || !ctx->profile)
+	if (!ctx || !ctx->timing)
+		return;
+
+	ctx->profile_compare_engine_wall_us = 0;
+	ctx->profile_compare_engine_cpu_us = 0;
+	if (!ctx->profile)
 		return;
 
 	ctx->profile_started = false;
@@ -3232,8 +3398,6 @@ static void hot_service_profile_reset_generation(struct hot_apply_ctx *ctx)
 	ctx->profile_compare_wall_us = 0;
 	ctx->profile_compare_cpu_us = 0;
 	ctx->profile_sidecar_emit_us = 0;
-	ctx->profile_compare_engine_wall_us = 0;
-	ctx->profile_compare_engine_cpu_us = 0;
 	ctx->profile_output_wall_us = 0;
 	ctx->profile_output_start_us = 0;
 	ctx->profile_hot_apply_us = 0;
@@ -3255,6 +3419,28 @@ static void hot_service_profile_reset_generation(struct hot_apply_ctx *ctx)
 	ctx->profile_batch_child_nobof = 0;
 	ctx->profile_batch_max_active_outer = 0;
 	ctx->profile_batch_max_active_children = 0;
+	ctx->profile_dml_setter_calls = 0;
+	ctx->profile_dml_submit_calls = 0;
+	ctx->profile_dml_submit_retries = 0;
+	ctx->profile_dml_check_calls = 0;
+	ctx->profile_dml_completion_reads = 0;
+	ctx->profile_dml_padding_nops = 0;
+	ctx->profile_dml_prepare_groups = 0;
+	ctx->profile_dml_prepare_sample_groups = 0;
+	ctx->profile_dml_prepare_sample_tasks = 0;
+	ctx->profile_dml_prepare_sample_ns = 0;
+	ctx->profile_transport_submit_calls = 0;
+	ctx->profile_transport_submit_sample_calls = 0;
+	ctx->profile_transport_submit_sample_ns = 0;
+	ctx->profile_transport_probe_calls = 0;
+	ctx->profile_transport_probe_sample_calls = 0;
+	ctx->profile_transport_probe_sample_ns = 0;
+	ctx->profile_dml_completion_groups = 0;
+	ctx->profile_dml_completion_sample_groups = 0;
+	ctx->profile_dml_completion_sample_children = 0;
+	ctx->profile_dml_completion_sample_ns = 0;
+	ctx->profile_transport_timer_overhead_ns = ctx->transport_breakdown ?
+		hot_transport_timer_overhead_ns() : 0;
 	ctx->profile_max_completion_age_us = 0;
 	ctx->profile_memcmp_requested_bytes = 0;
 	ctx->profile_scalar64_bytes_examined = 0;
@@ -3275,6 +3461,10 @@ static void hot_service_profile_reset_generation(struct hot_apply_ctx *ctx)
 	ctx->profile_assist_max_queue_depth = 0;
 	ctx->profile_assist_while_dsa_active_pages = 0;
 	ctx->profile_assist_tail_pages = 0;
+	ctx->profile_assist_diff_ranges_found = 0;
+	ctx->profile_assist_pages_became_full = 0;
+	ctx->profile_assist_pages_finished_span = 0;
+	ctx->profile_assist_pages_returned_to_dsa = 0;
 	ctx->profile_prq_pg_requests = 0;
 	ctx->profile_prq_thread_cpu_us = 0;
 	ctx->profile_parent_pages = 0;
@@ -3298,10 +3488,19 @@ static void hot_service_profile_snapshot(
 		return;
 
 	profile->enabled = ctx->profile ? 1 : 0;
+	profile->timing_enabled = ctx->timing ? 1 : 0;
+	profile->transport_breakdown_enabled =
+		ctx->transport_breakdown ? 1 : 0;
 	profile->backend = ctx->fg_compare_backend;
 	profile->prq_profile_available = ctx->profile_prq_available ? 1 : 0;
 	profile->prq_profile_sources = ctx->profile_nr_prq_sources;
 	profile->prq_setup_errno = ctx->profile_prq_setup_errno;
+	if (ctx->timing) {
+		profile->compare_engine_wall_us =
+			ctx->profile_compare_engine_wall_us;
+		profile->compare_engine_cpu_us =
+			ctx->profile_compare_engine_cpu_us;
+	}
 	if (!ctx->profile)
 		return;
 
@@ -3309,8 +3508,6 @@ static void hot_service_profile_snapshot(
 	profile->span_build_us = ctx->profile_span_build_us;
 	profile->compare_wall_us = ctx->profile_compare_wall_us;
 	profile->compare_cpu_us = ctx->profile_compare_cpu_us;
-	profile->compare_engine_wall_us = ctx->profile_compare_engine_wall_us;
-	profile->compare_engine_cpu_us = ctx->profile_compare_engine_cpu_us;
 	profile->result_publish_us = ctx->profile_sidecar_emit_us;
 	profile->raw_pages = ctx->profile_raw_pages;
 	profile->raw_bytes = ctx->profile_raw_bytes;
@@ -3329,6 +3526,35 @@ static void hot_service_profile_snapshot(
 	profile->batch_child_nobof = ctx->profile_batch_child_nobof;
 	profile->batch_max_active_outer = ctx->profile_batch_max_active_outer;
 	profile->batch_max_active_children = ctx->profile_batch_max_active_children;
+	profile->dml_setter_calls = ctx->profile_dml_setter_calls;
+	profile->dml_submit_calls = ctx->profile_dml_submit_calls;
+	profile->dml_submit_retries = ctx->profile_dml_submit_retries;
+	profile->dml_check_calls = ctx->profile_dml_check_calls;
+	profile->dml_completion_reads = ctx->profile_dml_completion_reads;
+	profile->dml_padding_nops = ctx->profile_dml_padding_nops;
+	profile->dml_prepare_sample_groups =
+		ctx->profile_dml_prepare_sample_groups;
+	profile->dml_prepare_sample_tasks =
+		ctx->profile_dml_prepare_sample_tasks;
+	profile->dml_prepare_sample_ns = ctx->profile_dml_prepare_sample_ns;
+	profile->transport_submit_calls = ctx->profile_transport_submit_calls;
+	profile->transport_submit_sample_calls =
+		ctx->profile_transport_submit_sample_calls;
+	profile->transport_submit_sample_ns =
+		ctx->profile_transport_submit_sample_ns;
+	profile->transport_probe_calls = ctx->profile_transport_probe_calls;
+	profile->transport_probe_sample_calls =
+		ctx->profile_transport_probe_sample_calls;
+	profile->transport_probe_sample_ns =
+		ctx->profile_transport_probe_sample_ns;
+	profile->dml_completion_sample_groups =
+		ctx->profile_dml_completion_sample_groups;
+	profile->dml_completion_sample_children =
+		ctx->profile_dml_completion_sample_children;
+	profile->dml_completion_sample_ns =
+		ctx->profile_dml_completion_sample_ns;
+	profile->transport_timer_overhead_ns =
+		ctx->profile_transport_timer_overhead_ns;
 	profile->max_completion_age_us = ctx->profile_max_completion_age_us;
 	profile->parent_pages = ctx->profile_parent_pages;
 	profile->patch_pages = ctx->fg_patch_pages;
@@ -3363,6 +3589,14 @@ static void hot_service_profile_snapshot(
 	profile->assist_while_dsa_active_pages =
 		ctx->profile_assist_while_dsa_active_pages;
 	profile->assist_tail_pages = ctx->profile_assist_tail_pages;
+	profile->assist_diff_ranges_found =
+		ctx->profile_assist_diff_ranges_found;
+	profile->assist_pages_became_full =
+		ctx->profile_assist_pages_became_full;
+	profile->assist_pages_finished_span =
+		ctx->profile_assist_pages_finished_span;
+	profile->assist_pages_returned_to_dsa =
+		ctx->profile_assist_pages_returned_to_dsa;
 }
 
 static void hot_profile_emit(struct hot_apply_ctx *ctx, int ret)
@@ -3389,7 +3623,7 @@ static void hot_profile_emit(struct hot_apply_ctx *ctx, int ret)
 	dat_bytes = ctx->fg_dat_off >= 0 ? (u64)ctx->fg_dat_off : 0;
 
 	ctx->profile_emitted = true;
-	pr_info("DSA_POST_THAW_PROFILE_TIME: version=15 pages_id=%u backend=%s ret=%d total_us=%" PRIu64 " post_prepare_us=%" PRIu64 " materialize_us=%" PRIu64 " raw_index_us=%" PRIu64 " span_build_us=%" PRIu64 " compare_output_pipeline_wall_us=%" PRIu64 " compare_engine_wall_us=%" PRIu64 " compare_engine_cpu_us=%" PRIu64 " control_thread_cpu_us=%" PRIu64 " output_wall_us=%" PRIu64 " hot_apply_us=%" PRIu64 " pagemap_us=%" PRIu64 " pagemap_plan_us=%" PRIu64 " parent_validate_us=%" PRIu64 " pagemap_pack_us=%" PRIu64 " finish_us=%" PRIu64 " accounted_us=%" PRIu64 " unaccounted_us=%" PRIu64 " ledger_overrun=%u\n",
+	pr_info("DSA_POST_THAW_PROFILE_TIME: version=17 pages_id=%u backend=%s ret=%d total_us=%" PRIu64 " post_prepare_us=%" PRIu64 " materialize_us=%" PRIu64 " raw_index_us=%" PRIu64 " span_build_us=%" PRIu64 " compare_output_pipeline_wall_us=%" PRIu64 " compare_engine_wall_us=%" PRIu64 " compare_engine_cpu_us=%" PRIu64 " control_thread_cpu_us=%" PRIu64 " output_wall_us=%" PRIu64 " hot_apply_us=%" PRIu64 " pagemap_us=%" PRIu64 " pagemap_plan_us=%" PRIu64 " parent_validate_us=%" PRIu64 " pagemap_pack_us=%" PRIu64 " finish_us=%" PRIu64 " accounted_us=%" PRIu64 " unaccounted_us=%" PRIu64 " ledger_overrun=%u\n",
 		ctx->pages_id, backend, ret, total_us, ctx->profile_post_prepare_us,
 		ctx->profile_materialize_us, ctx->profile_raw_index_us,
 		ctx->profile_span_build_us, ctx->profile_compare_wall_us,
@@ -3401,7 +3635,9 @@ static void hot_profile_emit(struct hot_apply_ctx *ctx, int ret)
 		ctx->profile_parent_validate_us, ctx->profile_pagemap_pack_us,
 		ctx->profile_finish_us, accounted_us,
 		unaccounted_us, accounted_us > total_us ? 1 : 0);
-	pr_info("DSA_POST_THAW_PROFILE_COUNT: version=15 pages_id=%u backend=%s ret=%d raw_pages=%" PRIu64 " raw_bytes=%" PRIu64 " capture_runs=%" PRIu64 " spans=%" PRIu64 " span_pages=%" PRIu64 " max_span_pages=%" PRIu64 " memcmp_requested_bytes=%" PRIu64 " scalar64_bytes_examined=%" PRIu64 " simd_bytes_examined=%" PRIu64 " compare_nobof_faults=%" PRIu64 " compare_nobof_fault_source1=%" PRIu64 " compare_nobof_fault_source2=%" PRIu64 " compare_fault_handoff_remaining_bytes=%" PRIu64 " dsa_logical_progress_bytes=%" PRIu64 " normal_simd_logical_progress_bytes=%" PRIu64 " fault_simd_logical_progress_bytes=%" PRIu64 " dsa_fresh_submit_ops=%" PRIu64 " dsa_continuation_submit_ops=%" PRIu64 " dsa_submitted_bytes=%" PRIu64 " assist_enabled=%u assist_overflow_to_dsa=%" PRIu64 " assist_pages=%" PRIu64 " assist_bytes=%" PRIu64 " assist_max_queue_depth=%" PRIu64 " assist_while_dsa_active_pages=%" PRIu64 " assist_tail_pages=%" PRIu64 " batch_outer_submits=%" PRIu64 " batch_child_submits=%" PRIu64 " batch_partial_submits=%" PRIu64 " batch_single_tail_submits=%" PRIu64 " batch_outer_fail=%" PRIu64 " batch_child_nobof=%" PRIu64 " batch_max_active_outer=%" PRIu64 " batch_max_active_children=%" PRIu64 " prq_profile_available=%u prq_profile_sources=%u prq_pg_requests=%" PRIu64 " prq_thread_cpu_us=%" PRIu64 " prq_setup_errno=%d enq_retries=%" PRIu64 " poll_sweeps=%" PRIu64 " max_completion_age_us=%" PRIu64 " parent_pages=%" PRIu64 " patch_pages=%" PRIu64 " full_pages=%" PRIu64 " patch_ranges=%" PRIu64 " patch_bytes=%" PRIu64 " idx_write_calls=%" PRIu64 " idx_bytes=%" PRIu64 " dat_write_calls=%" PRIu64 " dat_writev_calls=%" PRIu64 " dat_bytes=%" PRIu64 " pagemap_records=%zu pagemap_bytes=%" PRIu64 "\n",
+	pr_info("DSA_TRANSPORT_BREAKDOWN: version=1 pages_id=%u backend=%s enabled=%u\n",
+		ctx->pages_id, backend, ctx->transport_breakdown ? 1U : 0U);
+	pr_info("DSA_POST_THAW_PROFILE_COUNT: version=17 pages_id=%u backend=%s ret=%d raw_pages=%" PRIu64 " raw_bytes=%" PRIu64 " capture_runs=%" PRIu64 " spans=%" PRIu64 " span_pages=%" PRIu64 " max_span_pages=%" PRIu64 " memcmp_requested_bytes=%" PRIu64 " scalar64_bytes_examined=%" PRIu64 " simd_bytes_examined=%" PRIu64 " compare_nobof_faults=%" PRIu64 " compare_nobof_fault_source1=%" PRIu64 " compare_nobof_fault_source2=%" PRIu64 " compare_fault_handoff_remaining_bytes=%" PRIu64 " dsa_logical_progress_bytes=%" PRIu64 " normal_simd_logical_progress_bytes=%" PRIu64 " fault_simd_logical_progress_bytes=%" PRIu64 " dsa_fresh_submit_ops=%" PRIu64 " dsa_continuation_submit_ops=%" PRIu64 " dsa_submitted_bytes=%" PRIu64 " assist_enabled=%u assist_overflow_to_dsa=%" PRIu64 " assist_pages=%" PRIu64 " assist_bytes=%" PRIu64 " assist_max_queue_depth=%" PRIu64 " assist_while_dsa_active_pages=%" PRIu64 " assist_tail_pages=%" PRIu64 " assist_diff_ranges_found=%" PRIu64 " assist_pages_became_full=%" PRIu64 " assist_pages_finished_span=%" PRIu64 " assist_pages_returned_to_dsa=%" PRIu64 " batch_outer_submits=%" PRIu64 " batch_child_submits=%" PRIu64 " batch_partial_submits=%" PRIu64 " batch_single_tail_submits=%" PRIu64 " batch_outer_fail=%" PRIu64 " batch_child_nobof=%" PRIu64 " batch_max_active_outer=%" PRIu64 " batch_max_active_children=%" PRIu64 " dml_setter_calls=%" PRIu64 " dml_submit_calls=%" PRIu64 " dml_submit_retries=%" PRIu64 " dml_check_calls=%" PRIu64 " dml_completion_reads=%" PRIu64 " dml_padding_nops=%" PRIu64 " dml_prepare_sample_groups=%" PRIu64 " dml_prepare_sample_tasks=%" PRIu64 " dml_prepare_sample_ns=%" PRIu64 " transport_submit_calls=%" PRIu64 " transport_submit_sample_calls=%" PRIu64 " transport_submit_sample_ns=%" PRIu64 " transport_probe_calls=%" PRIu64 " transport_probe_sample_calls=%" PRIu64 " transport_probe_sample_ns=%" PRIu64 " dml_completion_sample_groups=%" PRIu64 " dml_completion_sample_children=%" PRIu64 " dml_completion_sample_ns=%" PRIu64 " transport_timer_overhead_ns=%" PRIu64 " prq_profile_available=%u prq_profile_sources=%u prq_pg_requests=%" PRIu64 " prq_thread_cpu_us=%" PRIu64 " prq_setup_errno=%d enq_retries=%" PRIu64 " poll_sweeps=%" PRIu64 " max_completion_age_us=%" PRIu64 " parent_pages=%" PRIu64 " patch_pages=%" PRIu64 " full_pages=%" PRIu64 " patch_ranges=%" PRIu64 " patch_bytes=%" PRIu64 " idx_write_calls=%" PRIu64 " idx_bytes=%" PRIu64 " dat_write_calls=%" PRIu64 " dat_writev_calls=%" PRIu64 " dat_bytes=%" PRIu64 " pagemap_records=%zu pagemap_bytes=%" PRIu64 "\n",
 		ctx->pages_id, backend, ret, ctx->profile_raw_pages,
 		ctx->profile_raw_bytes, ctx->profile_capture_runs, ctx->profile_spans,
 		ctx->profile_span_pages, ctx->profile_max_span_pages,
@@ -3421,11 +3657,32 @@ static void hot_profile_emit(struct hot_apply_ctx *ctx, int ret)
 		ctx->profile_assist_overflow_to_dsa, ctx->profile_assist_pages,
 		ctx->profile_assist_bytes, ctx->profile_assist_max_queue_depth,
 		ctx->profile_assist_while_dsa_active_pages,
-		ctx->profile_assist_tail_pages, ctx->profile_batch_outer_submits,
+		ctx->profile_assist_tail_pages,
+		ctx->profile_assist_diff_ranges_found,
+		ctx->profile_assist_pages_became_full,
+		ctx->profile_assist_pages_finished_span,
+		ctx->profile_assist_pages_returned_to_dsa,
+		ctx->profile_batch_outer_submits,
 		ctx->profile_batch_child_submits, ctx->profile_batch_partial_submits,
 		ctx->profile_batch_single_tail_submits, ctx->profile_batch_outer_fail,
 		ctx->profile_batch_child_nobof, ctx->profile_batch_max_active_outer,
 		ctx->profile_batch_max_active_children,
+		ctx->profile_dml_setter_calls, ctx->profile_dml_submit_calls,
+		ctx->profile_dml_submit_retries, ctx->profile_dml_check_calls,
+		ctx->profile_dml_completion_reads, ctx->profile_dml_padding_nops,
+		ctx->profile_dml_prepare_sample_groups,
+		ctx->profile_dml_prepare_sample_tasks,
+		ctx->profile_dml_prepare_sample_ns,
+		ctx->profile_transport_submit_calls,
+		ctx->profile_transport_submit_sample_calls,
+		ctx->profile_transport_submit_sample_ns,
+		ctx->profile_transport_probe_calls,
+		ctx->profile_transport_probe_sample_calls,
+		ctx->profile_transport_probe_sample_ns,
+		ctx->profile_dml_completion_sample_groups,
+		ctx->profile_dml_completion_sample_children,
+		ctx->profile_dml_completion_sample_ns,
+		ctx->profile_transport_timer_overhead_ns,
 		ctx->profile_prq_available ? 1U : 0U, ctx->profile_nr_prq_sources,
 		ctx->profile_prq_pg_requests, ctx->profile_prq_thread_cpu_us,
 		ctx->profile_prq_setup_errno, ctx->profile_compare_enq_retries,
@@ -3435,6 +3692,18 @@ static void hot_profile_emit(struct hot_apply_ctx *ctx, int ret)
 		ctx->profile_idx_writes, idx_bytes, ctx->profile_dat_writes,
 		ctx->profile_dat_writevs, dat_bytes, ctx->nr_pagemap_plan,
 		ctx->profile_pagemap_bytes);
+}
+
+static void hot_compare_timing_emit(struct hot_apply_ctx *ctx, int ret)
+{
+	if (!ctx || !ctx->fine_output || !ctx->timing || ctx->profile ||
+	    ctx->profile_emitted)
+		return;
+	ctx->profile_emitted = true;
+	pr_info("DSA_COMPARE_TIMING: version=1 pages_id=%u backend=%s ret=%d service_enabled=0 service_mapping_warm=0 compare_engine_wall_us=%" PRIu64 " compare_engine_cpu_us=%" PRIu64 "\n",
+		ctx->pages_id, hot_fg_compare_backend_name(ctx->fg_compare_backend),
+		ret, ctx->profile_compare_engine_wall_us,
+		ctx->profile_compare_engine_cpu_us);
 }
 
 static void dsa_memory_service_profile_emit(struct page_xfer *xfer, int ret)
@@ -3448,13 +3717,22 @@ static void dsa_memory_service_profile_emit(struct page_xfer *xfer, int ret)
 	u64 ipc_compare_overhead_us;
 	u64 ipc_apply_overhead_us;
 
-	if (!xfer || !xfer->dsa_fg_service || !dsa_profile_enabled() ||
-	    !xfer->dsa_fg_profile_total_start_us)
+	if (!xfer || !xfer->dsa_fg_service || !dsa_timing_enabled())
 		return;
 	p = &xfer->dsa_fg_service_profile;
 	backend_id = p->backend <= HOT_FG_COMPARE_VALIDATE ?
 		(enum hot_fg_compare_backend)p->backend : HOT_FG_COMPARE_DSA;
 	backend = hot_fg_compare_backend_name(backend_id);
+	if (!dsa_profile_enabled()) {
+		if (dsa_aligned_full_enabled())
+			return;
+		pr_info("DSA_COMPARE_TIMING: version=1 pages_id=%u backend=%s ret=%d service_enabled=1 service_mapping_warm=%u compare_engine_wall_us=%" PRIu64 " compare_engine_cpu_us=%" PRIu64 "\n",
+			xfer->pages_id, backend, ret, p->mapping_warm,
+			p->compare_engine_wall_us, p->compare_engine_cpu_us);
+		return;
+	}
+	if (!xfer->dsa_fg_profile_total_start_us)
+		return;
 	total_us = dsa_profile_delta_us(xfer->dsa_fg_profile_total_start_us,
 					 dsa_profile_wall_now_us());
 	accounted_us = xfer->dsa_fg_profile_request_publish_us +
@@ -3471,7 +3749,7 @@ static void dsa_memory_service_profile_emit(struct page_xfer *xfer, int ret)
 		xfer->dsa_fg_profile_ipc_apply_us >= p->hot_apply_us ?
 		xfer->dsa_fg_profile_ipc_apply_us - p->hot_apply_us : 0;
 
-	pr_info("DSA_POST_THAW_PROFILE_TIME: version=15 pages_id=%u backend=%s ret=%d service_enabled=1 service_profile_enabled=%u service_mapping_warm=%u total_us=%" PRIu64 " result_request_publish_us=%" PRIu64 " ipc_compare_us=%" PRIu64 " ipc_compare_overhead_us=%" PRIu64 " service_compare_wall_us=%" PRIu64 " service_compare_cpu_us=%" PRIu64 " service_hot_reconcile_us=%" PRIu64 " raw_index_us=%" PRIu64 " span_build_us=%" PRIu64 " compare_engine_wall_us=%" PRIu64 " compare_engine_cpu_us=%" PRIu64 " service_result_publish_us=%" PRIu64 " sidecar_us=%" PRIu64 " sidecar_preflight_us=%" PRIu64 " sidecar_serialize_us=%" PRIu64 " sidecar_idx_write_us=%" PRIu64 " sidecar_dat_write_us=%" PRIu64 " pagemap_us=%" PRIu64 " finish_us=%" PRIu64 " ipc_apply_us=%" PRIu64 " ipc_apply_overhead_us=%" PRIu64 " service_hot_apply_us=%" PRIu64 " service_hot_apply_cpu_us=%" PRIu64 " service_apply_validate_us=%" PRIu64 " service_apply_materialize_us=%" PRIu64 " service_apply_store_us=%" PRIu64 " service_apply_manifest_finish_us=%" PRIu64 " service_apply_manifest_close_us=%" PRIu64 " accounted_us=%" PRIu64 " unaccounted_us=%" PRIu64 " ledger_overrun=%u\n",
+	pr_info("DSA_POST_THAW_PROFILE_TIME: version=17 pages_id=%u backend=%s ret=%d service_enabled=1 service_profile_enabled=%u service_mapping_warm=%u total_us=%" PRIu64 " result_request_publish_us=%" PRIu64 " ipc_compare_us=%" PRIu64 " ipc_compare_overhead_us=%" PRIu64 " service_compare_wall_us=%" PRIu64 " service_compare_cpu_us=%" PRIu64 " service_hot_reconcile_us=%" PRIu64 " raw_index_us=%" PRIu64 " span_build_us=%" PRIu64 " compare_engine_wall_us=%" PRIu64 " compare_engine_cpu_us=%" PRIu64 " service_result_publish_us=%" PRIu64 " sidecar_us=%" PRIu64 " sidecar_preflight_us=%" PRIu64 " sidecar_serialize_us=%" PRIu64 " sidecar_idx_write_us=%" PRIu64 " sidecar_dat_write_us=%" PRIu64 " pagemap_us=%" PRIu64 " finish_us=%" PRIu64 " ipc_apply_us=%" PRIu64 " ipc_apply_overhead_us=%" PRIu64 " service_hot_apply_us=%" PRIu64 " service_hot_apply_cpu_us=%" PRIu64 " service_apply_validate_us=%" PRIu64 " service_apply_materialize_us=%" PRIu64 " service_apply_store_us=%" PRIu64 " service_apply_manifest_finish_us=%" PRIu64 " service_apply_manifest_close_us=%" PRIu64 " accounted_us=%" PRIu64 " unaccounted_us=%" PRIu64 " ledger_overrun=%u\n",
 		xfer->pages_id, backend, ret, p->enabled, p->mapping_warm, total_us,
 		xfer->dsa_fg_profile_request_publish_us,
 		xfer->dsa_fg_profile_ipc_compare_us, ipc_compare_overhead_us,
@@ -3490,7 +3768,9 @@ static void dsa_memory_service_profile_emit(struct page_xfer *xfer, int ret)
 		xfer->dsa_fg_service_diag.apply_manifest_finish_wall_us,
 		xfer->dsa_fg_service_diag.apply_manifest_close_wall_us,
 		accounted_us, unaccounted_us, accounted_us > total_us ? 1 : 0);
-	pr_info("DSA_POST_THAW_PROFILE_COUNT: version=15 pages_id=%u backend=%s ret=%d service_enabled=1 service_profile_enabled=%u service_mapping_warm=%u raw_pages=%" PRIu64 " raw_bytes=%" PRIu64 " capture_runs=%" PRIu64 " spans=%" PRIu64 " span_pages=%" PRIu64 " max_span_pages=%" PRIu64 " memcmp_requested_bytes=%" PRIu64 " scalar64_bytes_examined=%" PRIu64 " simd_bytes_examined=%" PRIu64 " compare_nobof_faults=%" PRIu64 " compare_nobof_fault_source1=%" PRIu64 " compare_nobof_fault_source2=%" PRIu64 " compare_fault_handoff_remaining_bytes=%" PRIu64 " dsa_logical_progress_bytes=%" PRIu64 " normal_simd_logical_progress_bytes=%" PRIu64 " fault_simd_logical_progress_bytes=%" PRIu64 " dsa_fresh_submit_ops=%" PRIu64 " dsa_continuation_submit_ops=%" PRIu64 " dsa_submitted_bytes=%" PRIu64 " assist_enabled=%" PRIu64 " assist_overflow_to_dsa=%" PRIu64 " assist_pages=%" PRIu64 " assist_bytes=%" PRIu64 " assist_max_queue_depth=%" PRIu64 " assist_while_dsa_active_pages=%" PRIu64 " assist_tail_pages=%" PRIu64 " batch_outer_submits=%" PRIu64 " batch_child_submits=%" PRIu64 " batch_partial_submits=%" PRIu64 " batch_single_tail_submits=%" PRIu64 " batch_outer_fail=%" PRIu64 " batch_child_nobof=%" PRIu64 " batch_max_active_outer=%" PRIu64 " batch_max_active_children=%" PRIu64 " prq_profile_available=%u prq_profile_sources=%u prq_pg_requests=%" PRIu64 " prq_thread_cpu_us=%" PRIu64 " prq_setup_errno=%d enq_retries=%" PRIu64 " poll_sweeps=%" PRIu64 " max_completion_age_us=%" PRIu64 " parent_pages=%" PRIu64 " patch_pages=%" PRIu64 " full_pages=%" PRIu64 " patch_ranges=%" PRIu64 " patch_bytes=%" PRIu64 " idx_write_calls=%" PRIu64 " idx_bytes=%" PRIu64 " dat_write_calls=%" PRIu64 " dat_writev_calls=%" PRIu64 " dat_bytes=%" PRIu64 " idx_write_syscalls=%" PRIu64 " dat_write_syscalls=%" PRIu64 " dat_writev_syscalls=%" PRIu64 " sidecar_lseek_syscalls=%" PRIu64 " pagemap_records=%" PRIu64 " pagemap_bytes=%" PRIu64 "\n",
+	pr_info("DSA_TRANSPORT_BREAKDOWN: version=1 pages_id=%u backend=%s enabled=%u\n",
+		xfer->pages_id, backend, p->transport_breakdown_enabled);
+	pr_info("DSA_POST_THAW_PROFILE_COUNT: version=17 pages_id=%u backend=%s ret=%d service_enabled=1 service_profile_enabled=%u service_mapping_warm=%u raw_pages=%" PRIu64 " raw_bytes=%" PRIu64 " capture_runs=%" PRIu64 " spans=%" PRIu64 " span_pages=%" PRIu64 " max_span_pages=%" PRIu64 " memcmp_requested_bytes=%" PRIu64 " scalar64_bytes_examined=%" PRIu64 " simd_bytes_examined=%" PRIu64 " compare_nobof_faults=%" PRIu64 " compare_nobof_fault_source1=%" PRIu64 " compare_nobof_fault_source2=%" PRIu64 " compare_fault_handoff_remaining_bytes=%" PRIu64 " dsa_logical_progress_bytes=%" PRIu64 " normal_simd_logical_progress_bytes=%" PRIu64 " fault_simd_logical_progress_bytes=%" PRIu64 " dsa_fresh_submit_ops=%" PRIu64 " dsa_continuation_submit_ops=%" PRIu64 " dsa_submitted_bytes=%" PRIu64 " assist_enabled=%" PRIu64 " assist_overflow_to_dsa=%" PRIu64 " assist_pages=%" PRIu64 " assist_bytes=%" PRIu64 " assist_max_queue_depth=%" PRIu64 " assist_while_dsa_active_pages=%" PRIu64 " assist_tail_pages=%" PRIu64 " assist_diff_ranges_found=%" PRIu64 " assist_pages_became_full=%" PRIu64 " assist_pages_finished_span=%" PRIu64 " assist_pages_returned_to_dsa=%" PRIu64 " batch_outer_submits=%" PRIu64 " batch_child_submits=%" PRIu64 " batch_partial_submits=%" PRIu64 " batch_single_tail_submits=%" PRIu64 " batch_outer_fail=%" PRIu64 " batch_child_nobof=%" PRIu64 " batch_max_active_outer=%" PRIu64 " batch_max_active_children=%" PRIu64 " dml_setter_calls=%" PRIu64 " dml_submit_calls=%" PRIu64 " dml_submit_retries=%" PRIu64 " dml_check_calls=%" PRIu64 " dml_completion_reads=%" PRIu64 " dml_padding_nops=%" PRIu64 " dml_prepare_sample_groups=%" PRIu64 " dml_prepare_sample_tasks=%" PRIu64 " dml_prepare_sample_ns=%" PRIu64 " transport_submit_calls=%" PRIu64 " transport_submit_sample_calls=%" PRIu64 " transport_submit_sample_ns=%" PRIu64 " transport_probe_calls=%" PRIu64 " transport_probe_sample_calls=%" PRIu64 " transport_probe_sample_ns=%" PRIu64 " dml_completion_sample_groups=%" PRIu64 " dml_completion_sample_children=%" PRIu64 " dml_completion_sample_ns=%" PRIu64 " transport_timer_overhead_ns=%" PRIu64 " prq_profile_available=%u prq_profile_sources=%u prq_pg_requests=%" PRIu64 " prq_thread_cpu_us=%" PRIu64 " prq_setup_errno=%d enq_retries=%" PRIu64 " poll_sweeps=%" PRIu64 " max_completion_age_us=%" PRIu64 " parent_pages=%" PRIu64 " patch_pages=%" PRIu64 " full_pages=%" PRIu64 " patch_ranges=%" PRIu64 " patch_bytes=%" PRIu64 " idx_write_calls=%" PRIu64 " idx_bytes=%" PRIu64 " dat_write_calls=%" PRIu64 " dat_writev_calls=%" PRIu64 " dat_bytes=%" PRIu64 " idx_write_syscalls=%" PRIu64 " dat_write_syscalls=%" PRIu64 " dat_writev_syscalls=%" PRIu64 " sidecar_lseek_syscalls=%" PRIu64 " pagemap_records=%" PRIu64 " pagemap_bytes=%" PRIu64 "\n",
 		xfer->pages_id, backend, ret, p->enabled, p->mapping_warm,
 		p->raw_pages, p->raw_bytes, p->capture_runs, p->spans,
 		p->span_pages, p->max_span_pages,
@@ -3504,10 +3784,22 @@ static void dsa_memory_service_profile_emit(struct page_xfer *xfer, int ret)
 		p->assist_enabled, p->assist_overflow_to_dsa, p->assist_pages,
 		p->assist_bytes, p->assist_max_queue_depth,
 		p->assist_while_dsa_active_pages, p->assist_tail_pages,
+		p->assist_diff_ranges_found, p->assist_pages_became_full,
+		p->assist_pages_finished_span, p->assist_pages_returned_to_dsa,
 		p->batch_outer_submits, p->batch_child_submits,
 		p->batch_partial_submits, p->batch_single_tail_submits,
 		p->batch_outer_fail, p->batch_child_nobof,
 		p->batch_max_active_outer, p->batch_max_active_children,
+		p->dml_setter_calls, p->dml_submit_calls,
+		p->dml_submit_retries, p->dml_check_calls,
+		p->dml_completion_reads, p->dml_padding_nops,
+		p->dml_prepare_sample_groups, p->dml_prepare_sample_tasks,
+		p->dml_prepare_sample_ns, p->transport_submit_calls,
+		p->transport_submit_sample_calls, p->transport_submit_sample_ns,
+		p->transport_probe_calls, p->transport_probe_sample_calls,
+		p->transport_probe_sample_ns, p->dml_completion_sample_groups,
+		p->dml_completion_sample_children, p->dml_completion_sample_ns,
+		p->transport_timer_overhead_ns,
 		p->prq_profile_available, p->prq_profile_sources,
 		p->prq_pg_requests, p->prq_thread_cpu_us, p->prq_setup_errno,
 		p->enq_retries, p->poll_sweeps, p->max_completion_age_us,
@@ -5025,7 +5317,121 @@ struct hot_fg_compare_batch {
 	u64 completion_deadline_ns;
 	bool direct_single;
 	bool active;
+	void *dml_job_storage;
+	dml_job_t *dml_job;
+	void *dml_batch_buffer;
+	u32 dml_batch_buffer_size;
+	u32 dml_physical_count;
+	dml_status_t dml_terminal_status;
+	bool dml_initialized;
+	bool dml_terminal;
 };
+
+#define HOT_DML_DESCRIPTOR_BYTES 64U
+#define HOT_DML_COMPLETION_BYTES 32U
+#define HOT_DML_TASK_BYTES \
+	(HOT_DML_DESCRIPTOR_BYTES + HOT_DML_COMPLETION_BYTES)
+#define HOT_DML_BATCH_SLACK 64U
+
+_Static_assert(sizeof(struct dsa_hw_desc) == HOT_DML_DESCRIPTOR_BYTES,
+	       "DML/IDXD descriptor ABI must remain 64 bytes");
+_Static_assert(sizeof(struct dsa_completion_record) == HOT_DML_COMPLETION_BYTES,
+	       "DML/IDXD completion ABI must remain 32 bytes");
+
+static void hot_dml_compare_close(struct hot_apply_ctx *ctx)
+{
+	size_t i;
+
+	if (!ctx || !ctx->compare_batches)
+		return;
+	for (i = 0; i < HOT_DSA_COMPARE_INFLIGHT; i++) {
+		struct hot_fg_compare_batch *batch = &ctx->compare_batches[i];
+
+		if (batch->dml_initialized && batch->dml_job)
+			(void)dml_finalize_job(batch->dml_job);
+		free(batch->dml_batch_buffer);
+		free(batch->dml_job_storage);
+		batch->dml_batch_buffer = NULL;
+		batch->dml_job_storage = NULL;
+		batch->dml_job = NULL;
+		batch->dml_initialized = false;
+		batch->dml_terminal = false;
+	}
+}
+
+static int hot_dml_compare_open(struct hot_apply_ctx *ctx)
+{
+	u32 job_size = 0;
+	u32 batch_size = 0;
+	size_t i;
+
+	if (!ctx || ctx->fg_compare_backend != HOT_FG_COMPARE_DML ||
+	    ctx->dsa_wq_count <= 0)
+		return -1;
+	if (dml_get_job_size(DML_PATH_HW, &job_size) != DML_STATUS_OK ||
+	    !job_size)
+		return -1;
+	if (!ctx->compare_batches) {
+		if (posix_memalign((void **)&ctx->compare_batches, 64,
+				   HOT_DSA_COMPARE_INFLIGHT *
+					   sizeof(*ctx->compare_batches)))
+			return -1;
+		memset(ctx->compare_batches, 0,
+		       HOT_DSA_COMPARE_INFLIGHT * sizeof(*ctx->compare_batches));
+	}
+	for (i = 0; i < HOT_DSA_COMPARE_INFLIGHT; i++) {
+		struct hot_fg_compare_batch *batch = &ctx->compare_batches[i];
+		int numa = ctx->dsa_wq_numa[i % (size_t)ctx->dsa_wq_count];
+
+		batch->dml_job_storage = calloc(1, job_size);
+		if (!batch->dml_job_storage)
+			goto err;
+		batch->dml_job = batch->dml_job_storage;
+		if (dml_init_job(DML_PATH_HW, batch->dml_job) != DML_STATUS_OK)
+			goto err;
+		batch->dml_initialized = true;
+		if (dml_get_batch_size(batch->dml_job,
+				       HOT_DSA_COMPARE_BATCH_CHILDREN,
+				       &batch_size) != DML_STATUS_OK ||
+		    batch_size != HOT_DML_BATCH_SLACK +
+					  HOT_DSA_COMPARE_BATCH_CHILDREN *
+						  HOT_DML_TASK_BYTES)
+			goto err;
+		if (posix_memalign(&batch->dml_batch_buffer, 64, batch_size))
+			goto err;
+		memset(batch->dml_batch_buffer, 0, batch_size);
+		batch->dml_batch_buffer_size = batch_size;
+		batch->dml_job->destination_first_ptr = batch->dml_batch_buffer;
+		batch->dml_job->operation = DML_OP_BATCH;
+		batch->dml_job->flags = 0;
+		batch->dml_job->numa_id = (u32)numa;
+	}
+	pr_info("DSA fine-grained stock DML pool initialized slots=%u children=%u path=hw\n",
+		HOT_DSA_COMPARE_INFLIGHT, HOT_DSA_COMPARE_BATCH_CHILDREN);
+	return 0;
+err:
+	hot_dml_compare_close(ctx);
+	return -1;
+}
+
+static int hot_dml_compare_child_completion(
+	struct hot_fg_compare_batch *batch, u32 child,
+	volatile struct dsa_completion_record *completion)
+{
+	unsigned char *base;
+	unsigned char *records;
+
+	if (!batch || !batch->dml_initialized || !batch->dml_batch_buffer ||
+	    !completion || child >= batch->child_count ||
+	    batch->dml_physical_count < DML_MIN_BATCH_SIZE ||
+	    batch->dml_physical_count > HOT_DSA_COMPARE_BATCH_CHILDREN)
+		return -1;
+	base = (unsigned char *)batch->dml_batch_buffer;
+	records = base + batch->dml_physical_count * HOT_DML_DESCRIPTOR_BYTES;
+	memcpy((void *)completion, records + child * HOT_DML_COMPLETION_BYTES,
+	       sizeof(*completion));
+	return completion->status ? 0 : -1;
+}
 
 enum hot_fg_compare_span_state {
 	HOT_FG_SPAN_UNPREFAULTED = 0,
@@ -6241,6 +6647,23 @@ static int hot_fg_compare_batch_prepare_child(
 	desc->src2_addr = (u64)(unsigned long)(span->parent + span->cursor);
 	desc->xfer_size = meta->submitted_len;
 	desc->completion_addr = (u64)(unsigned long)&batch->child_comp[child];
+	if (ctx->fg_compare_backend == HOT_FG_COMPARE_DML) {
+		if (!batch->dml_initialized || !batch->dml_job ||
+		    !batch->dml_batch_buffer)
+			return -1;
+		if (!child) {
+			batch->dml_physical_count = batch->child_count < DML_MIN_BATCH_SIZE ?
+				DML_MIN_BATCH_SIZE : batch->child_count;
+			batch->dml_job->operation = DML_OP_BATCH;
+			batch->dml_job->destination_first_ptr =
+				batch->dml_batch_buffer;
+			batch->dml_job->destination_length =
+				batch->dml_physical_count * HOT_DML_TASK_BYTES +
+				HOT_DML_BATCH_SLACK;
+			batch->dml_job->flags = 0;
+			batch->dml_terminal = false;
+		}
+	}
 	span->state = HOT_FG_SPAN_ACTIVE;
 	return 0;
 }
@@ -6251,6 +6674,64 @@ static int hot_fg_compare_batch_prepare_outer(struct hot_apply_ctx *ctx,
 	if (!batch->child_count || batch->child_count > HOT_DSA_COMPARE_BATCH_CHILDREN ||
 	    !ctx->dsa_wq_count || batch->wq_idx >= (u32)ctx->dsa_wq_count)
 		return -1;
+	if (ctx->fg_compare_backend == HOT_FG_COMPARE_DML) {
+		u32 i;
+		bool sample = false;
+		u64 sample_begin = 0;
+
+		if (!batch->dml_initialized ||
+		    batch->dml_physical_count < batch->child_count ||
+		    batch->dml_physical_count > HOT_DSA_COMPARE_BATCH_CHILDREN)
+			return -1;
+		if (ctx->profile) {
+			sample = ctx->transport_breakdown &&
+				(ctx->profile_dml_prepare_groups %
+				 HOT_DML_PREPARE_SAMPLE_INTERVAL) == 0;
+			ctx->profile_dml_prepare_groups++;
+			if (sample)
+				sample_begin = hot_dsa_watchdog_now_ns();
+		}
+		for (i = 0; i < batch->child_count; i++) {
+			struct dsa_hw_desc *desc = &batch->child_desc[i];
+			dml_status_t status = dml_batch_set_compare_by_index(
+				batch->dml_job, i,
+				(u8 *)(unsigned long)desc->src_addr,
+				(u8 *)(unsigned long)desc->src2_addr,
+				desc->xfer_size, 0, 0);
+
+			if (status != DML_STATUS_OK) {
+				pr_err("DML COMPARE child prepare failed child=%u status=%u\n",
+				       i, status);
+				return -1;
+			}
+			if (ctx->profile)
+				ctx->profile_dml_setter_calls++;
+		}
+		for (i = batch->child_count; i < batch->dml_physical_count; i++) {
+			dml_status_t status = dml_batch_set_nop_by_index(
+				batch->dml_job, i, 0);
+
+			if (status != DML_STATUS_OK) {
+				pr_err("DML COMPARE padding NOP failed child=%u status=%u\n",
+				       i, status);
+				return -1;
+			}
+			if (ctx->profile)
+				ctx->profile_dml_padding_nops++;
+		}
+		if (sample) {
+			u64 sample_end = hot_dsa_watchdog_now_ns();
+
+			ctx->profile_dml_prepare_sample_groups++;
+			ctx->profile_dml_prepare_sample_tasks +=
+				batch->dml_physical_count;
+			ctx->profile_dml_prepare_sample_ns +=
+				hot_transport_sample_delta_ns(ctx, sample_begin,
+							      sample_end);
+		}
+		batch->direct_single = false;
+		return 0;
+	}
 	batch->direct_single = batch->child_count == 1;
 	if (!batch->direct_single) {
 		memset(&batch->outer_desc, 0, sizeof(batch->outer_desc));
@@ -6278,10 +6759,73 @@ static int hot_fg_compare_batch_submit_released(
 	unsigned long off;
 	const void *submitted_desc;
 	u32 i;
+	bool sample = false;
+	u64 sample_begin = 0;
 
 	if (!batch->child_count || batch->child_count > HOT_DSA_COMPARE_BATCH_CHILDREN ||
 	    batch->active || batch->wq_idx >= (u32)ctx->dsa_wq_count)
 		return -1;
+	if (ctx->profile) {
+		sample = ctx->transport_breakdown &&
+			 (ctx->profile_transport_submit_calls %
+			  HOT_TRANSPORT_SUBMIT_SAMPLE_INTERVAL) == 0;
+		if (sample)
+			sample_begin = hot_dsa_watchdog_now_ns();
+	}
+	if (ctx->fg_compare_backend == HOT_FG_COMPARE_DML) {
+		dml_status_t status = DML_STATUS_INTERNAL_ERROR;
+
+		if (!batch->dml_initialized || !batch->dml_job)
+			return -1;
+		for (retry = 0; retry < HOT_DSA_MAX_ENQ_RETRY; retry++) {
+			status = dml_submit_job(batch->dml_job);
+			if (status == DML_STATUS_OK)
+				break;
+			if (status != DML_STATUS_WORK_QUEUE_OVERFLOW_ERROR)
+				break;
+			hot_dsa_cpu_relax();
+		}
+		if (status != DML_STATUS_OK) {
+			pr_err("DML COMPARE submit failed status=%u retries=%u\n",
+			       status, retry);
+			return -1;
+		}
+		batch->submit_ns = submit_ns;
+		batch->completion_deadline_ns =
+			submit_ns + HOT_DSA_COMPLETION_TIMEOUT_NS;
+		batch->dml_terminal = false;
+		batch->active = true;
+		if (ctx->profile) {
+			if (sample) {
+				u64 sample_end = hot_dsa_watchdog_now_ns();
+
+				ctx->profile_transport_submit_sample_calls++;
+				ctx->profile_transport_submit_sample_ns +=
+					hot_transport_sample_delta_ns(
+						ctx, sample_begin, sample_end);
+			}
+			ctx->profile_transport_submit_calls++;
+			ctx->profile_dml_submit_calls++;
+			ctx->profile_dml_submit_retries += retry;
+			ctx->profile_compare_enq_retries += retry;
+			ctx->profile_batch_outer_submits++;
+			ctx->profile_batch_child_submits += batch->child_count;
+			if (batch->child_count == 1)
+				ctx->profile_batch_single_tail_submits++;
+			if (batch->child_count < HOT_DSA_COMPARE_BATCH_CHILDREN)
+				ctx->profile_batch_partial_submits++;
+			for (i = 0; i < batch->child_count; i++) {
+				ctx->fg_compare_ops++;
+				ctx->profile_dsa_submitted_bytes +=
+					batch->child[i].submitted_len;
+				if (batch->child[i].submitted_cursor)
+					ctx->profile_dsa_continuation_submit_ops++;
+				else
+					ctx->profile_dsa_fresh_submit_ops++;
+			}
+		}
+		return 0;
+	}
 	portal_mask = ((unsigned long)ctx->dsa_portals[batch->wq_idx]) & ~0xfffUL;
 	submitted_desc = batch->direct_single ?
 		(const void *)&batch->child_desc[0] : (const void *)&batch->outer_desc;
@@ -6303,6 +6847,15 @@ static int hot_fg_compare_batch_submit_released(
 	batch->completion_deadline_ns = submit_ns + HOT_DSA_COMPLETION_TIMEOUT_NS;
 	batch->active = true;
 	if (ctx->profile) {
+		if (sample) {
+			u64 sample_end = hot_dsa_watchdog_now_ns();
+
+			ctx->profile_transport_submit_sample_calls++;
+			ctx->profile_transport_submit_sample_ns +=
+				hot_transport_sample_delta_ns(ctx, sample_begin,
+							      sample_end);
+		}
+		ctx->profile_transport_submit_calls++;
 		ctx->dsa_enqcmd++;
 		ctx->profile_compare_enq_retries += retry;
 		ctx->profile_batch_child_submits += batch->child_count;
@@ -6325,14 +6878,71 @@ static int hot_fg_compare_batch_submit_released(
 	return 0;
 }
 
-static bool hot_fg_compare_batch_ready(const struct hot_fg_compare_batch *batch)
+static bool hot_fg_compare_batch_ready(struct hot_apply_ctx *ctx,
+				       struct hot_fg_compare_batch *batch)
 {
+	bool sample = false;
+	u64 sample_begin = 0;
+	bool ready;
+
 	if (!batch->active)
 		return false;
+	if (ctx->fg_compare_backend == HOT_FG_COMPARE_DML) {
+		dml_status_t status;
+
+		if (batch->dml_terminal)
+			return true;
+		if (ctx->profile) {
+			sample = ctx->transport_breakdown &&
+				 (ctx->profile_transport_probe_calls %
+				  HOT_TRANSPORT_PROBE_SAMPLE_INTERVAL) == 0;
+			if (sample)
+				sample_begin = hot_dsa_watchdog_now_ns();
+		}
+		status = dml_check_job(batch->dml_job);
+		if (ctx->profile) {
+			if (sample) {
+				u64 sample_end = hot_dsa_watchdog_now_ns();
+
+				ctx->profile_transport_probe_sample_calls++;
+				ctx->profile_transport_probe_sample_ns +=
+					hot_transport_sample_delta_ns(
+						ctx, sample_begin, sample_end);
+			}
+			ctx->profile_transport_probe_calls++;
+			ctx->profile_dml_check_calls++;
+		}
+		if (status == DML_STATUS_BEING_PROCESSED)
+			return false;
+		batch->dml_terminal_status = status;
+		batch->dml_terminal = true;
+		return true;
+	}
+	if (ctx->profile) {
+		sample = ctx->transport_breakdown &&
+			 (ctx->profile_transport_probe_calls %
+			  HOT_TRANSPORT_PROBE_SAMPLE_INTERVAL) == 0;
+		if (sample)
+			sample_begin = hot_dsa_watchdog_now_ns();
+	}
 	if (batch->direct_single)
-		return __atomic_load_n(&batch->child_comp[0].status,
-				       __ATOMIC_ACQUIRE) != 0;
-	return __atomic_load_n(&batch->outer_comp.status, __ATOMIC_ACQUIRE) != 0;
+		ready = __atomic_load_n(&batch->child_comp[0].status,
+					__ATOMIC_ACQUIRE) != 0;
+	else
+		ready = __atomic_load_n(&batch->outer_comp.status,
+					__ATOMIC_ACQUIRE) != 0;
+	if (ctx->profile) {
+		if (sample) {
+			u64 sample_end = hot_dsa_watchdog_now_ns();
+
+			ctx->profile_transport_probe_sample_calls++;
+			ctx->profile_transport_probe_sample_ns +=
+				hot_transport_sample_delta_ns(ctx, sample_begin,
+							      sample_end);
+		}
+		ctx->profile_transport_probe_calls++;
+	}
+	return ready;
 }
 
 static int hot_fg_compare_batch_harvest(
@@ -6347,9 +6957,17 @@ static int hot_fg_compare_batch_harvest(
 	bool saw_nobof = false;
 	u32 outer_code = DSA_COMP_SUCCESS;
 
-	if (!hot_fg_compare_batch_ready(batch))
+	if (!hot_fg_compare_batch_ready(ctx, batch))
 		return 0;
-	if (!batch->direct_single) {
+	if (ctx->fg_compare_backend == HOT_FG_COMPARE_DML) {
+		if (batch->dml_terminal_status != DML_STATUS_OK &&
+		    batch->dml_terminal_status != DML_STATUS_BATCH_ERROR &&
+		    batch->dml_terminal_status != DML_STATUS_PAGE_FAULT_ERROR) {
+			pr_err("DML COMPARE BATCH outer failed status=%u\n",
+			       batch->dml_terminal_status);
+			return -1;
+		}
+	} else if (!batch->direct_single) {
 		outer_code = DSA_COMP_STATUS(batch->outer_comp.status);
 		if ((outer_code != DSA_COMP_SUCCESS &&
 		     outer_code != DSA_COMP_BATCH_FAIL) ||
@@ -6359,6 +6977,39 @@ static int hot_fg_compare_batch_harvest(
 			       batch->child_count);
 			return -1;
 		}
+	}
+	if (ctx->fg_compare_backend == HOT_FG_COMPARE_DML) {
+		bool sample = false;
+		u64 sample_begin = 0;
+
+		if (ctx->profile) {
+			sample = ctx->transport_breakdown &&
+				 (ctx->profile_dml_completion_groups %
+				  HOT_DML_COMPLETION_SAMPLE_INTERVAL) == 0;
+			ctx->profile_dml_completion_groups++;
+			if (sample)
+				sample_begin = hot_dsa_watchdog_now_ns();
+		}
+		for (i = 0; i < batch->child_count; i++) {
+			if (hot_dml_compare_child_completion(
+				    batch, i, &batch->child_comp[i])) {
+				pr_err("DML COMPARE child completion missing child=%u physical=%u\n",
+				       i, batch->dml_physical_count);
+				return -1;
+			}
+		}
+		if (sample) {
+			u64 sample_end = hot_dsa_watchdog_now_ns();
+
+			ctx->profile_dml_completion_sample_groups++;
+			ctx->profile_dml_completion_sample_children +=
+				batch->child_count;
+			ctx->profile_dml_completion_sample_ns +=
+				hot_transport_sample_delta_ns(ctx, sample_begin,
+							      sample_end);
+		}
+		if (ctx->profile)
+			ctx->profile_dml_completion_reads += batch->child_count;
 	}
 
 	for (i = 0; i < batch->child_count; i++) {
@@ -6371,7 +7022,8 @@ static int hot_fg_compare_batch_harvest(
 
 		memset(&view, 0, sizeof(view));
 		view.desc = batch->child_desc[i];
-		memcpy((void *)&view.comp, (const void *)&batch->child_comp[i],
+		memcpy((void *)&view.comp,
+		       (const void *)&batch->child_comp[i],
 		       sizeof(view.comp));
 		view.span = span;
 		view.submitted_cursor = meta->submitted_cursor;
@@ -6455,7 +7107,17 @@ static int hot_fg_compare_batch_harvest(
 			}
 		}
 	}
-	if (!batch->direct_single) {
+	if (ctx->fg_compare_backend == HOT_FG_COMPARE_DML) {
+		bool outer_failed = batch->dml_terminal_status != DML_STATUS_OK;
+
+		if (outer_failed != saw_nobof) {
+			pr_err("DML COMPARE BATCH outer/child status mismatch outer=%u nobof=%u\n",
+			       batch->dml_terminal_status, saw_nobof ? 1U : 0U);
+			return -1;
+		}
+		if (ctx->profile && outer_failed)
+			ctx->profile_batch_outer_fail++;
+	} else if (!batch->direct_single) {
 		if ((outer_code == DSA_COMP_BATCH_FAIL) != saw_nobof) {
 			pr_err("DSA COMPARE BATCH outer/child status mismatch outer=%u nobof=%u\n",
 			       outer_code, saw_nobof ? 1U : 0U);
@@ -6466,17 +7128,30 @@ static int hot_fg_compare_batch_harvest(
 	}
 	batch->active = false;
 	batch->child_count = 0;
+	batch->dml_terminal = false;
 	return 1;
 }
 
+struct hot_fg_assist_profile_delta {
+	u64 diff_ranges_found;
+	bool became_full;
+	bool finished_span;
+	bool returned_to_dsa;
+};
+
 /* Finish only the current 4 KiB page of a DSA-discovered DIFFERENT chain.
- * The following page, if any, returns to the ordinary DSA ready queue. */
+ * The following page, if any, returns to the ordinary DSA ready queue.
+ * profile_delta is NULL outside profile mode, so production does not keep a
+ * per-patch ledger or read an additional clock. */
 static int hot_fg_compare_assist_current_page(
 	struct hot_apply_ctx *ctx, struct hot_fg_raw_page *pages,
 	struct hot_fg_compare_span *span, struct hot_fg_ready_queue *ready,
-	size_t *done, u64 *progress_bytes)
+	size_t *done, u64 *progress_bytes,
+	struct hot_fg_assist_profile_delta *profile_delta)
 {
 	struct hot_fg_cpu_scan_stats stats = {};
+	struct hot_fg_raw_page *page;
+	size_t page_idx;
 	u32 start;
 	u32 page_end;
 
@@ -6490,6 +7165,10 @@ static int hot_fg_compare_assist_current_page(
 	page_end = (start & ~(PAGE_SIZE - 1)) + PAGE_SIZE;
 	if (page_end > span->length)
 		return -1;
+	page_idx = span->first_page + start / PAGE_SIZE;
+	page = &pages[page_idx];
+	if (profile_delta)
+		memset(profile_delta, 0, sizeof(*profile_delta));
 	span->state = HOT_FG_SPAN_ACTIVE;
 	while (span->cursor < page_end) {
 		bool equal;
@@ -6508,6 +7187,8 @@ static int hot_fg_compare_assist_current_page(
 				return -1;
 			break;
 		}
+		if (profile_delta)
+			profile_delta->diff_ranges_found++;
 		if (hot_fg_span_record_diff(span, pages, span->cursor + diff))
 			return -1;
 	}
@@ -6520,12 +7201,17 @@ static int hot_fg_compare_assist_current_page(
 			return -1;
 		span->state = HOT_FG_SPAN_DONE;
 		(*done)++;
+		if (profile_delta)
+			profile_delta->finished_span = true;
 	} else {
 		span->state = HOT_FG_SPAN_READY;
 		if (hot_fg_ready_queue_push(ready, (size_t)(span - ready->spans)))
 			return -1;
+		if (profile_delta)
+			profile_delta->returned_to_dsa = true;
 	}
-	if (ctx->profile) {
+	if (ctx->profile && profile_delta) {
+		profile_delta->became_full = page->state == HOT_FG_RAW_FULL;
 		hot_fg_cpu_scan_stats_add(ctx, &stats);
 		ctx->profile_normal_simd_logical_progress_bytes += *progress_bytes;
 	}
@@ -6542,6 +7228,8 @@ static void hot_fg_compare_batch_timeout(
 	       " active_outer=%zu child_count=%u outer_status=%u\n",
 	       CDP_DSA_COMPLETION_TIMEOUT_EXIT, batch->wq_idx, age_us, active,
 	       batch->child_count,
+	       batch->dml_initialized ?
+		(unsigned int)batch->dml_terminal_status :
 	       batch->direct_single ?
 		(unsigned int)__atomic_load_n(&batch->child_comp[0].status,
 					 __ATOMIC_ACQUIRE) :
@@ -6651,7 +7339,7 @@ static int hot_fg_compare_hw_batch(struct hot_apply_ctx *ctx,
 
 			if (!batch->active)
 				continue;
-			if (!hot_fg_compare_batch_ready(batch)) {
+			if (!hot_fg_compare_batch_ready(ctx, batch)) {
 				if (now_ns >= batch->completion_deadline_ns)
 					hot_fg_compare_batch_timeout(batch, active_outer,
 								     now_ns);
@@ -6735,7 +7423,8 @@ static int hot_fg_compare_hw_batch(struct hot_apply_ctx *ctx,
 		if (prepared_count) {
 			/* One release fence covers every immutable descriptor prepared
 			 * during this refill group. */
-			hot_dsa_release_descriptors();
+			if (ctx->fg_compare_backend != HOT_FG_COMPARE_DML)
+				hot_dsa_release_descriptors();
 			for (i = 0; i < prepared_count; i++) {
 				struct hot_fg_compare_batch *batch =
 					&batches[prepared[i]];
@@ -6762,13 +7451,15 @@ static int hot_fg_compare_hw_batch(struct hot_apply_ctx *ctx,
 
 			while (assist_done < HOT_DSA_COMPARE_ASSIST_BURST_PAGES &&
 			       cpu_assist.nr) {
+				struct hot_fg_assist_profile_delta assist_profile;
 				size_t span_idx;
 				u64 progress_bytes = 0;
 
 				if (hot_fg_ready_queue_pop(&cpu_assist, &span_idx) ||
 				    hot_fg_compare_assist_current_page(
 					    ctx, pages, &spans[span_idx], &ready, &done,
-					    &progress_bytes))
+					    &progress_bytes,
+					    ctx->profile ? &assist_profile : NULL))
 					goto out_queue;
 				assist_done++;
 				if (ctx->profile) {
@@ -6778,6 +7469,14 @@ static int hot_fg_compare_hw_batch(struct hot_apply_ctx *ctx,
 						ctx->profile_assist_while_dsa_active_pages++;
 					else
 						ctx->profile_assist_tail_pages++;
+					ctx->profile_assist_diff_ranges_found +=
+						assist_profile.diff_ranges_found;
+					if (assist_profile.became_full)
+						ctx->profile_assist_pages_became_full++;
+					if (assist_profile.finished_span)
+						ctx->profile_assist_pages_finished_span++;
+					if (assist_profile.returned_to_dsa)
+						ctx->profile_assist_pages_returned_to_dsa++;
 				}
 			}
 			continue;
@@ -6827,6 +7526,13 @@ static int hot_fg_compare_hw_batch(struct hot_apply_ctx *ctx,
 	     ctx->profile_assist_while_dsa_active_pages +
 		     ctx->profile_assist_tail_pages !=
 		     ctx->profile_assist_pages ||
+	     ctx->profile_assist_pages_finished_span +
+		     ctx->profile_assist_pages_returned_to_dsa !=
+		     ctx->profile_assist_pages ||
+	     ctx->profile_assist_pages_became_full >
+		     ctx->profile_assist_pages ||
+	     ctx->profile_assist_diff_ranges_found <
+		     ctx->profile_assist_pages_became_full ||
 	     ctx->profile_assist_max_queue_depth >
 		     HOT_DSA_COMPARE_ASSIST_QUEUE_CAPACITY ||
 	     (!assist_enabled &&
@@ -6834,7 +7540,11 @@ static int hot_fg_compare_hw_batch(struct hot_apply_ctx *ctx,
 	       ctx->profile_assist_pages || ctx->profile_assist_bytes ||
 	       ctx->profile_assist_max_queue_depth ||
 	       ctx->profile_assist_while_dsa_active_pages ||
-	       ctx->profile_assist_tail_pages)))) {
+	       ctx->profile_assist_tail_pages ||
+	       ctx->profile_assist_diff_ranges_found ||
+	       ctx->profile_assist_pages_became_full ||
+	       ctx->profile_assist_pages_finished_span ||
+	       ctx->profile_assist_pages_returned_to_dsa)))) {
 		pr_err("DSA continuation-assist profile invariant failed spans=%zu dsa_spans=%zu fresh=%" PRIu64
 		       " continuation=%" PRIu64 " children=%" PRIu64
 		       " dsa_bytes=%" PRIu64 " assist_bytes=%" PRIu64
@@ -6845,6 +7555,84 @@ static int hot_fg_compare_hw_batch(struct hot_apply_ctx *ctx,
 		       ctx->profile_dsa_logical_progress_bytes,
 		       ctx->profile_assist_bytes,
 		       ctx->profile_fault_simd_logical_progress_bytes);
+		goto out_queue;
+	}
+	if (ctx->profile && ctx->fg_compare_backend == HOT_FG_COMPARE_DML &&
+	    (ctx->profile_dml_setter_calls != ctx->profile_batch_child_submits ||
+	     ctx->profile_dml_submit_calls != ctx->profile_batch_outer_submits ||
+	     ctx->profile_dml_completion_reads !=
+		     ctx->profile_batch_child_submits ||
+	     ctx->profile_transport_submit_calls !=
+		     ctx->profile_dml_submit_calls ||
+	     ctx->profile_transport_probe_calls != ctx->profile_dml_check_calls ||
+	     ctx->profile_dml_prepare_groups != ctx->profile_dml_submit_calls ||
+	     ctx->profile_dml_completion_groups !=
+		     ctx->profile_dml_submit_calls)) {
+		pr_err("DML COMPARE profile invariant failed setters=%" PRIu64
+		       " submits=%" PRIu64 " checks=%" PRIu64
+		       " reads=%" PRIu64 " children=%" PRIu64
+		       " outers=%" PRIu64 "\n",
+		       ctx->profile_dml_setter_calls,
+		       ctx->profile_dml_submit_calls,
+		       ctx->profile_dml_check_calls,
+		       ctx->profile_dml_completion_reads,
+		       ctx->profile_batch_child_submits,
+		       ctx->profile_batch_outer_submits);
+		goto out_queue;
+	}
+	if (ctx->profile && ctx->transport_breakdown &&
+	    ctx->fg_compare_backend == HOT_FG_COMPARE_DML &&
+	    (
+	     !ctx->profile_dml_prepare_sample_groups ||
+	     !ctx->profile_dml_prepare_sample_tasks ||
+	     ctx->profile_dml_prepare_sample_groups >
+		     ctx->profile_dml_prepare_groups ||
+	     ctx->profile_dml_prepare_sample_tasks >
+		     ctx->profile_dml_setter_calls +
+		     ctx->profile_dml_padding_nops ||
+	     !ctx->profile_transport_submit_sample_calls ||
+	     ctx->profile_transport_submit_sample_calls >
+		     ctx->profile_transport_submit_calls ||
+	     !ctx->profile_transport_probe_sample_calls ||
+	     ctx->profile_transport_probe_sample_calls >
+		     ctx->profile_transport_probe_calls ||
+	     !ctx->profile_dml_completion_sample_groups ||
+	     !ctx->profile_dml_completion_sample_children ||
+	     ctx->profile_dml_completion_sample_groups >
+		     ctx->profile_dml_completion_groups ||
+	     ctx->profile_dml_completion_sample_children >
+		     ctx->profile_dml_completion_reads)) {
+		pr_err("DML COMPARE profile invariant failed setters=%" PRIu64
+		       " submits=%" PRIu64 " checks=%" PRIu64
+		       " reads=%" PRIu64 " children=%" PRIu64
+		       " outers=%" PRIu64 " prepare_samples=%" PRIu64
+		       " submit_samples=%" PRIu64 " probe_samples=%" PRIu64
+		       " completion_samples=%" PRIu64 "\n",
+		       ctx->profile_dml_setter_calls,
+		       ctx->profile_dml_submit_calls,
+		       ctx->profile_dml_check_calls,
+		       ctx->profile_dml_completion_reads,
+		       ctx->profile_batch_child_submits,
+		       ctx->profile_batch_outer_submits,
+		       ctx->profile_dml_prepare_sample_groups,
+		       ctx->profile_transport_submit_sample_calls,
+		       ctx->profile_transport_probe_sample_calls,
+		       ctx->profile_dml_completion_sample_groups);
+		goto out_queue;
+	}
+	if (ctx->profile && !ctx->transport_breakdown &&
+	    (ctx->profile_dml_prepare_sample_groups ||
+	     ctx->profile_dml_prepare_sample_tasks ||
+	     ctx->profile_dml_prepare_sample_ns ||
+	     ctx->profile_transport_submit_sample_calls ||
+	     ctx->profile_transport_submit_sample_ns ||
+	     ctx->profile_transport_probe_sample_calls ||
+	     ctx->profile_transport_probe_sample_ns ||
+	     ctx->profile_dml_completion_sample_groups ||
+	     ctx->profile_dml_completion_sample_children ||
+	     ctx->profile_dml_completion_sample_ns ||
+	     ctx->profile_transport_timer_overhead_ns)) {
+		pr_err("COMPARE transport breakdown disabled but samples are non-zero\n");
 		goto out_queue;
 	}
 	ret = 0;
@@ -6858,7 +7646,7 @@ out_queue:
 			for (i = 0; i < HOT_DSA_COMPARE_INFLIGHT; i++) {
 				if (!batches[i].active)
 					continue;
-				if (hot_fg_compare_batch_ready(&batches[i])) {
+				if (hot_fg_compare_batch_ready(ctx, &batches[i])) {
 					batches[i].active = false;
 					batches[i].child_count = 0;
 				} else {
@@ -7211,6 +7999,7 @@ static int hot_fg_encode_raw_wavefront(struct page_xfer *xfer,
 	u64 phase_start_us = 0;
 	u64 compare_cpu_start_us = 0;
 	u64 compare_cpu_end_us = 0;
+	u64 compare_engine_start_us = 0;
 	u64 compare_engine_end_us = 0;
 	u64 compare_engine_cpu_start_us = 0;
 	u64 compare_engine_cpu_end_us = 0;
@@ -7259,6 +8048,7 @@ static int hot_fg_encode_raw_wavefront(struct page_xfer *xfer,
 		phase_start_us = dsa_profile_wall_now_us();
 	}
 	if (ctx->fg_compare_backend == HOT_FG_COMPARE_DSA ||
+	    ctx->fg_compare_backend == HOT_FG_COMPARE_DML ||
 	    ctx->fg_compare_backend == HOT_FG_COMPARE_VALIDATE) {
 		max_xfer = ctx->dsa_max_transfer_size & ~(PAGE_SIZE - 1);
 		if (max_xfer < PAGE_SIZE) {
@@ -7341,11 +8131,15 @@ static int hot_fg_encode_raw_wavefront(struct page_xfer *xfer,
 		}
 		phase_start_us = dsa_profile_wall_now_us();
 	}
-	if (ctx->profile) {
+	if (ctx->profile)
 		(void)hot_prq_profile_start(ctx);
-		phase_start_us = dsa_profile_wall_now_us();
+	if (ctx->timing) {
+		compare_engine_start_us = dsa_profile_wall_now_us();
+		compare_engine_cpu_start_us = dsa_profile_thread_now_us();
+	}
+	if (ctx->profile) {
+		phase_start_us = compare_engine_start_us;
 		compare_cpu_start_us = dsa_profile_thread_now_us();
-		compare_engine_cpu_start_us = compare_cpu_start_us;
 	}
 	if (ctx->fg_compare_backend == HOT_FG_COMPARE_VALIDATE && nr_spans) {
 		validate_pages = xmalloc(nr * sizeof(*validate_pages));
@@ -7361,6 +8155,10 @@ static int hot_fg_encode_raw_wavefront(struct page_xfer *xfer,
 			if (hot_fg_compare_hw_batch(ctx, pages, spans, nr_spans)) {
 				goto err;
 			}
+			break;
+		case HOT_FG_COMPARE_DML:
+			if (hot_fg_compare_hw_batch(ctx, pages, spans, nr_spans))
+				goto err;
 			break;
 		case HOT_FG_COMPARE_MEMCMP:
 		case HOT_FG_COMPARE_SCALAR64:
@@ -7383,11 +8181,12 @@ static int hot_fg_encode_raw_wavefront(struct page_xfer *xfer,
 			goto err;
 		}
 	}
-	if (ctx->profile) {
+	if (ctx->timing) {
 		compare_engine_end_us = dsa_profile_wall_now_us();
 		compare_engine_cpu_end_us = dsa_profile_thread_now_us();
-		(void)hot_prq_profile_stop(ctx);
 	}
+	if (ctx->profile)
+		(void)hot_prq_profile_stop(ctx);
 	for (i = 0; i < nr; i++) {
 		if (pages[i].state != HOT_FG_RAW_PARENT &&
 		    pages[i].state != HOT_FG_RAW_PATCH &&
@@ -7425,17 +8224,20 @@ static int hot_fg_encode_raw_wavefront(struct page_xfer *xfer,
 		if (hot_fg_output_drain(output))
 			goto err;
 	}
+	if (ctx->timing) {
+		ctx->profile_compare_engine_wall_us +=
+			dsa_profile_delta_us(compare_engine_start_us,
+					     compare_engine_end_us);
+		ctx->profile_compare_engine_cpu_us +=
+			dsa_profile_delta_us(compare_engine_cpu_start_us,
+					     compare_engine_cpu_end_us);
+	}
 	if (ctx->profile) {
 		compare_cpu_end_us = dsa_profile_thread_now_us();
 		ctx->profile_compare_wall_us += dsa_profile_delta_us(phase_start_us,
 							       dsa_profile_wall_now_us());
 		ctx->profile_compare_cpu_us += dsa_profile_delta_us(compare_cpu_start_us,
 							      compare_cpu_end_us);
-		ctx->profile_compare_engine_wall_us +=
-			dsa_profile_delta_us(phase_start_us, compare_engine_end_us);
-		ctx->profile_compare_engine_cpu_us +=
-			dsa_profile_delta_us(compare_engine_cpu_start_us,
-					     compare_engine_cpu_end_us);
 		if (ctx->profile_output_start_us)
 			ctx->profile_output_wall_us +=
 				dsa_profile_delta_us(ctx->profile_output_start_us,
@@ -8492,6 +9294,7 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 out:
 	dsa_memory_service_profile_emit(xfer, ret);
 	hot_profile_emit(profile_ctx, ret);
+	hot_compare_timing_emit(profile_ctx, ret);
 	page_xfer_write_profile_emit(xfer, ret);
 	return ret;
 }
@@ -9601,8 +10404,12 @@ static int dsa_ms_prepare_ctx(struct hot_apply_ctx **ctxp,
 	}
 	if (ctx->fine_output &&
 	    (ctx->fg_compare_backend == HOT_FG_COMPARE_DSA ||
+	     ctx->fg_compare_backend == HOT_FG_COMPARE_DML ||
 	     ctx->fg_compare_backend == HOT_FG_COMPARE_VALIDATE) &&
 	    hot_dsa_open(ctx))
+		goto err;
+	if (ctx->fine_output && ctx->fg_compare_backend == HOT_FG_COMPARE_DML &&
+	    hot_dml_compare_open(ctx))
 		goto err;
 	/* The service stages only hot-memory.<generation>.next.  CDP alone owns
 	 * latest.json and the durable READY commit, so generic CRIU cleanup must

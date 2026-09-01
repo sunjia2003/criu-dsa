@@ -30,6 +30,12 @@ CFLAGS			+= -iquote .
 CFLAGS			+= $(shell $(PKG_CONFIG) --cflags libnl-3.0)
 CFLAGS			+= $(CONFIG-DEFINES)
 
+# The stock-DML COMPARE ablation is linked into CRIU but initialized only when
+# CRIU_DSA_FG_COMPARE_BACKEND=dml.  Keep the library path overridable for an
+# equivalent pinned installation.
+DML_C_API_LIB		?= /usr/local/lib/libdml.a
+DML_LINK_LIBS		:= $(DML_C_API_LIB) -lstdc++ -pthread
+
 ifeq ($(GMON),1)
 	CFLAGS		+= -pg
 	GMONLDOPT	:= -pg
@@ -85,7 +91,7 @@ $(obj)/%: pie
 
 $(obj)/criu: $(PROGRAM-BUILTINS)
 	$(call msg-link, $@)
-	$(Q) $(CC) $(CFLAGS) $^ $(LDFLAGS) $(LIBS) $(WRAPFLAGS) $(GMONLDOPT) -rdynamic -o $@
+	$(Q) $(CC) $(CFLAGS) $^ $(LDFLAGS) $(LIBS) $(DML_LINK_LIBS) $(WRAPFLAGS) $(GMONLDOPT) -rdynamic -o $@
 
 UNIT-BUILTINS		+= $(obj)/util.o
 UNIT-BUILTINS		+= $(obj)/config.o

@@ -11,7 +11,7 @@
 #include <stdint.h>
 
 #define CDP_DSA_MEMORY_SERVICE_MAGIC   0x4350444dU /* "CDPM" */
-#define CDP_DSA_MEMORY_SERVICE_VERSION 20U
+#define CDP_DSA_MEMORY_SERVICE_VERSION 24U
 #define CDP_DSA_MEMORY_SERVICE_DIAG_MAGIC 0x43445044U /* "CDPD" */
 #define CDP_DSA_MEMORY_SERVICE_DIAG_VERSION 1U
 #define CDP_DSA_MS_DIAG_INVALID_OBJECT UINT64_MAX
@@ -99,6 +99,8 @@ struct cdp_dsa_memory_service_profile {
 	uint32_t enabled;
 	uint32_t backend;
 	uint32_t mapping_warm;
+	uint32_t timing_enabled;
+	uint32_t transport_breakdown_enabled;
 	uint32_t prq_profile_available;
 	uint32_t prq_profile_sources;
 	int32_t prq_setup_errno;
@@ -156,6 +158,11 @@ struct cdp_dsa_memory_service_profile {
 	uint64_t assist_max_queue_depth;
 	uint64_t assist_while_dsa_active_pages;
 	uint64_t assist_tail_pages;
+	/* Profile schema v24: page-local continuation-assist outcome ledger. */
+	uint64_t assist_diff_ranges_found;
+	uint64_t assist_pages_became_full;
+	uint64_t assist_pages_finished_span;
+	uint64_t assist_pages_returned_to_dsa;
 	uint64_t batch_outer_submits;
 	uint64_t batch_child_submits;
 	uint64_t batch_partial_submits;
@@ -164,6 +171,27 @@ struct cdp_dsa_memory_service_profile {
 	uint64_t batch_child_nobof;
 	uint64_t batch_max_active_outer;
 	uint64_t batch_max_active_children;
+	/* Profile schema v21: stock-DML transport experiment. */
+	uint64_t dml_setter_calls;
+	uint64_t dml_submit_calls;
+	uint64_t dml_submit_retries;
+	uint64_t dml_check_calls;
+	uint64_t dml_completion_reads;
+	uint64_t dml_padding_nops;
+	/* Profile schema v22: low-perturbation sampled transport breakdown. */
+	uint64_t dml_prepare_sample_groups;
+	uint64_t dml_prepare_sample_tasks;
+	uint64_t dml_prepare_sample_ns;
+	uint64_t transport_submit_calls;
+	uint64_t transport_submit_sample_calls;
+	uint64_t transport_submit_sample_ns;
+	uint64_t transport_probe_calls;
+	uint64_t transport_probe_sample_calls;
+	uint64_t transport_probe_sample_ns;
+	uint64_t dml_completion_sample_groups;
+	uint64_t dml_completion_sample_children;
+	uint64_t dml_completion_sample_ns;
+	uint64_t transport_timer_overhead_ns;
 	/* Filled by the short-lived durable writer after COMPARE_DONE. */
 	uint64_t idx_write_calls;
 	uint64_t idx_bytes;
