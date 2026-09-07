@@ -1934,8 +1934,25 @@ static inline void dsa_stream_cpu_relax(void)
 #endif
 }
 
-#define DSA_STREAM_DESC_REGION_BYTES (64U * 1024U * 1024U)
-#define DSA_STREAM_FG_META_REGION_BYTES (32U * 1024U * 1024U)
+/* u32 arena offsets cap raw capture below 4 GiB.  Keep one worst-case
+ * 16-byte descriptor per 4 KiB arena page, and reserve approximately one
+ * 88-byte fine-grained result per page.  The result tail remains tunable
+ * for smaller workloads or future layout experiments. */
+
+#define DSA_STREAM_DESC_REGION_BYTES (16U * 1024U * 1024U)
+#define DSA_STREAM_FG_META_REGION_BYTES_DEFAULT (88U * 1024U * 1024U)
+#define DSA_STREAM_FG_META_REGION_BYTES_MIN (32U * 1024U * 1024U)
+#define DSA_STREAM_FG_META_REGION_BYTES_MAX (512U * 1024U * 1024U)
+
+static u32 dsa_stream_fg_meta_region_bytes(void)
+{
+	return dsa_round_up_u32(
+		dsa_parse_env_u32("CRIU_DSA_FG_META_REGION_BYTES",
+				  DSA_STREAM_FG_META_REGION_BYTES_DEFAULT,
+				  DSA_STREAM_FG_META_REGION_BYTES_MIN,
+				  DSA_STREAM_FG_META_REGION_BYTES_MAX),
+		DSA_SHARED_DATA_ALIGN);
+}
 
 static void dsa_stream_restore_parasite_args(struct dsa_desc_scan_ctx *sc)
 {
@@ -1975,6 +1992,7 @@ static int dsa_stream_layout_init(struct dsa_desc_scan_ctx *sc)
 	u32 dio_scratch_limit = 0;
 	u32 raw_payload_limit = 0;
 	u32 desc_area_bytes;
+	u32 fg_meta_region_bytes = dsa_stream_fg_meta_region_bytes();
 	u64 vma_plan_bytes;
 	u64 vma_plan_aligned_bytes;
 	u32 i;
@@ -2006,17 +2024,17 @@ static int dsa_stream_layout_init(struct dsa_desc_scan_ctx *sc)
 		 * the metadata tail and the generation-exclusive direct-I/O scratch
 		 * immediately before it, so frozen capture can overwrite neither. */
 		if (sc->dsa_ctx->shared_buf_size <=
-				DSA_STREAM_FG_META_REGION_BYTES + DSA_DIRECT_SCRATCH_BYTES ||
+				fg_meta_region_bytes + DSA_DIRECT_SCRATCH_BYTES ||
 		    sc->dsa_ctx->shared_buf_size -
-				(DSA_STREAM_FG_META_REGION_BYTES + DSA_DIRECT_SCRATCH_BYTES) <=
+				(fg_meta_region_bytes + DSA_DIRECT_SCRATCH_BYTES) <=
 				payload_base) {
 			pr_err("DSA raw result/direct scratch does not fit shared=%zu payload_base=%u reserve=%u\n",
 			       sc->dsa_ctx->shared_buf_size, payload_base,
-			       DSA_STREAM_FG_META_REGION_BYTES + DSA_DIRECT_SCRATCH_BYTES);
+			       fg_meta_region_bytes + DSA_DIRECT_SCRATCH_BYTES);
 			return -1;
 		}
 		fg_meta_base = (u32)(sc->dsa_ctx->shared_buf_size -
-					     DSA_STREAM_FG_META_REGION_BYTES);
+					     fg_meta_region_bytes);
 		fg_meta_limit = (u32)sc->dsa_ctx->shared_buf_size;
 		dio_idx_scratch_off = fg_meta_base - DSA_DIRECT_SCRATCH_BYTES;
 		dio_dat_scratch_off =
@@ -2040,11 +2058,11 @@ static int dsa_stream_layout_init(struct dsa_desc_scan_ctx *sc)
 				 sizeof(struct dsa_fg_vma_plan_record);
 		vma_plan_aligned_bytes = round_up(vma_plan_bytes, 8U);
 		if (!sc->vma_plan_count ||
-		    vma_plan_aligned_bytes >= DSA_STREAM_FG_META_REGION_BYTES) {
+		    vma_plan_aligned_bytes >= fg_meta_region_bytes) {
 			pr_err("DSA raw capture VMA plan does not fit metadata count=%zu bytes=%llu region=%u\n",
 			       sc->vma_plan_count,
 			       (unsigned long long)vma_plan_aligned_bytes,
-			       DSA_STREAM_FG_META_REGION_BYTES);
+			       fg_meta_region_bytes);
 			return -1;
 		}
 		if (dsa_fine_grained_enabled()) {
@@ -2053,7 +2071,7 @@ static int dsa_stream_layout_init(struct dsa_desc_scan_ctx *sc)
 			u64 bounded_limit;
 
 			max_result_pages =
-				(DSA_STREAM_FG_META_REGION_BYTES -
+				(fg_meta_region_bytes -
 				 vma_plan_aligned_bytes) /
 				sizeof(struct parasite_dsa_fg_result);
 			if (desc_area_bytes / sizeof(struct dsa_dump_descriptor) <
@@ -2070,8 +2088,12 @@ static int dsa_stream_layout_init(struct dsa_desc_scan_ctx *sc)
 				return -1;
 			}
 		}
-	}
 
+		pr_info("DSA streaming raw layout: shared=%zu payload_base=%u payload_limit=%u scratch=%u fg_meta=%u\n",
+			sc->dsa_ctx->shared_buf_size, payload_base,
+			raw_payload_limit, DSA_DIRECT_SCRATCH_BYTES,
+			fg_meta_region_bytes);
+	}
 	memset(shared_u8, 0, desc_area_off);
 	sc->stream_hdr = (struct parasite_dsa_stream_hdr *)shared_u8;
 	sc->stream_slots = (struct parasite_dsa_stream_slot *)(shared_u8 + slots_off);
