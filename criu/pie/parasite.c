@@ -20,6 +20,7 @@
 #include <compel/plugins/std/syscall.h>
 #include "linux/mount.h"
 #include "parasite.h"
+#include "dsa-flow.h"
 #include "fcntl.h"
 #include "prctl.h"
 #include "common/lock.h"
@@ -82,6 +83,10 @@ static u32 dsa_raw_stream_slot_seq[DSA_STREAM_SLOT_COUNT];
 static u32 dsa_raw_stream_slot_complete[DSA_STREAM_SLOT_COUNT];
 static struct parasite_dsa_pipeline *dsa_pipeline;
 static struct dsa_pipeline_event *dsa_pipeline_events;
+static struct dsa_flow_buffer dsa_consumer_flow;
+static u32 dsa_flow_last_snapshot[6];
+static int dsa_flow_have_snapshot;
+static int dsa_flow_empty_input;
 
 #ifndef SPLICE_F_GIFT
 #define SPLICE_F_GIFT 0x08
@@ -341,6 +346,60 @@ static void dsa_pipeline_record_batch(struct dsa_raw_stream_batch *batch, u64 ob
 	if (dsa_pipeline->tail_count < DSA_PIPELINE_TAIL_COUNT)
 		dsa_pipeline->tail_count++;
 	dsa_pipeline->completed_events++;
+}
+
+static u64 dsa_flow_now_ns(void)
+{
+	struct timespec ts;
+
+	if (!dsa_consumer_flow.header)
+		return 0;
+	if (sys_clock_gettime(CLOCK_MONOTONIC, &ts)) {
+		dsa_consumer_flow.header->clock_valid = 0;
+		return 0;
+	}
+	return (u64)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+static void dsa_flow_cons_event(u32 kind, u32 seq, u32 id,
+			       u64 a, u64 b, u64 c, u64 d, u64 e)
+{
+	if (!dsa_consumer_flow.header)
+		return;
+	dsa_flow_push(&dsa_consumer_flow, dsa_flow_now_ns(), kind, seq, id, 0, a, b, c, d, e);
+}
+
+static void dsa_flow_snapshot(u32 produced, u32 accepted, u32 retired,
+			      u32 active, u32 finished, u32 blocked)
+{
+	u32 values[6] = { produced, accepted, retired, active, finished, blocked };
+	u32 i;
+	int changed = !dsa_flow_have_snapshot;
+
+	if (!dsa_consumer_flow.header)
+		return;
+	for (i = 0; i < 6; i++)
+		if (values[i] != dsa_flow_last_snapshot[i])
+			changed = 1;
+	if (!changed)
+		return;
+	for (i = 0; i < 6; i++)
+		dsa_flow_last_snapshot[i] = values[i];
+	dsa_flow_have_snapshot = 1;
+	dsa_flow_push(&dsa_consumer_flow, dsa_flow_now_ns(), DSA_FLOW_SNAPSHOT,
+		accepted, DSA_FLOW_NO_ID, finished ? 1U : 0U,
+		produced, accepted, retired, active, blocked);
+}
+
+static void dsa_flow_input_state(u32 produced, u32 accepted, u32 active, u32 finished)
+{
+	int empty = produced == accepted && !active && !finished;
+
+	if (!dsa_consumer_flow.header || empty == dsa_flow_empty_input)
+		return;
+	dsa_flow_cons_event(empty ? DSA_FLOW_EMPTY_INPUT_BEGIN : DSA_FLOW_EMPTY_INPUT_END,
+		accepted, DSA_FLOW_NO_ID, produced, active, finished, 0, 0);
+	dsa_flow_empty_input = empty;
 }
 
 static inline int dsa_path_eq(const char *a, const char *b, u32 max_len)
@@ -1461,6 +1520,8 @@ static int dsa_raw_stream_batch_prepare(
 	u64 pipeline_begin = dsa_pipeline ? dsa_pipeline->last_ns : 0;
 	u32 i;
 
+	dsa_flow_cons_event(DSA_FLOW_PREPARE_BEGIN, batch->owner_seq, batch->pipeline.id,
+		batch->child_count, dsa_copy_batch_bytes[batch_idx], 0, 0, 0);
 	if (!batch->child_count ||
 	    batch->child_count > DSA_HW_BATCH_CHILDREN || !active_wq_count ||
 	    batch->active)
@@ -1524,6 +1585,8 @@ static int dsa_raw_stream_batch_prepare(
 			batch->pipeline.prepare_end_ns = end;
 		}
 	}
+	dsa_flow_cons_event(DSA_FLOW_PREPARE_END, batch->owner_seq, batch->pipeline.id,
+		batch->child_count, bytes, batch->prepared_wq_idx, 0, 0);
 	return 0;
 }
 
@@ -1543,6 +1606,9 @@ static int dsa_raw_stream_batch_submit_released(
 		return -1;
 	pipeline_parent = dsa_pipeline_enter(DSA_PIPELINE_SUBMIT);
 	pipeline_begin = dsa_pipeline ? dsa_pipeline->last_ns : 0;
+	dsa_flow_cons_event(DSA_FLOW_SUBMIT_BEGIN, batch->owner_seq, batch->pipeline.id,
+		batch->child_count, batch->prepared_bytes, batch->prepared_wq_idx,
+		a->batch_enq_retries, a->raw_faults);
 	rc = dsa_submit_copy_desc(
 		a, batch->direct_single ? &dsa_copy_hw_descs[base] :
 		   &dsa_copy_batch_descs[batch_idx],
@@ -1559,6 +1625,9 @@ static int dsa_raw_stream_batch_submit_released(
 	}
 	if (rc)
 		return rc;
+	dsa_flow_cons_event(DSA_FLOW_SUBMIT_END, batch->owner_seq, batch->pipeline.id,
+		batch->child_count, batch->prepared_bytes, batch->prepared_wq_idx,
+		a->batch_enq_retries, a->raw_faults);
 	batch->active = 1;
 	batch->poll_count = 0;
 	a->batch_child_submits += batch->child_count;
@@ -1800,11 +1869,13 @@ static int dsa_raw_stream_accept_slot(
 	u32 payload_pos = 0;
 	u32 i, j;
 	u64 pipeline_accept = dsa_pipeline_now();
+	u64 ready_observed;
 
 	if (dsa_atomic_load_u32(&slot->state) != DSA_STREAM_SLOT_READY ||
 	    slot->seq != seq)
 		return -1;
 	__atomic_thread_fence(__ATOMIC_ACQUIRE);
+	ready_observed = dsa_flow_now_ns();
 	if (!slot->desc_count || slot->desc_count > hdr->slot_desc_cap ||
 	    slot->desc_off < hdr->desc_area_off || slot->desc_off >= hdr->payload_base ||
 	    slot->desc_count * sizeof(*input) > hdr->payload_base - slot->desc_off ||
@@ -1821,6 +1892,10 @@ static int dsa_raw_stream_accept_slot(
 			free_batch[free_count++] = i;
 	if (free_count < needed)
 		return 0;
+	if (dsa_consumer_flow.header)
+		dsa_flow_push(&dsa_consumer_flow, ready_observed, DSA_FLOW_ACCEPT, seq,
+			DSA_FLOW_NO_ID, 0, pipeline_accept, slot->desc_count,
+			slot->payload_bytes, needed, 0);
 
 	input = (struct dsa_dump_descriptor *)(shared_buf + slot->desc_off);
 	for (i = 0; i < slot->desc_count; i++) {
@@ -1892,6 +1967,8 @@ static int dsa_raw_stream_accept_slot(
 			batch_bytes += src->copy_len;
 		}
 		dsa_copy_batch_bytes[batch_idx] = batch_bytes;
+		dsa_flow_cons_event(DSA_FLOW_H_CREATE, seq, batch->pipeline.id,
+			count, batch_bytes, batch_idx, 0, 0);
 		desc_pos += count;
 	}
 
@@ -1944,6 +2021,7 @@ static int dsa_stream_consume_hw_runway(
 	u32 accepted_descs = 0;
 	u32 i;
 
+	dsa_flow_cons_event(DSA_FLOW_LOOP_BEGIN, 0, DSA_FLOW_NO_ID, 0, 0, 0, 0, 0);
 	if (dsa_pipeline) {
 		dsa_pipeline->consumer_begin_ns = dsa_pipeline_now();
 		dsa_pipeline->last_ns = dsa_pipeline->consumer_begin_ns;
@@ -1972,6 +2050,7 @@ static int dsa_stream_consume_hw_runway(
 
 	while (1) {
 		u32 produced;
+		u32 blocked = 0;
 		bool finished;
 		bool progressed = false;
 
@@ -2004,6 +2083,12 @@ static int dsa_stream_consume_hw_runway(
 			if (rc < 0)
 				goto fail;
 			if (rc == 1) {
+				/* Harvest can emit fault-recovery submissions. Keep append order
+				 * monotonic and carry the earlier READY observation separately. */
+				dsa_flow_cons_event(DSA_FLOW_COMPLETE_OBSERVED,
+					dsa_raw_stream_batches[i].owner_seq, dsa_raw_stream_batches[i].pipeline.id,
+					pipeline_observed, dsa_raw_stream_batches[i].pipeline.child_count,
+					dsa_copy_batch_bytes[i], a->raw_faults, a->batch_enq_retries);
 				dsa_pipeline_record_batch(&dsa_raw_stream_batches[i], pipeline_observed);
 				active_outer--;
 			}
@@ -2024,12 +2109,16 @@ static int dsa_stream_consume_hw_runway(
 			slot->status = 0;
 			dsa_raw_stream_slot_complete[slot_idx] = 0;
 			dsa_atomic_store_u32(&slot->state, DSA_STREAM_SLOT_DONE);
+			dsa_flow_cons_event(DSA_FLOW_RECYCLE, retire_seq, DSA_FLOW_NO_ID,
+				slot->desc_count, slot->payload_bytes, 0, 0, 0);
 			retire_seq++;
 			dsa_atomic_store_u32(&hdr->consumer_seq, retire_seq);
 			progressed = true;
 		}
 
 		produced = dsa_atomic_load_u32(&hdr->producer_seq);
+		dsa_flow_input_state(produced, accept_seq, active_outer,
+			dsa_atomic_load_u32(&hdr->finish));
 		dsa_pipeline_switch(DSA_PIPELINE_ACCEPT);
 		while (accept_seq < produced) {
 			struct parasite_dsa_stream_slot *slot =
@@ -2041,8 +2130,10 @@ static int dsa_stream_consume_hw_runway(
 
 			if (rc < 0)
 				goto fail;
-			if (!rc)
+			if (!rc) {
+				blocked = 1;
 				break;
+			}
 			accepted_descs += slot->desc_count;
 			accept_seq++;
 			progressed = true;
@@ -2067,6 +2158,8 @@ static int dsa_stream_consume_hw_runway(
 		 * and make us retire the stream one slot too early. */
 		finished = dsa_atomic_load_u32(&hdr->finish) != 0;
 		produced = dsa_atomic_load_u32(&hdr->producer_seq);
+		dsa_flow_input_state(produced, accept_seq, active_outer, finished);
+		dsa_flow_snapshot(produced, accept_seq, retire_seq, active_outer, finished, blocked);
 		if (finished && retire_seq == produced &&
 		    accept_seq == produced && !active_outer) {
 			u32 payload_head = dsa_atomic_load_u32(&hdr->payload_head);
@@ -2099,6 +2192,8 @@ static int dsa_stream_consume_hw_runway(
 				return -1;
 			}
 			a->op_ret = 0;
+			dsa_flow_cons_event(DSA_FLOW_LOOP_END, accept_seq, DSA_FLOW_NO_ID,
+				accepted_descs, a->total_copied, a->raw_faults, a->batch_enq_retries, 0);
 			if (dsa_pipeline) {
 				dsa_pipeline_switch(DSA_PIPELINE_CONTROL);
 				dsa_pipeline->consumer_end_ns = dsa_pipeline->last_ns;
@@ -2237,6 +2332,9 @@ static int parasite_dsa_dump_pages(struct parasite_dsa_dump_pages_args *a)
 	a = &local_args;
 	dsa_pipeline = NULL;
 	dsa_pipeline_events = NULL;
+	dsa_memzero(&dsa_consumer_flow, sizeof(dsa_consumer_flow));
+	dsa_flow_have_snapshot = 0;
+	dsa_flow_empty_input = 0;
 	/* Error cleanup can precede arena/trace mapping. Never inspect uninitialized
 	 * portal or FD entries if diagnostic setup fails. */
 	for (i = 0; i < DSA_DUMP_MAX_WQ; i++) {
@@ -2291,9 +2389,10 @@ static int parasite_dsa_dump_pages(struct parasite_dsa_dump_pages_args *a)
 	a->cleanup_close_us = 0;
 
 	/* Validate input parameters */
-	if (a->pipeline_trace_bytes && (!a->profile_enabled ||
-	    a->pipeline_trace_bytes > DSA_PIPELINE_TRACE_BYTES_MAX ||
-	    a->pipeline_trace_bytes % sizeof(struct dsa_pipeline_event))) {
+	if ((!a->pipeline_trace_bytes && a->pipeline_flow_bytes) ||
+	    (a->pipeline_trace_bytes && (!a->profile_enabled ||
+	    !dsa_flow_layout_valid(a->pipeline_trace_bytes, a->pipeline_flow_bytes,
+		DSA_PIPELINE_TRACE_BYTES_MAX, sizeof(struct dsa_pipeline_event))))) {
 		a->op_ret = -EINVAL;
 		goto out_copy_results;
 	}
@@ -2420,7 +2519,7 @@ static int parasite_dsa_dump_pages(struct parasite_dsa_dump_pages_args *a)
 	if (a->pipeline_trace_bytes) {
 		if (!stream_hdr || !stream_hdr->pipeline.enabled ||
 		    stream_hdr->pipeline.trace_capacity !=
-			    a->pipeline_trace_bytes / sizeof(struct dsa_pipeline_event)) {
+			    (a->pipeline_trace_bytes - a->pipeline_flow_bytes) / sizeof(struct dsa_pipeline_event)) {
 			a->op_ret = -EINVAL;
 			goto out_cleanup;
 		}
@@ -2439,6 +2538,19 @@ static int parasite_dsa_dump_pages(struct parasite_dsa_dump_pages_args *a)
 			goto out_cleanup;
 		}
 		dsa_pipeline_events = pipeline_trace_map;
+		if (a->pipeline_flow_bytes) {
+			void *flow_memory = (u8 *)pipeline_trace_map + a->pipeline_trace_bytes - a->pipeline_flow_bytes;
+
+			dsa_flow_bind(&dsa_consumer_flow, (u8 *)flow_memory + a->pipeline_flow_bytes / 2,
+				a->pipeline_flow_bytes / 2);
+			if (dsa_consumer_flow.header->magic != DSA_FLOW_MAGIC ||
+			    dsa_consumer_flow.header->role != DSA_FLOW_PARASITE) {
+				a->op_ret = -EINVAL;
+				goto out_cleanup;
+			}
+			dsa_flow_push(&dsa_consumer_flow, pipeline_rpc_begin_ns, DSA_FLOW_BEGIN,
+				0, DSA_FLOW_NO_ID, 0, 0, 0, 0, 0, 0);
+		}
 		sys_close(pipeline_trace_fd);
 		pipeline_trace_fd = -1;
 	}
@@ -2598,6 +2710,7 @@ static int parasite_dsa_dump_pages(struct parasite_dsa_dump_pages_args *a)
 			dsa_pipeline->ready_ns = dsa_pipeline_now();
 		}
 		dsa_atomic_store_u32(&stream_hdr->consumer_ready, 1);
+		dsa_flow_cons_event(DSA_FLOW_READY, 0, DSA_FLOW_NO_ID, 0, 0, 0, 0, 0);
 		if (dsa_stream_consume_hw_runway(a, shared_buf, stream_hdr,
 				       active_wq_count,
 				       active_wq_idx, active_wq_load, use_portal,
@@ -2615,6 +2728,8 @@ static int parasite_dsa_dump_pages(struct parasite_dsa_dump_pages_args *a)
 	goto out_cleanup;
 
 out_cleanup:
+	dsa_flow_cons_event(DSA_FLOW_CLEANUP_BEGIN, DSA_FLOW_NO_ID, DSA_FLOW_NO_ID, 0, 0, 0, 0, 0);
+	dsa_consumer_flow.header = NULL;
 	/* Consumer has stopped; trace pages remain mapped by Host until export. */
 	dsa_pipeline_events = NULL;
 	if ((long)pipeline_trace_map >= 0)

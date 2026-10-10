@@ -17,6 +17,7 @@
 #include "imgset.h"
 #include "parasite-syscall.h"
 #include "parasite.h"
+#include "dsa-flow.h"
 #include "crtools.h"
 #include "namespaces.h"
 #include "kerndat.h"
@@ -342,8 +343,9 @@ int parasite_dsa_dump_pages_seized(struct parasite_ctl *ctl, struct parasite_dsa
 		return -EINVAL;
 	if (!!args->pipeline_trace_bytes != (pipeline_trace_fd >= 0) ||
 	    (args->pipeline_trace_bytes && (!args->profile_enabled ||
-	     args->pipeline_trace_bytes > DSA_PIPELINE_TRACE_BYTES_MAX ||
-	     args->pipeline_trace_bytes % sizeof(struct dsa_pipeline_event))))
+	     !dsa_flow_layout_valid(args->pipeline_trace_bytes, args->pipeline_flow_bytes,
+		DSA_PIPELINE_TRACE_BYTES_MAX, sizeof(struct dsa_pipeline_event)))) ||
+	    (!args->pipeline_trace_bytes && args->pipeline_flow_bytes))
 		return -EINVAL;
 
 	if (!wq_fds) {

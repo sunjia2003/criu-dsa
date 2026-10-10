@@ -38,6 +38,7 @@ static uint64_t restore_now_us(void)
 #include "mem.h"
 #include "mman.h"
 #include "parasite-syscall.h"
+#include "dsa-flow.h"
 #include "parasite.h"
 #include "page-pipe.h"
 #include "page-xfer.h"
@@ -1240,6 +1241,8 @@ struct dsa_pipeline_trace_ctx {
 	int fd, pid;
 	void *buf;
 	size_t size;
+	u32 software_size, flow_size;
+	struct dsa_flow_buffer host_flow, parasite_flow;
 	bool ready, exported;
 	struct dsa_pipeline_trace_file header;
 	void *host_buf;
@@ -1259,13 +1262,24 @@ static struct dsa_pipeline_trace_ctx *dsa_pipeline_trace_alloc(void)
 	u32 host_size = dsa_parse_env_u32("CRIU_DSA_HOST_TRACE_BYTES",
 				 DSA_HOST_TRACE_BYTES_DEFAULT, 4096U,
 				 DSA_HOST_TRACE_BYTES_MAX);
+	u32 flow_size = dsa_parse_env_u32("CRIU_DSA_FLOW_TRACE_BYTES",
+				 DSA_FLOW_BYTES_DEFAULT, 4096U, DSA_FLOW_BYTES_MAX);
+	const char *flow_enabled = getenv("CRIU_DSA_FLOW_TRACE");
+	u32 software_size;
 
 	size -= size % sizeof(struct dsa_pipeline_event);
+	software_size = size;
+	if (flow_enabled && !strcmp(flow_enabled, "0"))
+		flow_size = 0;
+	flow_size -= flow_size % (2U * sizeof(struct dsa_flow_event));
+	size += flow_size;
 	host_size -= host_size % sizeof(struct dsa_pipeline_event);
 	trace = xzalloc(sizeof(*trace));
 	if (!trace)
 		return NULL;
 	trace->size = size;
+	trace->software_size = software_size;
+	trace->flow_size = flow_size;
 	trace->buf = MAP_FAILED;
 	trace->host_buf = MAP_FAILED;
 	trace->host_size = host_size;
@@ -1279,6 +1293,18 @@ static struct dsa_pipeline_trace_ctx *dsa_pipeline_trace_alloc(void)
 	if (trace->buf == MAP_FAILED) {
 		pr_perror("DSA pipeline trace mmap failed");
 		goto fail;
+	}
+	if (flow_size) {
+		dsa_flow_bind(&trace->host_flow, (u8 *)trace->buf + software_size, flow_size / 2);
+		dsa_flow_bind(&trace->parasite_flow,
+			(u8 *)trace->buf + software_size + flow_size / 2, flow_size / 2);
+		trace->host_flow.header->magic = trace->parasite_flow.header->magic = DSA_FLOW_MAGIC;
+		trace->host_flow.header->version = trace->parasite_flow.header->version = DSA_FLOW_VERSION;
+		trace->host_flow.header->header_size = trace->parasite_flow.header->header_size = sizeof(struct dsa_flow_header);
+		trace->host_flow.header->event_size = trace->parasite_flow.header->event_size = sizeof(struct dsa_flow_event);
+		trace->host_flow.header->clock_valid = trace->parasite_flow.header->clock_valid = 1;
+		trace->host_flow.header->role = DSA_FLOW_HOST;
+		trace->parasite_flow.header->role = DSA_FLOW_PARASITE;
 	}
 	/* Host-only and independent of both the consumer trace and DSA arena.
 	 * Populate before freeze for the first process, as with the consumer. */
@@ -1320,14 +1346,24 @@ static struct dsa_pipeline_trace_ctx *dsa_pipeline_trace_acquire(int pid)
 		pr_info("DSA pipeline trace: allocating additional process buffer while frozen pid=%d\n", pid);
 		trace = dsa_pipeline_trace_alloc();
 	}
-	if (trace)
+	if (trace) {
 		trace->pid = pid;
+		if (trace->host_flow.header) {
+			struct timespec ts;
+			u64 ns = 0;
+
+			trace->host_flow.header->pid = trace->parasite_flow.header->pid = pid;
+			if (!clock_gettime(CLOCK_MONOTONIC, &ts))
+				ns = (u64)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+			dsa_flow_push(&trace->host_flow, ns, DSA_FLOW_BEGIN, 0, DSA_FLOW_NO_ID, 0, 0, 0, 0, 0, 0);
+		}
+	}
 	return trace;
 }
 
 static void dsa_trace_write_file(int pid, const char *prefix, const char *marker,
 				const void *header, size_t header_size, const void *buf,
-				u64 count, u64 dropped, u32 flags)
+				u64 count, u64 dropped, u32 flags, size_t event_size)
 {
 	char path[PATH_MAX];
 	FILE *file;
@@ -1352,7 +1388,7 @@ static void dsa_trace_write_file(int pid, const char *prefix, const char *marker
 		return;
 	}
 	written = fwrite(header, header_size, 1, file) == 1 &&
-		  fwrite(buf, sizeof(struct dsa_pipeline_event), count, file) == count;
+		  fwrite(buf, event_size, count, file) == count;
 	if (fclose(file))
 		written = false;
 	if (!written) {
@@ -1375,11 +1411,26 @@ void dsa_pipeline_trace_write_after_thaw(void)
 		if (trace->ready)
 			dsa_trace_write_file(trace->pid, "dsa-pipeline", "DSA_PIPELINE_TRACE_FILE",
 				&trace->header, sizeof(trace->header), trace->buf,
-				trace->header.event_count, trace->header.dropped, trace->header.flags);
+				trace->header.event_count, trace->header.dropped, trace->header.flags,
+				sizeof(struct dsa_pipeline_event));
 		if (trace->host_ready)
 			dsa_trace_write_file(trace->pid, "dsa-host-pipeline", "DSA_HOST_TRACE_FILE",
 				&trace->host_header, sizeof(trace->host_header), trace->host_buf,
-				trace->host_header.event_count, trace->host_header.dropped, trace->host_header.flags);
+				trace->host_header.event_count, trace->host_header.dropped, trace->host_header.flags,
+				sizeof(struct dsa_pipeline_event));
+		if (trace->host_flow.header) {
+			struct dsa_flow_buffer *buffers[] = { &trace->host_flow, &trace->parasite_flow };
+			const char *prefixes[] = { "dsa-host-flow", "dsa-parasite-flow" };
+			unsigned int i;
+
+			for (i = 0; i < ARRAY_SIZE(buffers); i++) {
+				struct dsa_flow_header *h = buffers[i]->header;
+
+				dsa_trace_write_file(trace->pid, prefixes[i], "DSA_FLOW_TRACE_FILE",
+					h, sizeof(*h), buffers[i]->events, h->event_count, h->dropped,
+					h->flags, sizeof(struct dsa_flow_event));
+			}
+		}
 	}
 }
 
@@ -2145,6 +2196,20 @@ struct dsa_desc_scan_ctx {
 	size_t vma_plan_count;
 };
 
+static void dsa_flow_host_event(struct dsa_desc_scan_ctx *sc, u32 kind, u32 seq,
+			       u64 a, u64 b, u64 c)
+{
+	struct dsa_pipeline_trace_ctx *trace = sc->dsa_ctx->pipeline_trace;
+	struct timespec ts;
+	u64 ns = 0;
+
+	if (!trace || !trace->host_flow.header)
+		return;
+	if (!clock_gettime(CLOCK_MONOTONIC, &ts))
+		ns = (u64)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+	dsa_flow_push(&trace->host_flow, ns, kind, seq, DSA_FLOW_NO_ID, 0, a, b, c, 0, 0);
+}
+
 static u64 dsa_scan_detail_now(struct dsa_scan_detail *detail)
 {
 	struct timespec ts;
@@ -2527,7 +2592,7 @@ static int dsa_stream_layout_init(struct dsa_desc_scan_ctx *sc)
 	sc->stream_hdr->pipeline.enabled = sc->scan_profile ? 1U : 0U;
 	if (sc->scan_profile && sc->dsa_ctx->pipeline_trace)
 		sc->stream_hdr->pipeline.trace_capacity =
-			sc->dsa_ctx->pipeline_trace->size / sizeof(struct dsa_pipeline_event);
+			sc->dsa_ctx->pipeline_trace->software_size / sizeof(struct dsa_pipeline_event);
 	sc->stream_hdr->payload_limit = raw_fg_capture ? raw_payload_limit :
 		sc->dsa_ctx->shared_buf_size;
 	dsa_shared_store_u32(&sc->stream_hdr->payload_head, payload_base);
@@ -2562,6 +2627,8 @@ static int dsa_stream_layout_init(struct dsa_desc_scan_ctx *sc)
 	sc->rpc_args.profile_enabled = sc->scan_profile ? 1 : 0;
 	sc->rpc_args.pipeline_trace_bytes = sc->scan_profile && sc->dsa_ctx->pipeline_trace ?
 		sc->dsa_ctx->pipeline_trace->size : 0;
+	sc->rpc_args.pipeline_flow_bytes = sc->scan_profile && sc->dsa_ctx->pipeline_trace ?
+		sc->dsa_ctx->pipeline_trace->flow_size : 0;
 
 	for (j = 0; j < (unsigned int)sc->dsa_ctx->wq_count; j++) {
 		size_t path_len;
@@ -2588,6 +2655,7 @@ static int dsa_stream_start_rpc(struct dsa_desc_scan_ctx *sc)
 	}
 	sc->rpc_started = true;
 	sc->dsa_ctx->shared_fds_sent = true;
+	dsa_flow_host_event(sc, DSA_FLOW_JOIN_BEGIN, DSA_FLOW_NO_ID, 1, 0, 0);
 
 	wait_start = dsa_wall_now_us();
 	while (!dsa_shared_load_u32(&sc->stream_hdr->consumer_ready)) {
@@ -2607,6 +2675,7 @@ static int dsa_stream_start_rpc(struct dsa_desc_scan_ctx *sc)
 		dsa_stream_cpu_relax();
 	}
 
+	dsa_flow_host_event(sc, DSA_FLOW_READY, DSA_FLOW_NO_ID, 0, 0, 0);
 	return 0;
 }
 
@@ -2617,6 +2686,7 @@ static int dsa_stream_join_rpc(struct dsa_desc_scan_ctx *sc)
 	if (!sc->rpc_started)
 		return 0;
 
+	dsa_flow_host_event(sc, DSA_FLOW_JOIN_BEGIN, DSA_FLOW_NO_ID, 2, 0, 0);
 	wait_start = dsa_wall_now_us();
 	if (pthread_join(sc->rpc_tid, NULL)) {
 		pr_err("DSA strict: can't join streaming RPC thread\n");
@@ -2624,6 +2694,7 @@ static int dsa_stream_join_rpc(struct dsa_desc_scan_ctx *sc)
 	}
 	sc->finish_wait_us += dsa_wall_delta_us(wait_start, dsa_wall_now_us());
 	sc->rpc_started = false;
+	dsa_flow_host_event(sc, DSA_FLOW_JOIN_END, DSA_FLOW_NO_ID, 2, 0, 0);
 
 	__atomic_thread_fence(__ATOMIC_ACQUIRE);
 	if (sc->stream_hdr) {
@@ -2732,9 +2803,10 @@ static int dsa_stream_wait_slot(struct dsa_desc_scan_ctx *sc, u32 slot_idx)
 			       slot_idx, state, sc->rpc_ret, sc->rpc_args.op_ret);
 			return -1;
 		}
-		if (!wait_start)
+		if (!wait_start) {
 			wait_start = dsa_wall_now_us();
-		else if (dsa_wall_delta_us(wait_start, dsa_wall_now_us()) >
+			dsa_flow_host_event(sc, DSA_FLOW_WAIT_SLOT_BEGIN, sc->produced_slots, slot_idx, state, slot->seq);
+		} else if (dsa_wall_delta_us(wait_start, dsa_wall_now_us()) >
 			 DSA_STREAM_WAIT_SLOT_TIMEOUT_US) {
 			pr_err("DSA streaming wait slot timeout slot=%u state=%u seq=%u produced=%u producer_seq=%u consumer_seq=%u finish=%u error=%d payload_head=%u\n",
 			       slot_idx, state, slot->seq, sc->produced_slots,
@@ -2750,9 +2822,11 @@ static int dsa_stream_wait_slot(struct dsa_desc_scan_ctx *sc, u32 slot_idx)
 		dsa_stream_cpu_relax();
 	}
 
-	if (wait_start)
+	if (wait_start) {
 		sc->producer_wait_slot_us += dsa_wall_delta_us(wait_start,
 							       dsa_wall_now_us());
+		dsa_flow_host_event(sc, DSA_FLOW_WAIT_SLOT_END, sc->produced_slots, slot_idx, 0, 0);
+	}
 	return 0;
 }
 
@@ -2876,12 +2950,16 @@ static int dsa_stream_flush_slot(struct dsa_desc_scan_ctx *sc)
 	slot->status = 0;
 
 
+	dsa_flow_host_event(sc, DSA_FLOW_PUBLISH_PRE, sc->produced_slots,
+			sc->desc_count, desc_sum, sc->slot_payload_off);
 	__atomic_thread_fence(__ATOMIC_RELEASE);
 	dsa_shared_store_u32(&slot->state, DSA_STREAM_SLOT_READY);
 	sc->desc_head = desc_off + sc->desc_count *
 		sizeof(struct dsa_dump_descriptor);
 	sc->produced_slots++;
 	dsa_shared_store_u32(&sc->stream_hdr->producer_seq, sc->produced_slots);
+	dsa_flow_host_event(sc, DSA_FLOW_PUBLISH_POST, sc->produced_slots - 1,
+			sc->desc_count, desc_sum, sc->slot_payload_off);
 	sc->current_slot = sc->produced_slots % DSA_STREAM_SLOT_COUNT;
 	dsa_desc_scan_reset_batch(sc);
 	dsa_scan_detail_switch(sc, DSA_SCAN_FLUSH_CONTROL);
@@ -2926,6 +3004,8 @@ static int dsa_desc_scan_batch_append(struct dsa_desc_scan_ctx *sc,
 	if (sc->scan_profile)
 		t0 = dsa_wall_now_us();
 	slot_desc = dsa_stream_slot_desc(sc, sc->current_slot);
+	if (!sc->desc_count)
+		dsa_flow_host_event(sc, DSA_FLOW_FIRST_TASK, sc->produced_slots, src_addr, copy_len, sc->payload_head);
 	if (sc->desc_count > 0) {
 		u64 prev_src = slot_desc[sc->desc_count - 1].src_addr;
 		u32 prev_len = slot_desc[sc->desc_count - 1].copy_len;
@@ -3046,10 +3126,27 @@ static int dsa_stream_finish(struct dsa_desc_scan_ctx *sc)
 		return -1;
 
 	sc->stream_hdr->base.data_bytes = sc->payload_head - sc->payload_base;
+	dsa_flow_host_event(sc, DSA_FLOW_FINISH_PRE, sc->produced_slots, sc->stream_bytes, sc->stream_descs, 0);
 	dsa_shared_store_u32(&sc->stream_hdr->finish, 1);
+	dsa_flow_host_event(sc, DSA_FLOW_FINISH_POST, sc->produced_slots, sc->stream_bytes, sc->stream_descs, 0);
 
 	if (dsa_stream_join_rpc(sc))
 		return -1;
+	dsa_flow_host_event(sc, DSA_FLOW_END, sc->produced_slots, sc->stream_bytes, sc->stream_descs, 0);
+	if (sc->dsa_ctx->pipeline_trace && sc->dsa_ctx->pipeline_trace->host_flow.header) {
+		struct dsa_pipeline_trace_ctx *trace = sc->dsa_ctx->pipeline_trace;
+		struct dsa_flow_header *host = trace->host_flow.header;
+		struct dsa_flow_header *consumer = trace->parasite_flow.header;
+		u64 end = sc->stream_hdr->pipeline.rpc_end_ns;
+
+		/* Actual post-cleanup Parasite clock, transported in the existing RPC ledger. */
+		if (!end || end < consumer->end_ns || !sc->stream_hdr->pipeline.clock_valid)
+			consumer->clock_valid = 0;
+		else
+			consumer->end_ns = end;
+		host->flags = host->clock_valid && !host->dropped && host->event_count ? DSA_FLOW_COMPLETE : 0;
+		consumer->flags = consumer->clock_valid && !consumer->dropped && consumer->event_count ? DSA_FLOW_COMPLETE : 0;
+	}
 	dsa_pipeline_emit(sc);
 	dsa_scan_detail_emit(sc);
 

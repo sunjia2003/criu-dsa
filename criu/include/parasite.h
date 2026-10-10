@@ -513,6 +513,7 @@ struct parasite_dsa_dump_pages_args {
 	u32 raw_full_prefault;	/* Initial full generation: prefault every capture source page */
 	u32 profile_enabled;	/* Collect optional aggregate timing */
 	u32 pipeline_trace_bytes; /* Full-only separate memfd, never raw-arena payload */
+	u32 pipeline_flow_bytes; /* Two single-writer event buffers at the memfd tail */
 	char wq_paths[DSA_DUMP_MAX_WQ][64];  /* WQ paths or empty if using FD */
 
 	/* Output from PARASITE */
