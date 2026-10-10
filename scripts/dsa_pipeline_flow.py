@@ -207,11 +207,22 @@ def correlate(host, parasite, dump_log=None):
         lines = [line for line in text.splitlines() if 'DSA_MEMDUMP_DETAIL:' in line]
         require(len(lines) == 1, 'Expected exactly one stream detail log')
         values = dict((key, int(value)) for key, value in re.findall(r'(\w+)=(\d+)', lines[0]))
+        submitted = [phase for group in groups.values() for phase in group['phases']
+                     if phase['phase'] == 'submit']
+        outer_submits = sum(phase['children'] > 1 for phase in submitted)
+        single_submits = len(submitted)-outer_submits
+        outer_success = sum(next(phase for phase in reversed(group['phases'])
+                                 if phase['phase'] == 'submit')['children'] > 1 for group in groups.values())
         require(values.get('stream_payload_bytes') == total_bytes and
                 values.get('stream_desc_count') == total_desc and
                 values.get('stream_flush_count') == len(slots) and
-                values.get('batch_outer_submits') == result['submit_attempts'] and
-                values.get('batch_outer_success') == len(groups), 'Flow and native stream ledger differ')
+                values.get('batch_outer_submits') == outer_submits and
+                values.get('batch_single_tail_submits') == single_submits and
+                values.get('batch_outer_success') == outer_success and
+                values.get('batch_outer_fail') == outer_submits-outer_success and
+                values.get('batch_child_submits') == sum(phase['children'] for phase in submitted) and
+                values.get('batch_child_success') == total_desc,
+                'Flow and native stream ledger differ')
         result['dump_log_verified'] = True
     return result
 

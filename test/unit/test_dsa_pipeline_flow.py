@@ -151,6 +151,26 @@ int main(void) {
                         '-I'+str(ROOT/'criu/include'), str(source), '-o', str(binary)], check=True)
         subprocess.run([str(binary)], check=True)
 
+    def test_native_batch_counters_exclude_direct_single_requests(self):
+        for row in self.host:
+            if row['kind'] in ('publish_pre', 'publish_post'):
+                row['a'] = 1
+            if row['kind'] in ('finish_pre', 'finish_post'):
+                row['b'] = 1
+        for row in self.parasite:
+            if row['kind'] == 'accept': row['b'] = 1
+            if row['kind'] in ('h_create', 'prepare_begin', 'prepare_end', 'submit_begin', 'submit_end', 'recycle'):
+                row['a'] = 1
+            if row['kind'] == 'complete_observed': row['b'] = 1
+            if row['kind'] == 'loop_end': row['a'] = 1
+        log = self.root/'dump.log'
+        log.write_text('DSA_MEMDUMP_DETAIL: stream_payload_bytes=8192 stream_desc_count=1 '
+                       'stream_flush_count=1 batch_outer_submits=0 batch_single_tail_submits=1 '
+                       'batch_outer_success=0 batch_outer_fail=0 batch_child_submits=1 batch_child_success=1\n')
+        result = reader.correlate(reader.load(self.write(1, self.host)),
+                                  reader.load(self.write(2, self.parasite)), log)
+        self.assertTrue(result['dump_log_verified'])
+
 
 if __name__ == '__main__':
     unittest.main()
