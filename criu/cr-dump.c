@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <string.h>
+#include <time.h>
 
 #include <fcntl.h>
 
@@ -1578,6 +1579,13 @@ struct frozen_timeline {
 	u64 start_us;
 	u64 last_us;
 	u64 phase_us[FROZEN_PHASE_NR];
+	bool pipeline_enabled, pipeline_valid;
+	u32 pipeline_count;
+	u64 pipeline_last_ns;
+	struct {
+		int phase;
+		u64 begin_ns, end_ns;
+	} pipeline[64];
 };
 
 struct frozen_timeline_record {
@@ -1604,14 +1612,53 @@ static bool frozen_timeline_dsa_mode(void)
 	return env && atoi(env) > 0;
 }
 
+static u64 frozen_pipeline_now_ns(void)
+{
+	struct timespec ts;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &ts)) {
+		frozen_tl.pipeline_valid = false;
+		return 0;
+	}
+	return (u64)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+static void frozen_pipeline_record(void)
+{
+	u64 now;
+	u32 index;
+
+	if (!frozen_tl.pipeline_enabled)
+		return;
+	now = frozen_pipeline_now_ns();
+	index = frozen_tl.pipeline_count;
+	if (index >= ARRAY_SIZE(frozen_tl.pipeline)) {
+		frozen_tl.pipeline_valid = false;
+		return;
+	}
+	if (!frozen_tl.pipeline_last_ns || now < frozen_tl.pipeline_last_ns)
+		frozen_tl.pipeline_valid = false;
+	frozen_tl.pipeline[index].phase = frozen_tl.phase;
+	frozen_tl.pipeline[index].begin_ns = frozen_tl.pipeline_last_ns;
+	frozen_tl.pipeline[index].end_ns = now;
+	frozen_tl.pipeline_count++;
+	frozen_tl.pipeline_last_ns = now;
+}
+
 void frozen_timeline_begin_after_freeze(void)
 {
+	const char *pipeline_env = getenv("CRIU_DSA_SCAN_PROFILE");
+
 	memset(&frozen_tl, 0, sizeof(frozen_tl));
 	frozen_detail_reset();
 	frozen_tl.active = true;
 	frozen_tl.phase = FROZEN_PHASE_POST_FREEZE_PREP;
 	frozen_tl.start_us = dump_wall_now_us();
 	frozen_tl.last_us = frozen_tl.start_us;
+	frozen_tl.pipeline_enabled = frozen_timeline_dsa_mode() && pipeline_env && atoi(pipeline_env) > 0;
+	frozen_tl.pipeline_valid = true;
+	if (frozen_tl.pipeline_enabled)
+		frozen_tl.pipeline_last_ns = frozen_pipeline_now_ns();
 }
 
 static void frozen_timeline_switch(int phase)
@@ -1623,6 +1670,7 @@ static void frozen_timeline_switch(int phase)
 		return;
 
 	now = dump_wall_now_us();
+	frozen_pipeline_record();
 	if (frozen_tl.phase >= 0 && frozen_tl.phase < FROZEN_PHASE_NR)
 		frozen_tl.phase_us[frozen_tl.phase] +=
 			dump_wall_delta_us(frozen_tl.last_us, now);
@@ -1643,6 +1691,7 @@ static void frozen_timeline_finish(int ret)
 		return;
 
 	now = dump_wall_now_us();
+	frozen_pipeline_record();
 	if (frozen_tl.phase >= 0 && frozen_tl.phase < FROZEN_PHASE_NR)
 		frozen_tl.phase_us[frozen_tl.phase] +=
 			dump_wall_delta_us(frozen_tl.last_us, now);
@@ -1662,6 +1711,13 @@ static void frozen_timeline_finish(int ret)
 	       sizeof(frozen_timeline_last.phase_us));
 	frozen_timeline_last.accounted_us = accounted_us;
 	frozen_timeline_last.gap_us = gap_us;
+	if (frozen_tl.pipeline_enabled) {
+		for (i = 0; i < frozen_tl.pipeline_count; i++)
+			pr_info("DSA_PIPELINE_FREEZE: version=1 clock_valid=%u phase=%d start_ns=%llu end_ns=%llu\n",
+				frozen_tl.pipeline_valid ? 1U : 0U, frozen_tl.pipeline[i].phase,
+				(unsigned long long)frozen_tl.pipeline[i].begin_ns,
+				(unsigned long long)frozen_tl.pipeline[i].end_ns);
+	}
 
 	frozen_tl.active = false;
 }

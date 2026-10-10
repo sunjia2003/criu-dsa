@@ -7,6 +7,7 @@
 #include <sys/ioctl.h>
 #include <sys/uio.h>
 #include <sys/time.h>
+#include <time.h>
 #include <linux/idxd.h>
 #include <linux/memfd.h>
 #include <linux/mman.h>
@@ -72,12 +73,14 @@ struct dsa_raw_stream_batch {
 	u32 active;
 	u32 poll_count;
 	u64 prepared_bytes;
+	struct parasite_dsa_pipeline_batch pipeline;
 };
 
 static struct dsa_raw_stream_batch dsa_raw_stream_batches[DSA_HW_BATCH_OUTER_DEPTH];
 static u32 dsa_raw_stream_slot_batches[DSA_STREAM_SLOT_COUNT];
 static u32 dsa_raw_stream_slot_seq[DSA_STREAM_SLOT_COUNT];
 static u32 dsa_raw_stream_slot_complete[DSA_STREAM_SLOT_COUNT];
+static struct parasite_dsa_pipeline *dsa_pipeline;
 
 #ifndef SPLICE_F_GIFT
 #define SPLICE_F_GIFT 0x08
@@ -209,6 +212,66 @@ static inline u64 dsa_now_us(void)
 		return 0;
 
 	return (u64)tv.tv_sec * 1000000ULL + (u64)tv.tv_usec;
+}
+
+static u64 dsa_pipeline_mono_ns(void)
+{
+	struct timespec ts;
+
+	if (sys_clock_gettime(CLOCK_MONOTONIC, &ts))
+		return 0;
+	return (u64)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+static u64 dsa_pipeline_now(void)
+{
+	u64 now;
+
+	if (!dsa_pipeline)
+		return 0;
+	now = dsa_pipeline_mono_ns();
+	if (!now)
+		dsa_pipeline->clock_valid = 0;
+	return now;
+}
+
+static void dsa_pipeline_accumulate(u64 *counter, u64 begin, u64 end)
+{
+	if (!dsa_pipeline)
+		return;
+	if (!begin || end < begin)
+		dsa_pipeline->clock_valid = 0;
+	else
+		*counter += end - begin;
+}
+
+static void dsa_pipeline_switch(u32 phase)
+{
+	u64 now;
+
+	if (!dsa_pipeline)
+		return;
+	now = dsa_pipeline_now();
+	dsa_pipeline_accumulate(&dsa_pipeline->phase_ns[dsa_pipeline->phase],
+				dsa_pipeline->last_ns, now);
+	dsa_pipeline->phase = phase;
+	dsa_pipeline->last_ns = now;
+}
+
+static void dsa_pipeline_record_batch(struct dsa_raw_stream_batch *batch, u64 observed)
+{
+	struct parasite_dsa_pipeline_batch *event = &batch->pipeline;
+
+	if (!dsa_pipeline)
+		return;
+	event->completion_observed_ns = observed;
+	if (event->id < DSA_PIPELINE_HEAD_COUNT)
+		dsa_pipeline->head[event->id] = *event;
+	dsa_pipeline->tail[dsa_pipeline->tail_next] = *event;
+	dsa_pipeline->tail_next = (dsa_pipeline->tail_next + 1U) % DSA_PIPELINE_TAIL_COUNT;
+	if (dsa_pipeline->tail_count < DSA_PIPELINE_TAIL_COUNT)
+		dsa_pipeline->tail_count++;
+	dsa_pipeline->completed_events++;
 }
 
 static inline int dsa_path_eq(const char *a, const char *b, u32 max_len)
@@ -1325,6 +1388,7 @@ static int dsa_raw_stream_batch_prepare(
 	u32 base = batch_idx * DSA_HW_BATCH_CHILDREN;
 	u32 wq_sel = 0;
 	u64 bytes = 0;
+	u64 pipeline_begin = dsa_pipeline_now();
 	u32 i;
 
 	if (!batch->child_count ||
@@ -1380,6 +1444,15 @@ static int dsa_raw_stream_batch_prepare(
 	 * failure aborts the generation, so this planning ledger never needs a
 	 * rollback path. */
 	active_wq_load[wq_sel] += bytes;
+	if (dsa_pipeline) {
+		u64 end = dsa_pipeline_now();
+
+		dsa_pipeline_accumulate(&dsa_pipeline->prepare_ns, pipeline_begin, end);
+		if (!batch->pipeline.prepare_begin_ns) {
+			batch->pipeline.prepare_begin_ns = pipeline_begin;
+			batch->pipeline.prepare_end_ns = end;
+		}
+	}
 	return 0;
 }
 
@@ -1392,13 +1465,24 @@ static int dsa_raw_stream_batch_submit_released(
 	struct dsa_raw_stream_batch *batch = &dsa_raw_stream_batches[batch_idx];
 	u32 base = batch_idx * DSA_HW_BATCH_CHILDREN;
 	int rc;
+	u64 pipeline_begin;
 
 	if (!batch->child_count || batch->active || !batch->prepared_bytes)
 		return -1;
+	pipeline_begin = dsa_pipeline_now();
 	rc = dsa_submit_copy_desc(
 		a, batch->direct_single ? &dsa_copy_hw_descs[base] :
 		   &dsa_copy_batch_descs[batch_idx],
 		batch->prepared_wq_idx, use_portal, portal_mask, portal_offset);
+	if (dsa_pipeline) {
+		u64 end = dsa_pipeline_now();
+
+		dsa_pipeline_accumulate(&dsa_pipeline->submit_call_ns, pipeline_begin, end);
+		if (!batch->pipeline.submit_begin_ns) {
+			batch->pipeline.submit_begin_ns = pipeline_begin;
+			batch->pipeline.submit_end_ns = end;
+		}
+	}
 	if (rc)
 		return rc;
 	batch->active = 1;
@@ -1641,6 +1725,7 @@ static int dsa_raw_stream_accept_slot(
 	u32 desc_pos = 0;
 	u32 payload_pos = 0;
 	u32 i, j;
+	u64 pipeline_accept = dsa_pipeline_now();
 
 	if (dsa_atomic_load_u32(&slot->state) != DSA_STREAM_SLOT_READY ||
 	    slot->seq != seq)
@@ -1695,6 +1780,14 @@ static int dsa_raw_stream_accept_slot(
 		batch->owner_seq = seq;
 		batch->child_count = count;
 		batch->direct_single = 0;
+		if (dsa_pipeline) {
+			dsa_memzero(&batch->pipeline, sizeof(batch->pipeline));
+			batch->pipeline.id = dsa_pipeline->next_id++;
+			batch->pipeline.slot_seq = seq;
+			batch->pipeline.child_count = count;
+			batch->pipeline.publish_ns = slot->pipeline_publish_ns;
+			batch->pipeline.accept_ns = pipeline_accept;
+		}
 		for (j = 0; j < count; j++) {
 			u32 state = base + j;
 			struct dsa_dump_descriptor *src = &input[desc_pos + j];
@@ -1777,6 +1870,12 @@ static int dsa_stream_consume_hw_runway(
 	u32 accepted_descs = 0;
 	u32 i;
 
+	if (dsa_pipeline) {
+		dsa_pipeline->consumer_begin_ns = dsa_pipeline_now();
+		dsa_pipeline->last_ns = dsa_pipeline->consumer_begin_ns;
+		dsa_pipeline->phase = DSA_PIPELINE_CONTROL;
+	}
+
 	if (hdr->slot_count != DSA_STREAM_SLOT_COUNT ||
 	    hdr->slot_desc_cap != DSA_STREAM_SLOT_DESC_CAP ||
 	    hdr->slots_off > a->shared_buf_size ||
@@ -1804,8 +1903,10 @@ static int dsa_stream_consume_hw_runway(
 			a->op_ret = -EIO;
 			goto fail;
 		}
+		dsa_pipeline_switch(DSA_PIPELINE_POLL_SCAN);
 		for (i = 0; i < DSA_HW_BATCH_OUTER_DEPTH; i++) {
 			int rc;
+			u64 pipeline_observed;
 
 			if (!dsa_raw_stream_batches[i].active)
 				continue;
@@ -1817,16 +1918,23 @@ static int dsa_stream_consume_hw_runway(
 				}
 				continue;
 			}
+			pipeline_observed = dsa_pipeline_now();
 			rc = dsa_raw_stream_batch_harvest(
 				a, i, active_wq_count, active_wq_idx,
 				active_wq_load, use_portal, portal_mask, portal_offset);
+			if (dsa_pipeline)
+				dsa_pipeline_accumulate(&dsa_pipeline->harvest_ns,
+						pipeline_observed, dsa_pipeline_now());
 			if (rc < 0)
 				goto fail;
-			if (rc == 1)
+			if (rc == 1) {
+				dsa_pipeline_record_batch(&dsa_raw_stream_batches[i], pipeline_observed);
 				active_outer--;
+			}
 			if (rc > 0)
 				progressed = true;
 		}
+		dsa_pipeline_switch(DSA_PIPELINE_CONTROL);
 		while (retire_seq < accept_seq) {
 			u32 slot_idx = retire_seq % hdr->slot_count;
 			struct parasite_dsa_stream_slot *slot = &slots[slot_idx];
@@ -1846,6 +1954,7 @@ static int dsa_stream_consume_hw_runway(
 		}
 
 		produced = dsa_atomic_load_u32(&hdr->producer_seq);
+		dsa_pipeline_switch(DSA_PIPELINE_ACCEPT);
 		while (accept_seq < produced) {
 			struct parasite_dsa_stream_slot *slot =
 				&slots[accept_seq % hdr->slot_count];
@@ -1862,6 +1971,7 @@ static int dsa_stream_consume_hw_runway(
 			accept_seq++;
 			progressed = true;
 		}
+		dsa_pipeline_switch(DSA_PIPELINE_CONTROL);
 
 		if (active_outer > a->batch_max_active_outer)
 			a->batch_max_active_outer = active_outer;
@@ -1913,6 +2023,10 @@ static int dsa_stream_consume_hw_runway(
 				return -1;
 			}
 			a->op_ret = 0;
+			if (dsa_pipeline) {
+				dsa_pipeline_switch(DSA_PIPELINE_CONTROL);
+				dsa_pipeline->consumer_end_ns = dsa_pipeline->last_ns;
+			}
 			return 0;
 		}
 		if (!progressed)
@@ -1920,6 +2034,8 @@ static int dsa_stream_consume_hw_runway(
 	}
 
 fail:
+	if (dsa_pipeline)
+		dsa_pipeline->clock_valid = 0;
 	/* No accepted descriptor may outlive the shared raw arena.  Stop intake,
 	 * wait for every outer/direct descriptor already admitted by ENQCMD, then
 	 * let the generation abort path reclaim the arena. */
@@ -2029,6 +2145,7 @@ static int parasite_dsa_dump_pages(struct parasite_dsa_dump_pages_args *a)
 	u64 wq_setup_end_us = 0;
 	u64 t_begin_us;
 	u64 t_end_us;
+	u64 pipeline_rpc_begin_ns = 0;
 
 	/*
 	 * The RPC argument area is shared with CRIU and can be reused by the
@@ -2037,6 +2154,7 @@ static int parasite_dsa_dump_pages(struct parasite_dsa_dump_pages_args *a)
 	 * through the DSA stream header.
 	 */
 	a = &local_args;
+	dsa_pipeline = NULL;
 
 	/* Initialize output fields */
 	a->op_ret = -1;
@@ -2109,6 +2227,8 @@ static int parasite_dsa_dump_pages(struct parasite_dsa_dump_pages_args *a)
 		goto out_copy_results;
 	}
 
+	if (a->profile_enabled)
+		pipeline_rpc_begin_ns = dsa_pipeline_mono_ns();
 	setup_begin_us = dsa_now_us();
 	shared_setup_begin_us = dsa_now_us();
 
@@ -2358,6 +2478,12 @@ static int parasite_dsa_dump_pages(struct parasite_dsa_dump_pages_args *a)
 		a->setup_us = setup_end_us - setup_begin_us;
 
 	if (stream_hdr) {
+		if (a->profile_enabled && stream_hdr->pipeline.enabled) {
+			dsa_pipeline = &stream_hdr->pipeline;
+			dsa_pipeline->clock_valid = pipeline_rpc_begin_ns != 0;
+			dsa_pipeline->rpc_begin_ns = pipeline_rpc_begin_ns;
+			dsa_pipeline->ready_ns = dsa_pipeline_now();
+		}
 		dsa_atomic_store_u32(&stream_hdr->consumer_ready, 1);
 		if (dsa_stream_consume_hw_runway(a, shared_buf, stream_hdr,
 				       active_wq_count,
@@ -2425,6 +2551,8 @@ out_cleanup:
 	}
 
 	out_copy_results:
+	if (dsa_pipeline)
+		dsa_pipeline->rpc_end_ns = dsa_pipeline_now();
 	*orig_args = *a;
 	if (stream_hdr) {
 		stream_hdr->result_op_ret = a->op_ret;
@@ -2467,6 +2595,7 @@ out_cleanup:
 		stream_hdr->result_raw_fault_resubmit_us = a->raw_fault_resubmit_us;
 		__atomic_thread_fence(__ATOMIC_RELEASE);
 	}
+	dsa_pipeline = NULL;
 	return 0;
 }
 

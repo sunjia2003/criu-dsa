@@ -858,6 +858,12 @@ struct memdump_timeline {
 	u64 start_us;
 	u64 last_us;
 	u64 phase_us[MEMDUMP_PHASE_NR];
+	bool pipeline_enabled;
+	u32 pipeline_count;
+	struct {
+		int phase;
+		u64 begin_us, end_us;
+	} pipeline[32];
 };
 
 struct memdump_timeline_record {
@@ -873,6 +879,7 @@ struct memdump_timeline_record {
 };
 
 static struct memdump_timeline_record memdump_timeline_last;
+static bool dsa_scan_profile_enabled(void);
 
 static void memdump_timeline_begin(struct memdump_timeline *tl, int pid,
 					   int phase)
@@ -882,6 +889,17 @@ static void memdump_timeline_begin(struct memdump_timeline *tl, int pid,
 	tl->phase = phase;
 	tl->start_us = dsa_wall_now_us();
 	tl->last_us = tl->start_us;
+	tl->pipeline_enabled = dsa_scan_profile_enabled();
+}
+
+static void memdump_pipeline_record(struct memdump_timeline *tl, u64 end_us)
+{
+	if (!tl->pipeline_enabled || tl->pipeline_count >= ARRAY_SIZE(tl->pipeline))
+		return;
+	tl->pipeline[tl->pipeline_count].phase = tl->phase;
+	tl->pipeline[tl->pipeline_count].begin_us = tl->last_us;
+	tl->pipeline[tl->pipeline_count].end_us = end_us;
+	tl->pipeline_count++;
 }
 
 static void memdump_timeline_switch(struct memdump_timeline *tl, int phase)
@@ -892,6 +910,7 @@ static void memdump_timeline_switch(struct memdump_timeline *tl, int phase)
 		return;
 
 	now = dsa_wall_now_us();
+	memdump_pipeline_record(tl, now);
 	if (tl->phase >= 0 && tl->phase < MEMDUMP_PHASE_NR)
 		tl->phase_us[tl->phase] += dsa_wall_delta_us(tl->last_us, now);
 	tl->phase = phase;
@@ -911,6 +930,7 @@ static void memdump_timeline_finish(struct memdump_timeline *tl, int ret,
 		return;
 
 	now = dsa_wall_now_us();
+	memdump_pipeline_record(tl, now);
 	if (tl->phase >= 0 && tl->phase < MEMDUMP_PHASE_NR)
 		tl->phase_us[tl->phase] += dsa_wall_delta_us(tl->last_us, now);
 	total_us = dsa_wall_delta_us(tl->start_us, now);
@@ -929,6 +949,13 @@ static void memdump_timeline_finish(struct memdump_timeline *tl, int ret,
 	       sizeof(memdump_timeline_last.phase_us));
 	memdump_timeline_last.accounted_us = accounted_us;
 	memdump_timeline_last.gap_us = gap_us;
+	if (tl->pipeline_enabled && dsa_mode) {
+		for (i = 0; i < tl->pipeline_count; i++)
+			pr_info("DSA_PIPELINE_HOST: version=1 pid=%d phase=%d start_ns=%llu end_ns=%llu\n",
+				tl->pid, tl->pipeline[i].phase,
+				(unsigned long long)tl->pipeline[i].begin_us * 1000ULL,
+				(unsigned long long)tl->pipeline[i].end_us * 1000ULL);
+	}
 
 	tl->start_us = 0;
 }
@@ -1829,6 +1856,31 @@ static void dsa_abort_replay_pipe(struct page_pipe *pp, int pipe_fd)
 	}
 }
 
+/* Full-only, disjoint scan-window ledger.  Nested flushes change phase and
+ * restore their caller; they are not added a second time to desc_append. */
+enum dsa_scan_detail_phase {
+	DSA_SCAN_CONTROL, DSA_SCAN_VMA_PREPARE, DSA_SCAN_PAGEMAP_READ,
+	DSA_SCAN_SHMEM_METADATA, DSA_SCAN_PAGE_SELECT, DSA_SCAN_LAZY_STACK,
+	DSA_SCAN_PARENT_COVERAGE, DSA_SCAN_HOLE_METADATA, DSA_SCAN_PAGE_METADATA,
+	DSA_SCAN_RAW_TRACKING, DSA_SCAN_DESC_APPEND, DSA_SCAN_SLOT_WAIT,
+	DSA_SCAN_DESC_SUM, DSA_SCAN_DESC_COPY, DSA_SCAN_SLOT_PUBLISH,
+	DSA_SCAN_FLUSH_CONTROL, DSA_SCAN_LOGGING, DSA_SCAN_DETAIL_NR,
+};
+
+static const char *const dsa_scan_detail_names[DSA_SCAN_DETAIL_NR] = {
+	"control", "vma_prepare", "pagemap_read", "shmem_metadata", "page_select",
+	"lazy_stack", "parent_coverage", "hole_metadata", "page_metadata",
+	"raw_tracking", "desc_append", "slot_wait", "desc_sum", "desc_copy",
+	"slot_publish", "flush_control", "scan_logging",
+};
+
+struct dsa_scan_detail {
+	bool active, valid, recorded;
+	int phase, pid;
+	u64 start_ns, last_ns, total_ns, transitions;
+	u64 phase_ns[DSA_SCAN_DETAIL_NR], entries[DSA_SCAN_DETAIL_NR];
+};
+
 struct dsa_desc_scan_ctx {
 	struct parasite_ctl *ctl;
 	struct parasite_dump_pages_args *args;
@@ -1877,6 +1929,7 @@ struct dsa_desc_scan_ctx {
 	u64 stream_descs;
 	bool raw_full_prefault;
 	bool scan_profile;
+	struct dsa_scan_detail detail;
 	u64 scan_pages;
 	u64 scan_dump_pages;
 	u64 scan_hole_pages;
@@ -1914,6 +1967,90 @@ struct dsa_desc_scan_ctx {
 	u64 desc_seq_total;
 	size_t vma_plan_count;
 };
+
+static u64 dsa_scan_detail_now(struct dsa_scan_detail *detail)
+{
+	struct timespec ts;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &ts)) {
+		detail->valid = false;
+		return 0;
+	}
+	return (u64)ts.tv_sec * 1000000000ULL + (u64)ts.tv_nsec;
+}
+
+static inline void dsa_scan_detail_switch(struct dsa_desc_scan_ctx *sc, int phase)
+{
+	struct dsa_scan_detail *d = &sc->detail;
+	u64 now;
+
+	if (!sc->scan_profile || !d->active)
+		return;
+	now = dsa_scan_detail_now(d);
+	if (d->valid && now >= d->last_ns)
+		d->phase_ns[d->phase] += now - d->last_ns;
+	else
+		d->valid = false;
+	d->last_ns = now;
+	d->phase = phase;
+	d->entries[phase]++;
+	d->transitions++;
+}
+
+static void dsa_scan_detail_begin(struct dsa_desc_scan_ctx *sc, int pid)
+{
+	struct dsa_scan_detail *d = &sc->detail;
+
+	if (!sc->scan_profile)
+		return;
+	memset(d, 0, sizeof(*d));
+	d->valid = true;
+	d->pid = pid;
+	d->phase = DSA_SCAN_CONTROL;
+	d->start_ns = d->last_ns = dsa_scan_detail_now(d);
+	d->entries[DSA_SCAN_CONTROL] = 1;
+	d->active = true;
+}
+
+static void dsa_scan_detail_end(struct dsa_desc_scan_ctx *sc)
+{
+	struct dsa_scan_detail *d = &sc->detail;
+
+	if (!d->active)
+		return;
+	dsa_scan_detail_switch(sc, DSA_SCAN_CONTROL);
+	d->total_ns = d->valid ? d->last_ns - d->start_ns : 0;
+	d->active = false;
+	d->recorded = true;
+}
+
+static void dsa_scan_detail_emit(struct dsa_desc_scan_ctx *sc)
+{
+	struct dsa_scan_detail *d = &sc->detail;
+	char line[2048];
+	u64 accounted = 0;
+	int i, n, used;
+
+	if (!sc->scan_profile || !d->recorded)
+		return;
+	for (i = 0; i < DSA_SCAN_DETAIL_NR; i++)
+		accounted += d->phase_ns[i];
+	used = snprintf(line, sizeof(line),
+		"DSA_SCAN_DETAIL_PROFILE: version=1 pid=%d clock_valid=%u total_ns=%llu accounted_ns=%llu transitions=%llu",
+		d->pid, d->valid ? 1U : 0U, (unsigned long long)d->total_ns,
+		(unsigned long long)accounted, (unsigned long long)d->transitions);
+	for (i = 0; i < DSA_SCAN_DETAIL_NR; i++) {
+		n = snprintf(line + used, sizeof(line) - used, " %s_ns=%llu %s_entries=%llu",
+			dsa_scan_detail_names[i], (unsigned long long)d->phase_ns[i],
+			dsa_scan_detail_names[i], (unsigned long long)d->entries[i]);
+		if (n < 0 || n >= sizeof(line) - used) {
+			pr_err("DSA scan detail log buffer too small\n");
+			return;
+		}
+		used += n;
+	}
+	pr_info("%s\n", line);
+}
 
 static inline u32 dsa_shared_load_u32(volatile u32 *p)
 {
@@ -2127,6 +2264,7 @@ static int dsa_stream_layout_init(struct dsa_desc_scan_ctx *sc)
 	sc->stream_hdr->slots_off = slots_off;
 	sc->stream_hdr->desc_area_off = desc_area_off;
 	sc->stream_hdr->payload_base = payload_base;
+	sc->stream_hdr->pipeline.enabled = sc->scan_profile ? 1U : 0U;
 	sc->stream_hdr->payload_limit = raw_fg_capture ? raw_payload_limit :
 		sc->dsa_ctx->shared_buf_size;
 	dsa_shared_store_u32(&sc->stream_hdr->payload_head, payload_base);
@@ -2409,23 +2547,29 @@ static int dsa_stream_flush_slot(struct dsa_desc_scan_ctx *sc)
 	u64 flush_t0 = 0;
 	u64 t0 = 0;
 	u64 t1;
+	int detail_parent = sc->detail.phase;
 
 	if (!sc->desc_count)
 		return 0;
+	dsa_scan_detail_switch(sc, DSA_SCAN_FLUSH_CONTROL);
 
 	if (sc->scan_profile)
 		flush_t0 = dsa_wall_now_us();
 	slot_idx = sc->current_slot;
+	dsa_scan_detail_switch(sc, DSA_SCAN_SLOT_WAIT);
 	if (dsa_stream_wait_slot(sc, slot_idx))
 		return -1;
+	dsa_scan_detail_switch(sc, DSA_SCAN_FLUSH_CONTROL);
 
 	slot = &sc->stream_slots[slot_idx];
 	desc_off = sc->desc_head;
 	if (sc->scan_profile)
 		t0 = dsa_wall_now_us();
 	slot_desc = dsa_stream_slot_desc(sc, slot_idx);
+	dsa_scan_detail_switch(sc, DSA_SCAN_DESC_SUM);
 	for (i = 0; i < sc->desc_count; i++)
 		desc_sum += slot_desc[i].copy_len;
+	dsa_scan_detail_switch(sc, DSA_SCAN_FLUSH_CONTROL);
 	if (sc->scan_profile) {
 		t1 = dsa_wall_now_us();
 		sc->flush_desc_sum_us += dsa_wall_delta_us(t0, t1);
@@ -2441,8 +2585,10 @@ static int dsa_stream_flush_slot(struct dsa_desc_scan_ctx *sc)
 	}
 	if (sc->scan_profile)
 		t0 = dsa_wall_now_us();
+	dsa_scan_detail_switch(sc, DSA_SCAN_DESC_COPY);
 	memcpy((u8 *)sc->dsa_ctx->shared_buf + desc_off, slot_desc,
 	       sc->desc_count * sizeof(struct dsa_dump_descriptor));
+	dsa_scan_detail_switch(sc, DSA_SCAN_FLUSH_CONTROL);
 	if (sc->scan_profile) {
 		t1 = dsa_wall_now_us();
 		sc->flush_desc_memcpy_us += dsa_wall_delta_us(t0, t1);
@@ -2453,7 +2599,10 @@ static int dsa_stream_flush_slot(struct dsa_desc_scan_ctx *sc)
 
 	if (sc->scan_profile)
 		t0 = dsa_wall_now_us();
+	dsa_scan_detail_switch(sc, DSA_SCAN_SLOT_PUBLISH);
 	slot->seq = sc->produced_slots;
+	if (sc->scan_profile)
+		slot->pipeline_publish_ns = dsa_wall_now_us() * 1000ULL;
 	slot->desc_off = desc_off;
 	slot->desc_count = sc->desc_count;
 	slot->payload_off = sc->slot_payload_off;
@@ -2470,11 +2619,13 @@ static int dsa_stream_flush_slot(struct dsa_desc_scan_ctx *sc)
 	dsa_shared_store_u32(&sc->stream_hdr->producer_seq, sc->produced_slots);
 	sc->current_slot = sc->produced_slots % DSA_STREAM_SLOT_COUNT;
 	dsa_desc_scan_reset_batch(sc);
+	dsa_scan_detail_switch(sc, DSA_SCAN_FLUSH_CONTROL);
 	if (sc->scan_profile) {
 		t1 = dsa_wall_now_us();
 		sc->flush_publish_us += dsa_wall_delta_us(t0, t1);
 		sc->flush_slot_us += dsa_wall_delta_us(flush_t0, t1);
 	}
+	dsa_scan_detail_switch(sc, detail_parent);
 	return 0;
 }
 
@@ -2549,6 +2700,49 @@ static int dsa_desc_scan_batch_append(struct dsa_desc_scan_ctx *sc,
 	return 0;
 }
 
+static void dsa_pipeline_emit_batch(const struct parasite_dsa_pipeline_batch *event)
+{
+	if (!event->child_count)
+		return;
+	pr_info("DSA_PIPELINE_BATCH: version=1 id=%u slot_seq=%u children=%u publish_ns=%llu accept_ns=%llu prepare_begin_ns=%llu prepare_end_ns=%llu submit_begin_ns=%llu submit_end_ns=%llu completion_observed_ns=%llu\n",
+		event->id, event->slot_seq, event->child_count,
+		(unsigned long long)event->publish_ns, (unsigned long long)event->accept_ns,
+		(unsigned long long)event->prepare_begin_ns, (unsigned long long)event->prepare_end_ns,
+		(unsigned long long)event->submit_begin_ns, (unsigned long long)event->submit_end_ns,
+		(unsigned long long)event->completion_observed_ns);
+}
+
+static void dsa_pipeline_emit(struct dsa_desc_scan_ctx *sc)
+{
+	struct parasite_dsa_pipeline *p;
+	u32 i, start;
+
+	if (!sc->scan_profile || !sc->stream_hdr)
+		return;
+	p = &sc->stream_hdr->pipeline;
+	pr_info("DSA_PIPELINE_PROFILE: version=1 pid=%d clock_valid=%u rpc_begin_ns=%llu ready_ns=%llu consumer_begin_ns=%llu consumer_end_ns=%llu rpc_end_ns=%llu control_ns=%llu poll_scan_ns=%llu accept_ns=%llu prepare_ns=%llu submit_call_ns=%llu harvest_ns=%llu submitted_groups=%u completed_events=%u head_cap=%u tail_cap=%u tail_count=%u\n",
+		sc->detail.pid, p->clock_valid,
+		(unsigned long long)p->rpc_begin_ns, (unsigned long long)p->ready_ns,
+		(unsigned long long)p->consumer_begin_ns, (unsigned long long)p->consumer_end_ns,
+		(unsigned long long)p->rpc_end_ns,
+		(unsigned long long)p->phase_ns[DSA_PIPELINE_CONTROL],
+		(unsigned long long)p->phase_ns[DSA_PIPELINE_POLL_SCAN],
+		(unsigned long long)p->phase_ns[DSA_PIPELINE_ACCEPT],
+		(unsigned long long)p->prepare_ns, (unsigned long long)p->submit_call_ns,
+		(unsigned long long)p->harvest_ns, p->next_id, p->completed_events,
+		DSA_PIPELINE_HEAD_COUNT, DSA_PIPELINE_TAIL_COUNT, p->tail_count);
+	for (i = 0; i < DSA_PIPELINE_HEAD_COUNT; i++)
+		dsa_pipeline_emit_batch(&p->head[i]);
+	start = p->tail_count == DSA_PIPELINE_TAIL_COUNT ? p->tail_next : 0;
+	for (i = 0; i < p->tail_count; i++) {
+		const struct parasite_dsa_pipeline_batch *event =
+			&p->tail[(start + i) % DSA_PIPELINE_TAIL_COUNT];
+
+		if (event->id >= DSA_PIPELINE_HEAD_COUNT)
+			dsa_pipeline_emit_batch(event);
+	}
+}
+
 static int dsa_stream_finish(struct dsa_desc_scan_ctx *sc)
 {
 	if (dsa_stream_flush_slot(sc))
@@ -2559,6 +2753,8 @@ static int dsa_stream_finish(struct dsa_desc_scan_ctx *sc)
 
 	if (dsa_stream_join_rpc(sc))
 		return -1;
+	dsa_pipeline_emit(sc);
+	dsa_scan_detail_emit(sc);
 
 	if (sc->rpc_args.total_copied != sc->stream_bytes ||
 	    sc->rpc_args.new_buf_offset != sc->payload_head) {
@@ -3434,6 +3630,7 @@ static int generate_iovs_dsa_desc_scan(struct pstree_item *item,
 		struct page_info page_info = {};
 		int st;
 
+		dsa_scan_detail_switch(sc, DSA_SCAN_PAGE_SELECT);
 		if (sc->scan_profile)
 			t0 = dsa_wall_now_us();
 		if (should_dump_page(pmc, vma->e, vaddr, &page_info))
@@ -3442,15 +3639,19 @@ static int generate_iovs_dsa_desc_scan(struct pstree_item *item,
 			t1 = dsa_wall_now_us();
 			sc->should_dump_us += dsa_wall_delta_us(t0, t1);
 		}
+		dsa_scan_detail_switch(sc, DSA_SCAN_CONTROL);
 		sc->scan_pages++;
 
 		if (!dump_all_pages && page_info.next != vaddr) {
+			dsa_scan_detail_switch(sc, DSA_SCAN_RAW_TRACKING);
 			if (sc->scan_profile)
 				dsa_desc_scan_raw_flush(sc);
+			dsa_scan_detail_switch(sc, DSA_SCAN_CONTROL);
 			vaddr = page_info.next - PAGE_SIZE;
 			continue;
 		}
 
+		dsa_scan_detail_switch(sc, DSA_SCAN_LAZY_STACK);
 		if (sc->scan_profile)
 			t0 = dsa_wall_now_us();
 		if (vma_entry_can_be_lazy(vma->e) && !is_stack(item, vaddr))
@@ -3459,12 +3660,14 @@ static int generate_iovs_dsa_desc_scan(struct pstree_item *item,
 			t1 = dsa_wall_now_us();
 			sc->lazy_stack_check_us += dsa_wall_delta_us(t0, t1);
 		}
+		dsa_scan_detail_switch(sc, DSA_SCAN_CONTROL);
 
 		{
 			bool parent_has_page = false;
 			bool in_parent = false;
 
 			if (has_parent) {
+				dsa_scan_detail_switch(sc, DSA_SCAN_PARENT_COVERAGE);
 				if (sc->scan_profile)
 					t0 = dsa_wall_now_us();
 				parent_has_page = dsa_parent_coverage_contains_range(&dsa_parent_coverage_prev,
@@ -3473,13 +3676,16 @@ static int generate_iovs_dsa_desc_scan(struct pstree_item *item,
 					t1 = dsa_wall_now_us();
 					sc->parent_coverage_us += dsa_wall_delta_us(t0, t1);
 				}
+				dsa_scan_detail_switch(sc, DSA_SCAN_CONTROL);
 			}
 			in_parent = has_parent && page_in_parent(page_info.softdirty) &&
 				parent_has_page;
 
 			if (in_parent) {
+				dsa_scan_detail_switch(sc, DSA_SCAN_RAW_TRACKING);
 				if (sc->scan_profile)
 					dsa_desc_scan_raw_flush(sc);
+				dsa_scan_detail_switch(sc, DSA_SCAN_HOLE_METADATA);
 				if (sc->scan_profile)
 					t0 = dsa_wall_now_us();
 				ret = page_pipe_add_hole(pp, vaddr, PP_HOLE_PARENT);
@@ -3491,8 +3697,10 @@ static int generate_iovs_dsa_desc_scan(struct pstree_item *item,
 					sc->page_pipe_us += delta;
 					sc->page_pipe_hole_us += delta;
 				}
+				dsa_scan_detail_switch(sc, DSA_SCAN_CONTROL);
 				st = 0;
 			} else {
+				dsa_scan_detail_switch(sc, DSA_SCAN_PAGE_METADATA);
 				if (sc->scan_profile)
 					t0 = dsa_wall_now_us();
 				ret = page_pipe_add_page_unbounded(pp, vaddr, ppb_flags);
@@ -3504,14 +3712,18 @@ static int generate_iovs_dsa_desc_scan(struct pstree_item *item,
 					sc->page_pipe_us += delta;
 					sc->page_pipe_page_us += delta;
 				}
+				dsa_scan_detail_switch(sc, DSA_SCAN_CONTROL);
 				if (!ret) {
+					dsa_scan_detail_switch(sc, DSA_SCAN_RAW_TRACKING);
 					if (sc->scan_profile)
 						dsa_desc_scan_raw_append(sc,
 							(u64)(unsigned long)vaddr,
 							PAGE_SIZE);
+					dsa_scan_detail_switch(sc, DSA_SCAN_DESC_APPEND);
 					ret = dsa_desc_scan_batch_append(sc,
 						(u64)(unsigned long)vaddr,
 						PAGE_SIZE);
+					dsa_scan_detail_switch(sc, DSA_SCAN_CONTROL);
 				}
 				if (ppb_flags & PPB_LAZY && opts.lazy_pages)
 					st = 1;
@@ -3538,8 +3750,10 @@ static int generate_iovs_dsa_desc_scan(struct pstree_item *item,
 	cnt_add(CNT_PAGES_LAZY, pages[1]);
 	cnt_add(CNT_PAGES_WRITTEN, pages[2]);
 
+	dsa_scan_detail_switch(sc, DSA_SCAN_LOGGING);
 	pr_info("DSA desc-scan pagemap generated: %lu pages (%lu lazy) %lu holes\n",
 		pages[2] + pages[1], pages[1], pages[0]);
+	dsa_scan_detail_switch(sc, DSA_SCAN_CONTROL);
 
 	return ret;
 }
@@ -3578,13 +3792,18 @@ static int generate_vma_iovs_dsa_desc_scan(struct pstree_item *item,
 		has_parent = false;
 	}
 
+	dsa_scan_detail_switch(sc, DSA_SCAN_PAGEMAP_READ);
 	if (pmc_get_map(pmc, vma))
 		return -1;
+	dsa_scan_detail_switch(sc, DSA_SCAN_VMA_PREPARE);
 
-	if (vma_area_is(vma, VMA_ANON_SHARED))
+	if (vma_area_is(vma, VMA_ANON_SHARED)) {
+		dsa_scan_detail_switch(sc, DSA_SCAN_SHMEM_METADATA);
 		return add_shmem_area(item->pid->real, vma->e, pmc);
+	}
 
 	vaddr = vma->e->start;
+	dsa_scan_detail_switch(sc, DSA_SCAN_CONTROL);
 	ret = generate_iovs_dsa_desc_scan(item, vma, pp, pmc, &vaddr,
 					 has_parent, sc);
 
@@ -3857,7 +4076,11 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	memdump_timeline_switch(timeline, MEMDUMP_PHASE_SCAN_BUILD);
 	if (dsa_desc_scan_active)
 		scan_build_start_us = dsa_wall_now_us();
+	if (dsa_desc_scan_active)
+		dsa_scan_detail_begin(&dsa_sc, item->pid->real);
 	list_for_each_entry(vma_area, &vma_area_list->h, list) {
+		if (dsa_desc_scan_active)
+			dsa_scan_detail_switch(&dsa_sc, DSA_SCAN_VMA_PREPARE);
 		if (vma_area_is(vma_area, VMA_AREA_GUARD))
 			continue;
 
@@ -3873,11 +4096,15 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 						parent_predump_mode, timeline);
 		if (ret < 0)
 			goto out_xfer;
+		if (dsa_desc_scan_active)
+			dsa_scan_detail_switch(&dsa_sc, DSA_SCAN_CONTROL);
 	}
 
 	if (dsa_desc_scan_active) {
+		dsa_scan_detail_switch(&dsa_sc, DSA_SCAN_RAW_TRACKING);
 		if (dsa_sc.scan_profile)
 			dsa_desc_scan_raw_flush(&dsa_sc);
+		dsa_scan_detail_end(&dsa_sc);
 		scan_build_us = dsa_wall_delta_us(scan_build_start_us, dsa_wall_now_us());
 		dsa_sc.scan_wall_us = scan_build_us;
 	}

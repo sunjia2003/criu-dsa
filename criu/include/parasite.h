@@ -350,6 +350,35 @@ struct parasite_dsa_stream_slot {
 	u32 payload_bytes;
 	u32 copied_bytes;
 	u32 status;
+	u64 pipeline_publish_ns; /* Full-only sample immediately before READY */
+};
+
+#define DSA_PIPELINE_HEAD_COUNT 8U
+#define DSA_PIPELINE_TAIL_COUNT 128U
+
+enum dsa_pipeline_phase {
+	DSA_PIPELINE_CONTROL,
+	DSA_PIPELINE_POLL_SCAN,
+	DSA_PIPELINE_ACCEPT,
+	DSA_PIPELINE_PHASE_NR,
+};
+
+/* Diagnostic observations, not device execution timestamps. First submissions
+ * and a completion-ordered tail are retained; this is not an exhaustive trace. */
+struct parasite_dsa_pipeline_batch {
+	u32 id, slot_seq, child_count, reserved;
+	u64 publish_ns, accept_ns, prepare_begin_ns, prepare_end_ns;
+	u64 submit_begin_ns, submit_end_ns, completion_observed_ns;
+};
+
+struct parasite_dsa_pipeline {
+	u32 enabled, clock_valid, phase, next_id;
+	u32 completed_events, tail_next, tail_count, reserved;
+	u64 rpc_begin_ns, ready_ns, consumer_begin_ns, consumer_end_ns, rpc_end_ns;
+	u64 last_ns, phase_ns[DSA_PIPELINE_PHASE_NR];
+	u64 prepare_ns, submit_call_ns, harvest_ns;
+	struct parasite_dsa_pipeline_batch head[DSA_PIPELINE_HEAD_COUNT];
+	struct parasite_dsa_pipeline_batch tail[DSA_PIPELINE_TAIL_COUNT];
 };
 
 struct parasite_dsa_stream_hdr {
@@ -408,6 +437,7 @@ struct parasite_dsa_stream_hdr {
 	u64 result_raw_fault_partial_bytes;
 	u64 result_raw_fault_touch_us;
 	u64 result_raw_fault_resubmit_us;
+	struct parasite_dsa_pipeline pipeline;
 };
 
 struct parasite_dsa_dump_pages_args {
