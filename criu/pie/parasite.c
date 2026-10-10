@@ -2008,6 +2008,22 @@ static int dsa_raw_stream_accept_slot(
 	return 1;
 }
 
+static void dsa_raw_stream_recycle_slot(struct parasite_dsa_stream_slot *slot,
+				      u32 seq, u32 slot_idx)
+{
+	u32 desc_count = slot->desc_count;
+	u32 payload_bytes = slot->payload_bytes;
+
+	slot->copied_bytes = payload_bytes;
+	slot->status = 0;
+	dsa_raw_stream_slot_complete[slot_idx] = 0;
+	/* DONE transfers ownership back to the producer. Never read its mutable
+	 * metadata afterwards, even just for diagnostics. */
+	dsa_atomic_store_u32(&slot->state, DSA_STREAM_SLOT_DONE);
+	dsa_flow_cons_event(DSA_FLOW_RECYCLE, seq, DSA_FLOW_NO_ID,
+		desc_count, payload_bytes, 0, 0, 0);
+}
+
 static int dsa_stream_consume_hw_runway(
 	struct parasite_dsa_dump_pages_args *a, u8 *shared_buf,
 	struct parasite_dsa_stream_hdr *hdr, u32 active_wq_count,
@@ -2105,12 +2121,7 @@ static int dsa_stream_consume_hw_runway(
 			    dsa_atomic_load_u32(&slot->state) != DSA_STREAM_SLOT_COPYING ||
 			    slot->seq != retire_seq)
 				break;
-			slot->copied_bytes = slot->payload_bytes;
-			slot->status = 0;
-			dsa_raw_stream_slot_complete[slot_idx] = 0;
-			dsa_atomic_store_u32(&slot->state, DSA_STREAM_SLOT_DONE);
-			dsa_flow_cons_event(DSA_FLOW_RECYCLE, retire_seq, DSA_FLOW_NO_ID,
-				slot->desc_count, slot->payload_bytes, 0, 0, 0);
+			dsa_raw_stream_recycle_slot(slot, retire_seq, slot_idx);
 			retire_seq++;
 			dsa_atomic_store_u32(&hdr->consumer_seq, retire_seq);
 			progressed = true;

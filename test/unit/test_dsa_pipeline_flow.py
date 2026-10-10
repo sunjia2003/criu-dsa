@@ -158,6 +158,50 @@ int main(void) {
                         '-I'+str(ROOT/'criu/include'), str(source), '-o', str(binary)], check=True)
         subprocess.run([str(binary)], check=True)
 
+    def test_recycle_keeps_old_metadata_when_producer_immediately_reuses_slot(self):
+        text=(ROOT/'criu/pie/parasite.c').read_text()
+        start=text.index('static void dsa_raw_stream_recycle_slot(')
+        body=text.index('{',start);end=body+1;depth=1
+        while depth:
+            depth+=(text[end]=='{')-(text[end]=='}');end+=1
+        production=text[start:end]
+        source=self.root/'recycle.c'
+        source.write_text(r'''
+#include <stdint.h>
+#include <assert.h>
+typedef uint32_t u32; typedef uint64_t u64;
+#include "dsa-flow.h"
+#define DSA_STREAM_SLOT_DONE 3U
+struct parasite_dsa_stream_slot { u32 state,desc_count,payload_bytes,copied_bytes; int status; };
+static u32 dsa_raw_stream_slot_complete[8];
+static struct parasite_dsa_stream_slot *shared;
+static u64 observed_count,observed_bytes;
+static void dsa_atomic_store_u32(u32 *state,u32 value) {
+    *state=value;
+    /* A legal peer interleaving immediately after release, not a sleep. */
+    assert(shared->copied_bytes==8192 && shared->status==0);
+    assert(dsa_raw_stream_slot_complete[2]==0);
+    shared->desc_count=7;shared->payload_bytes=32768;
+}
+static void dsa_flow_cons_event(u32 kind,u32 seq,u32 id,u64 a,u64 b,u64 c,u64 d,u64 e) {
+    assert(kind==DSA_FLOW_RECYCLE && seq==10 && id==DSA_FLOW_NO_ID && !c && !d && !e);
+    observed_count=a;observed_bytes=b;
+}
+__PRODUCTION__
+int main(void) {
+    struct parasite_dsa_stream_slot slot={.desc_count=2,.payload_bytes=8192,.status=-1};
+    shared=&slot;dsa_raw_stream_slot_complete[2]=1;
+    dsa_raw_stream_recycle_slot(&slot,10,2);
+    assert(slot.state==DSA_STREAM_SLOT_DONE && slot.desc_count==7 && slot.payload_bytes==32768);
+    assert(observed_count==2 && observed_bytes==8192);
+    return 0;
+}
+'''.replace('__PRODUCTION__',production))
+        binary=self.root/'recycle'
+        subprocess.run(['cc','-std=c11','-O2','-Wall','-Wextra','-Werror',
+                        '-I'+str(ROOT/'criu/include'),str(source),'-o',str(binary)],check=True)
+        subprocess.run([str(binary)],check=True)
+
     def test_native_batch_counters_exclude_direct_single_requests(self):
         for row in self.host:
             if row['kind'] in ('publish_pre', 'publish_post'):
