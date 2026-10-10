@@ -48,17 +48,19 @@ struct dsa_desc_scan_ctx {
     u64 producer_wait_slot_us, finish_wait_us;
     struct {
         u32 raw_faults, raw_fault_resubmits, batch_max_active_outer, batch_child_submits;
+        u32 raw_fault_source, raw_fault_destination;
     } rpc_args;
 };
 __SUMMARY__
 int check_summary(void) {
     struct dsa_desc_scan_ctx sc={.stream_bytes=1234,.stream_descs=19,.produced_slots=2,
-      .producer_wait_slot_us=17,.finish_wait_us=23,.rpc_args={3,4,5,6}};
+      .producer_wait_slot_us=17,.finish_wait_us=23,.rpc_args={.raw_faults=3,.raw_fault_resubmits=4,
+      .batch_max_active_outer=5,.batch_child_submits=6,.raw_fault_source=7,.raw_fault_destination=8}};
     summary_enabled=false;summary_text[0]=0;dsa_desc_scan_emit_summary(&sc);
     if(summary_text[0])return 0;
     summary_enabled=true;dsa_desc_scan_emit_summary(&sc);
     return strstr(summary_text,"payload_bytes=1234 descriptors=19 slots=2 producer_wait_slot_us=17 stream_finish_wait_us=23") &&
-      strstr(summary_text,"raw_faults=3 raw_fault_resubmits=4 batch_max_active_outer=5 batch_child_submits=6");
+      strstr(summary_text,"raw_faults=3 raw_fault_source=7 raw_fault_destination=8 raw_fault_resubmits=4 batch_max_active_outer=5 batch_child_submits=6");
 }
 '''
         source, library = directory / 'check.c', directory / 'check.so'

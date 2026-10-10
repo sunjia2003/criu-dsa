@@ -4006,10 +4006,11 @@ static void dsa_desc_scan_emit_summary(struct dsa_desc_scan_ctx *sc)
 {
 	if (!dsa_env_enabled("CRIU_DSA_STREAM_SUMMARY"))
 		return;
-	pr_info("DSA_STREAM_SUMMARY: version=1 payload_bytes=%llu descriptors=%llu slots=%u producer_wait_slot_us=%llu stream_finish_wait_us=%llu raw_faults=%u raw_fault_resubmits=%u batch_max_active_outer=%u batch_child_submits=%u\n",
+	pr_info("DSA_STREAM_SUMMARY: version=1 payload_bytes=%llu descriptors=%llu slots=%u producer_wait_slot_us=%llu stream_finish_wait_us=%llu raw_faults=%u raw_fault_source=%u raw_fault_destination=%u raw_fault_resubmits=%u batch_max_active_outer=%u batch_child_submits=%u\n",
 		(unsigned long long)sc->stream_bytes, (unsigned long long)sc->stream_descs,
 		sc->produced_slots, (unsigned long long)sc->producer_wait_slot_us,
 		(unsigned long long)sc->finish_wait_us, sc->rpc_args.raw_faults,
+		sc->rpc_args.raw_fault_source, sc->rpc_args.raw_fault_destination,
 		sc->rpc_args.raw_fault_resubmits, sc->rpc_args.batch_max_active_outer,
 		sc->rpc_args.batch_child_submits);
 }
