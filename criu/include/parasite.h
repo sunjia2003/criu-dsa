@@ -355,13 +355,64 @@ struct parasite_dsa_stream_slot {
 
 #define DSA_PIPELINE_HEAD_COUNT 8U
 #define DSA_PIPELINE_TAIL_COUNT 128U
+#define DSA_PIPELINE_TRACE_BYTES_DEFAULT (256U * 1024U * 1024U)
+#define DSA_PIPELINE_TRACE_BYTES_MAX (512U * 1024U * 1024U)
+#define DSA_PIPELINE_TRACE_MAGIC 0x44535054U
+#define DSA_PIPELINE_TRACE_VERSION 1U
+#define DSA_PIPELINE_EVENT_RESUMED 1U
+#define DSA_PIPELINE_TRACE_COMPLETE 1U
+#define DSA_HOST_TRACE_BYTES_DEFAULT (512U * 1024U * 1024U)
+#define DSA_HOST_TRACE_BYTES_MAX (1024U * 1024U * 1024U)
+#define DSA_HOST_TRACE_MAGIC 0x44534854U
+#define DSA_HOST_TRACE_PHASE_NR 17U
 
 enum dsa_pipeline_phase {
 	DSA_PIPELINE_CONTROL,
 	DSA_PIPELINE_POLL_SCAN,
 	DSA_PIPELINE_ACCEPT,
+	DSA_PIPELINE_PREPARE,
+	DSA_PIPELINE_SUBMIT,
+	DSA_PIPELINE_HARVEST,
 	DSA_PIPELINE_PHASE_NR,
 };
+
+/* One exclusive wall-time interval. occurrence identifies a stage invocation;
+ * a resumed parent retains its id even when its time is split into fragments. */
+struct dsa_pipeline_event {
+	u64 start_ns, end_ns, occurrence;
+	u32 phase, flags;
+};
+
+struct dsa_pipeline_scope {
+	u64 occurrence;
+	u32 phase;
+};
+
+/* Native little-endian on supported x86 DSA hosts. Keep the fixed sizes below
+ * so a reader can reject incompatible files instead of guessing the layout. */
+struct dsa_pipeline_trace_file {
+	u32 magic, version, header_size, event_size;
+	u64 consumer_begin_ns, consumer_end_ns, event_count, dropped;
+	u64 phase_ns[DSA_PIPELINE_PHASE_NR];
+	u64 phase_calls[DSA_PIPELINE_PHASE_NR];
+	u64 phase_segments[DSA_PIPELINE_PHASE_NR];
+	u32 pid, clock_valid, capacity, flags;
+};
+
+/* Host page-scan ledger, distinct from the six-phase hardware consumer.
+ * Only Host writes this buffer; it is not sent to the target process. */
+struct dsa_host_trace_file {
+	u32 magic, version, header_size, event_size;
+	u64 scan_begin_ns, scan_end_ns, event_count, dropped;
+	u64 phase_ns[DSA_HOST_TRACE_PHASE_NR];
+	u64 phase_calls[DSA_HOST_TRACE_PHASE_NR];
+	u64 phase_segments[DSA_HOST_TRACE_PHASE_NR];
+	u32 pid, clock_valid, capacity, flags;
+};
+
+_Static_assert(sizeof(struct dsa_pipeline_event) == 32, "DSA pipeline event layout");
+_Static_assert(sizeof(struct dsa_pipeline_trace_file) == 208, "DSA pipeline file layout");
+_Static_assert(sizeof(struct dsa_host_trace_file) == 472, "DSA host trace file layout");
 
 /* Diagnostic observations, not device execution timestamps. First submissions
  * and a completion-ordered tail are retained; this is not an exhaustive trace. */
@@ -376,6 +427,12 @@ struct parasite_dsa_pipeline {
 	u32 completed_events, tail_next, tail_count, reserved;
 	u64 rpc_begin_ns, ready_ns, consumer_begin_ns, consumer_end_ns, rpc_end_ns;
 	u64 last_ns, phase_ns[DSA_PIPELINE_PHASE_NR];
+	u64 phase_transitions;
+	u64 phase_calls[DSA_PIPELINE_PHASE_NR], phase_segments[DSA_PIPELINE_PHASE_NR];
+	u64 occurrence, next_occurrence, trace_segments, trace_dropped;
+	u64 trace_last_occurrence;
+	u32 phase_flags, trace_count, trace_capacity, trace_last_phase;
+	/* Version-2 exclusive aliases, finalized from phase_ns on success. */
 	u64 prepare_ns, submit_call_ns, harvest_ns;
 	struct parasite_dsa_pipeline_batch head[DSA_PIPELINE_HEAD_COUNT];
 	struct parasite_dsa_pipeline_batch tail[DSA_PIPELINE_TAIL_COUNT];
@@ -455,6 +512,7 @@ struct parasite_dsa_dump_pages_args {
 	u32 wq_policy;		/* enum dsa_wq_policy, default LPT */
 	u32 raw_full_prefault;	/* Initial full generation: prefault every capture source page */
 	u32 profile_enabled;	/* Collect optional aggregate timing */
+	u32 pipeline_trace_bytes; /* Full-only separate memfd, never raw-arena payload */
 	char wq_paths[DSA_DUMP_MAX_WQ][64];  /* WQ paths or empty if using FD */
 
 	/* Output from PARASITE */

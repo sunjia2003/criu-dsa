@@ -2300,6 +2300,7 @@ static int cr_pre_dump_finish(int status)
 	frozen_timeline_finish(status);
 	frozen_timeline_write_csv();
 	memdump_timeline_write_csv();
+	dsa_pipeline_trace_write_after_thaw();
 
 	if (status < 0) {
 		ret = status;
@@ -2566,6 +2567,7 @@ static int cr_dump_finish(int ret)
 		frozen_timeline_write_csv();
 		frozen_detail_write_csv(ret);
 		memdump_timeline_write_csv();
+		dsa_pipeline_trace_write_after_thaw();
 
 		if (ws_snapshot_join_and_finalize(&dump_ws_snapshot) && !ret)
 			ret = -1;
@@ -2705,6 +2707,7 @@ static int cr_dump_finish(int ret)
 	frozen_timeline_write_csv();
 	frozen_detail_write_csv(ret || post_dump_ret);
 	memdump_timeline_write_csv();
+	dsa_pipeline_trace_write_after_thaw();
 
 	if (ws_snapshot_join_and_finalize(&dump_ws_snapshot) && !ret)
 		ret = -1;

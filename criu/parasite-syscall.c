@@ -328,7 +328,7 @@ int parasite_dump_cgroup(struct parasite_ctl *ctl, struct parasite_dump_cgroup_a
 
 int parasite_dsa_dump_pages_seized(struct parasite_ctl *ctl, struct parasite_dsa_dump_pages_args *args,
 				   int shared_buf_fd,
-				   int *wq_fds, int wq_count)
+				   int *wq_fds, int wq_count, int pipeline_trace_fd)
 {
 	int ret;
 	int sync_ret;
@@ -339,6 +339,11 @@ int parasite_dsa_dump_pages_seized(struct parasite_ctl *ctl, struct parasite_dsa
 	int i;
 
 	if (!args || wq_count <= 0 || wq_count > DSA_DUMP_MAX_WQ)
+		return -EINVAL;
+	if (!!args->pipeline_trace_bytes != (pipeline_trace_fd >= 0) ||
+	    (args->pipeline_trace_bytes && (!args->profile_enabled ||
+	     args->pipeline_trace_bytes > DSA_PIPELINE_TRACE_BYTES_MAX ||
+	     args->pipeline_trace_bytes % sizeof(struct dsa_pipeline_event))))
 		return -EINVAL;
 
 	if (!wq_fds) {
@@ -368,7 +373,7 @@ int parasite_dsa_dump_pages_seized(struct parasite_ctl *ctl, struct parasite_dsa
 	pa->use_shared_buf_fd = (shared_buf_fd >= 0) ? 1 : 0;
 
 	/* If any FD has to be passed, use call + send_fd + sync flow. */
-	if (pa->use_wq_fd || pa->use_shared_buf_fd) {
+	if (pa->use_wq_fd || pa->use_shared_buf_fd || pa->pipeline_trace_bytes) {
 		sk = compel_rpc_sock(ctl);
 
 		/* Start the RPC call first */
@@ -386,6 +391,16 @@ int parasite_dsa_dump_pages_seized(struct parasite_ctl *ctl, struct parasite_dsa
 					pr_err("Failed to sync DSA RPC after shared fd send error\n");
 				return -1;
 			}
+		}
+
+		/* Shared arena, optional diagnostic trace, then workqueues: the
+		 * parasite receives in exactly this order. */
+		if (pa->pipeline_trace_bytes && send_fd(sk, NULL, 0, pipeline_trace_fd) < 0) {
+			pr_err("Can't send DSA pipeline trace fd to parasite\n");
+			sync_ret = compel_rpc_sync(PARASITE_CMD_DSA_DUMP_PAGES, ctl);
+			if (sync_ret)
+				pr_err("Failed to sync DSA RPC after trace fd send error\n");
+			return -1;
 		}
 
 		/* Send all WQ FDs if fd mode is requested */

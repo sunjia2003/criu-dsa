@@ -81,6 +81,7 @@ static u32 dsa_raw_stream_slot_batches[DSA_STREAM_SLOT_COUNT];
 static u32 dsa_raw_stream_slot_seq[DSA_STREAM_SLOT_COUNT];
 static u32 dsa_raw_stream_slot_complete[DSA_STREAM_SLOT_COUNT];
 static struct parasite_dsa_pipeline *dsa_pipeline;
+static struct dsa_pipeline_event *dsa_pipeline_events;
 
 #ifndef SPLICE_F_GIFT
 #define SPLICE_F_GIFT 0x08
@@ -245,7 +246,40 @@ static void dsa_pipeline_accumulate(u64 *counter, u64 begin, u64 end)
 		*counter += end - begin;
 }
 
-static void dsa_pipeline_switch(u32 phase)
+static void dsa_pipeline_record_interval(u64 begin, u64 end)
+{
+	struct parasite_dsa_pipeline *p = dsa_pipeline;
+	struct dsa_pipeline_event *event;
+	bool continued;
+
+	if (!dsa_pipeline_events || !p->clock_valid || !begin || end < begin)
+		return;
+	continued = p->trace_segments && p->trace_last_phase == p->phase &&
+		    p->trace_last_occurrence == p->occurrence;
+	if (continued) {
+		/* Coalesce adjacent parts of the same invocation, never across a
+		 * child operation or a dropped interval. */
+		if (!p->trace_dropped && p->trace_count)
+			dsa_pipeline_events[p->trace_count - 1].end_ns = end;
+		return;
+	}
+	p->trace_segments++;
+	p->phase_segments[p->phase]++;
+	p->trace_last_phase = p->phase;
+	p->trace_last_occurrence = p->occurrence;
+	if (p->trace_count >= p->trace_capacity) {
+		p->trace_dropped++;
+		return;
+	}
+	event = &dsa_pipeline_events[p->trace_count++];
+	event->start_ns = begin;
+	event->end_ns = end;
+	event->occurrence = p->occurrence;
+	event->phase = p->phase;
+	event->flags = p->phase_flags;
+}
+
+static void dsa_pipeline_set_phase(u32 phase, u64 occurrence, u32 flags)
 {
 	u64 now;
 
@@ -254,8 +288,43 @@ static void dsa_pipeline_switch(u32 phase)
 	now = dsa_pipeline_now();
 	dsa_pipeline_accumulate(&dsa_pipeline->phase_ns[dsa_pipeline->phase],
 				dsa_pipeline->last_ns, now);
+	dsa_pipeline_record_interval(dsa_pipeline->last_ns, now);
 	dsa_pipeline->phase = phase;
+	if (!occurrence) {
+		occurrence = ++dsa_pipeline->next_occurrence;
+		dsa_pipeline->phase_calls[phase]++;
+	}
+	dsa_pipeline->occurrence = occurrence;
+	dsa_pipeline->phase_flags = flags;
 	dsa_pipeline->last_ns = now;
+	dsa_pipeline->phase_transitions++;
+}
+
+static void dsa_pipeline_switch(u32 phase)
+{
+	if (dsa_pipeline)
+		dsa_pipeline_set_phase(phase, phase == dsa_pipeline->phase ?
+				       dsa_pipeline->occurrence : 0, 0);
+}
+
+/* One active accounting phase. Entering a helper stops its caller's ledger;
+ * restoring the saved phase resumes it, including fault-recovery call paths. */
+static struct dsa_pipeline_scope dsa_pipeline_enter(u32 phase)
+{
+	struct dsa_pipeline_scope parent = { .phase = DSA_PIPELINE_CONTROL };
+
+	if (dsa_pipeline) {
+		parent.phase = dsa_pipeline->phase;
+		parent.occurrence = dsa_pipeline->occurrence;
+		dsa_pipeline_set_phase(phase, 0, 0);
+	}
+	return parent;
+}
+
+static void dsa_pipeline_resume(struct dsa_pipeline_scope parent)
+{
+	if (dsa_pipeline)
+		dsa_pipeline_set_phase(parent.phase, parent.occurrence, DSA_PIPELINE_EVENT_RESUMED);
 }
 
 static void dsa_pipeline_record_batch(struct dsa_raw_stream_batch *batch, u64 observed)
@@ -1388,7 +1457,8 @@ static int dsa_raw_stream_batch_prepare(
 	u32 base = batch_idx * DSA_HW_BATCH_CHILDREN;
 	u32 wq_sel = 0;
 	u64 bytes = 0;
-	u64 pipeline_begin = dsa_pipeline_now();
+	struct dsa_pipeline_scope pipeline_parent = dsa_pipeline_enter(DSA_PIPELINE_PREPARE);
+	u64 pipeline_begin = dsa_pipeline ? dsa_pipeline->last_ns : 0;
 	u32 i;
 
 	if (!batch->child_count ||
@@ -1445,9 +1515,10 @@ static int dsa_raw_stream_batch_prepare(
 	 * rollback path. */
 	active_wq_load[wq_sel] += bytes;
 	if (dsa_pipeline) {
-		u64 end = dsa_pipeline_now();
+		u64 end;
 
-		dsa_pipeline_accumulate(&dsa_pipeline->prepare_ns, pipeline_begin, end);
+		dsa_pipeline_resume(pipeline_parent);
+		end = dsa_pipeline->last_ns;
 		if (!batch->pipeline.prepare_begin_ns) {
 			batch->pipeline.prepare_begin_ns = pipeline_begin;
 			batch->pipeline.prepare_end_ns = end;
@@ -1466,18 +1537,21 @@ static int dsa_raw_stream_batch_submit_released(
 	u32 base = batch_idx * DSA_HW_BATCH_CHILDREN;
 	int rc;
 	u64 pipeline_begin;
+	struct dsa_pipeline_scope pipeline_parent;
 
 	if (!batch->child_count || batch->active || !batch->prepared_bytes)
 		return -1;
-	pipeline_begin = dsa_pipeline_now();
+	pipeline_parent = dsa_pipeline_enter(DSA_PIPELINE_SUBMIT);
+	pipeline_begin = dsa_pipeline ? dsa_pipeline->last_ns : 0;
 	rc = dsa_submit_copy_desc(
 		a, batch->direct_single ? &dsa_copy_hw_descs[base] :
 		   &dsa_copy_batch_descs[batch_idx],
 		batch->prepared_wq_idx, use_portal, portal_mask, portal_offset);
 	if (dsa_pipeline) {
-		u64 end = dsa_pipeline_now();
+		u64 end;
 
-		dsa_pipeline_accumulate(&dsa_pipeline->submit_call_ns, pipeline_begin, end);
+		dsa_pipeline_resume(pipeline_parent);
+		end = dsa_pipeline->last_ns;
 		if (!batch->pipeline.submit_begin_ns) {
 			batch->pipeline.submit_begin_ns = pipeline_begin;
 			batch->pipeline.submit_end_ns = end;
@@ -1874,6 +1948,8 @@ static int dsa_stream_consume_hw_runway(
 		dsa_pipeline->consumer_begin_ns = dsa_pipeline_now();
 		dsa_pipeline->last_ns = dsa_pipeline->consumer_begin_ns;
 		dsa_pipeline->phase = DSA_PIPELINE_CONTROL;
+		dsa_pipeline->occurrence = ++dsa_pipeline->next_occurrence;
+		dsa_pipeline->phase_calls[DSA_PIPELINE_CONTROL]++;
 	}
 
 	if (hdr->slot_count != DSA_STREAM_SLOT_COUNT ||
@@ -1907,6 +1983,7 @@ static int dsa_stream_consume_hw_runway(
 		for (i = 0; i < DSA_HW_BATCH_OUTER_DEPTH; i++) {
 			int rc;
 			u64 pipeline_observed;
+			struct dsa_pipeline_scope pipeline_parent;
 
 			if (!dsa_raw_stream_batches[i].active)
 				continue;
@@ -1918,13 +1995,12 @@ static int dsa_stream_consume_hw_runway(
 				}
 				continue;
 			}
-			pipeline_observed = dsa_pipeline_now();
+			pipeline_parent = dsa_pipeline_enter(DSA_PIPELINE_HARVEST);
+			pipeline_observed = dsa_pipeline ? dsa_pipeline->last_ns : 0;
 			rc = dsa_raw_stream_batch_harvest(
 				a, i, active_wq_count, active_wq_idx,
 				active_wq_load, use_portal, portal_mask, portal_offset);
-			if (dsa_pipeline)
-				dsa_pipeline_accumulate(&dsa_pipeline->harvest_ns,
-						pipeline_observed, dsa_pipeline_now());
+			dsa_pipeline_resume(pipeline_parent);
 			if (rc < 0)
 				goto fail;
 			if (rc == 1) {
@@ -2026,6 +2102,9 @@ static int dsa_stream_consume_hw_runway(
 			if (dsa_pipeline) {
 				dsa_pipeline_switch(DSA_PIPELINE_CONTROL);
 				dsa_pipeline->consumer_end_ns = dsa_pipeline->last_ns;
+				dsa_pipeline->prepare_ns = dsa_pipeline->phase_ns[DSA_PIPELINE_PREPARE];
+				dsa_pipeline->submit_call_ns = dsa_pipeline->phase_ns[DSA_PIPELINE_SUBMIT];
+				dsa_pipeline->harvest_ns = dsa_pipeline->phase_ns[DSA_PIPELINE_HARVEST];
 			}
 			return 0;
 		}
@@ -2136,7 +2215,9 @@ static int parasite_dsa_dump_pages(struct parasite_dsa_dump_pages_args *a)
 	void *portal_va;
 	int tsock;
 	int shared_buf_fd = -1;
+	int pipeline_trace_fd = -1;
 	void *shared_map = (void *)-1;
+	void *pipeline_trace_map = (void *)-1;
 	u64 setup_begin_us = 0;
 	u64 setup_end_us = 0;
 	u64 shared_setup_begin_us = 0;
@@ -2155,6 +2236,16 @@ static int parasite_dsa_dump_pages(struct parasite_dsa_dump_pages_args *a)
 	 */
 	a = &local_args;
 	dsa_pipeline = NULL;
+	dsa_pipeline_events = NULL;
+	/* Error cleanup can precede arena/trace mapping. Never inspect uninitialized
+	 * portal or FD entries if diagnostic setup fails. */
+	for (i = 0; i < DSA_DUMP_MAX_WQ; i++) {
+		wq_fds[i] = -1;
+		use_portal[i] = 0;
+		portal_mask[i] = 0;
+		portal_offset[i] = 0;
+		portals[i] = (void *)-1;
+	}
 
 	/* Initialize output fields */
 	a->op_ret = -1;
@@ -2200,6 +2291,12 @@ static int parasite_dsa_dump_pages(struct parasite_dsa_dump_pages_args *a)
 	a->cleanup_close_us = 0;
 
 	/* Validate input parameters */
+	if (a->pipeline_trace_bytes && (!a->profile_enabled ||
+	    a->pipeline_trace_bytes > DSA_PIPELINE_TRACE_BYTES_MAX ||
+	    a->pipeline_trace_bytes % sizeof(struct dsa_pipeline_event))) {
+		a->op_ret = -EINVAL;
+		goto out_copy_results;
+	}
 	if (!a->shared_map_size)
 		a->shared_map_size = a->shared_buf_size;
 
@@ -2320,16 +2417,32 @@ static int parasite_dsa_dump_pages(struct parasite_dsa_dump_pages_args *a)
 		a->op_ret = -EINVAL;
 		goto out_cleanup;
 	}
-	dsa_wq_cache_init_once();
-
-	/* Initialize all WQ pointers */
-	for (i = 0; i < a->wq_count; i++) {
-		wq_fds[i] = -1;
-		use_portal[i] = 0;
-		portal_mask[i] = 0;
-		portal_offset[i] = 0;
-		portals[i] = (void *)-1;
+	if (a->pipeline_trace_bytes) {
+		if (!stream_hdr || !stream_hdr->pipeline.enabled ||
+		    stream_hdr->pipeline.trace_capacity !=
+			    a->pipeline_trace_bytes / sizeof(struct dsa_pipeline_event)) {
+			a->op_ret = -EINVAL;
+			goto out_cleanup;
+		}
+		pipeline_trace_fd = recv_fd(parasite_get_rpc_sock());
+		if (pipeline_trace_fd < 0) {
+			pr_err("DSA pipeline trace recv fd failed\n");
+			a->op_ret = -EIO;
+			goto out_cleanup;
+		}
+		pipeline_trace_map = (void *)sys_mmap(NULL, a->pipeline_trace_bytes,
+						   PROT_READ | PROT_WRITE,
+						   MAP_SHARED | MAP_POPULATE, pipeline_trace_fd, 0);
+		if ((long)pipeline_trace_map < 0) {
+			pr_err("DSA pipeline trace mmap failed\n");
+			a->op_ret = -ENOMEM;
+			goto out_cleanup;
+		}
+		dsa_pipeline_events = pipeline_trace_map;
+		sys_close(pipeline_trace_fd);
+		pipeline_trace_fd = -1;
 	}
+	dsa_wq_cache_init_once();
 
 	wq_setup_begin_us = dsa_now_us();
 
@@ -2502,6 +2615,12 @@ static int parasite_dsa_dump_pages(struct parasite_dsa_dump_pages_args *a)
 	goto out_cleanup;
 
 out_cleanup:
+	/* Consumer has stopped; trace pages remain mapped by Host until export. */
+	dsa_pipeline_events = NULL;
+	if ((long)pipeline_trace_map >= 0)
+		sys_munmap(pipeline_trace_map, a->pipeline_trace_bytes);
+	if (pipeline_trace_fd >= 0)
+		sys_close(pipeline_trace_fd);
 	if (!a->setup_shared_us && shared_setup_begin_us) {
 		shared_setup_end_us = dsa_now_us();
 		if (shared_setup_end_us > shared_setup_begin_us)
@@ -2596,6 +2715,7 @@ out_cleanup:
 		__atomic_thread_fence(__ATOMIC_RELEASE);
 	}
 	dsa_pipeline = NULL;
+	dsa_pipeline_events = NULL;
 	return 0;
 }
 
