@@ -61,6 +61,13 @@ class FlowTests(unittest.TestCase):
         self.assertEqual(result['groups'][0]['harvest_end_ns'], 41)
         self.assertEqual(result['empty_input_observation_intervals'], [])
 
+    def test_consumer_may_finish_before_producer_records_post_release(self):
+        self.host[5]['ns'] = 50
+        self.assertEqual(self.result()['loop_end_ns'],44)
+        self.host[4]['ns'] = 49
+        with self.assertRaisesRegex(ValueError,'Finish/end'):
+            self.result()
+
     def test_observed_wait_is_not_inferred_from_held_queue_snapshot(self):
         self.parasite[3:3] = [event('empty_input_begin', 7), event('empty_input_end', 22, a=1)]
         self.assertEqual(self.result()['empty_input_observation_intervals'], [(7, 22)])

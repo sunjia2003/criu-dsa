@@ -162,7 +162,10 @@ def correlate(host, parasite, dump_log=None):
     require((finish['a'], finish['b']) == (finish_post['a'], finish_post['b']) ==
             (total_bytes, total_desc) == (loop_end['b'], loop_end['a']),
             'Finished payload/descriptors differ from flow')
-    require(finish['ns'] <= finish_post['ns'] <= loop_end['ns'], 'Finish/end ordering invalid')
+    # The consumer may finish after the release store but before the producer
+    # records FINISH_POST (e.g. the producer is descheduled at that boundary).
+    require(finish['ns'] <= finish_post['ns'] and finish['ns'] <= loop_end['ns'],
+            'Finish/end ordering invalid')
     wait = None
     waits = []
     for event in he:

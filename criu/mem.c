@@ -4001,6 +4001,19 @@ again:
 	return ret;
 }
 
+/* Optional coarse evidence uses existing counters; no per-page/loop probes. */
+static void dsa_desc_scan_emit_summary(struct dsa_desc_scan_ctx *sc)
+{
+	if (!dsa_env_enabled("CRIU_DSA_STREAM_SUMMARY"))
+		return;
+	pr_info("DSA_STREAM_SUMMARY: version=1 payload_bytes=%llu descriptors=%llu slots=%u producer_wait_slot_us=%llu stream_finish_wait_us=%llu raw_faults=%u raw_fault_resubmits=%u batch_max_active_outer=%u batch_child_submits=%u\n",
+		(unsigned long long)sc->stream_bytes, (unsigned long long)sc->stream_descs,
+		sc->produced_slots, (unsigned long long)sc->producer_wait_slot_us,
+		(unsigned long long)sc->finish_wait_us, sc->rpc_args.raw_faults,
+		sc->rpc_args.raw_fault_resubmits, sc->rpc_args.batch_max_active_outer,
+		sc->rpc_args.batch_child_submits);
+}
+
 static int generate_iovs_dsa_desc_scan(struct pstree_item *item,
 				       struct vma_area *vma,
 				       struct page_pipe *pp,
@@ -4544,6 +4557,7 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 			xfer.dsa_fg_materialized = false;
 		}
 		dsa_rpc_total_us = dsa_wall_delta_us(dsa_rpc_start_us, dsa_wall_now_us());
+		dsa_desc_scan_emit_summary(&dsa_sc);
 		if (dsa_sc.scan_profile)
 			pr_info("DSA_MEMDUMP_DETAIL: mode=streaming raw_capture=%u raw_capture_mode=%s scan_build_us=%llu scan_pages=%llu dump_pages=%llu hole_pages=%llu lazy_pages=%llu stream_finish_us=%llu dsa_rpc_total_us=%llu stream_payload_bytes=%llu stream_desc_count=%llu stream_flush_count=%u producer_wait_slot_us=%llu stream_finish_wait_us=%llu parasite_prefault_us=%llu raw_prefault_pages=%llu parasite_submit_us=%llu parasite_poll_us=%llu parasite_completed_count=%u parasite_submit_enqcmd=%u parasite_submit_write=%u batch_outer_submits=%u batch_child_submits=%u batch_partial_submits=%u batch_single_tail_submits=%u batch_outer_success=%u batch_outer_fail=%u batch_child_success=%u batch_child_nobof=%u batch_max_active_outer=%u batch_max_active_children=%u batch_enq_retries=%u raw_faults=%u raw_fault_source=%u raw_fault_destination=%u raw_fault_resubmits=%u raw_fault_partial_bytes=%llu raw_fault_touch_us=%llu raw_fault_resubmit_us=%llu\n",
 		dsa_ctx->raw_fg_capture ? 1 : 0,
