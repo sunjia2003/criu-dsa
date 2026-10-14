@@ -108,7 +108,7 @@ int main(int argc, char **argv) {
     fake_ns += 40; submit = dsa_pipeline_enter(DSA_PIPELINE_SUBMIT);
     fake_ns += 50; dsa_pipeline_resume(submit);
     fake_ns += 60; dsa_pipeline_resume(accept);
-    fake_ns += 70; dsa_pipeline_switch(DSA_PIPELINE_POLL_SCAN);
+    fake_ns += 70; dsa_pipeline_switch(DSA_PIPELINE_CONTROL);
     fake_ns += 80; harvest = dsa_pipeline_enter(DSA_PIPELINE_HARVEST);
     /* Real fault-recovery call shape: harvest -> prepare/submit -> harvest. */
     fake_ns += 90; prepare = dsa_pipeline_enter(DSA_PIPELINE_PREPARE);
@@ -118,8 +118,8 @@ int main(int argc, char **argv) {
     fake_ns += 130; dsa_pipeline_resume(harvest);
     fake_ns += 140; dsa_pipeline_switch(DSA_PIPELINE_CONTROL);
     fake_ns += 150; dsa_pipeline_switch(DSA_PIPELINE_CONTROL);
-    assert(p.phase_ns[DSA_PIPELINE_CONTROL] == 230);
-    assert(p.phase_ns[DSA_PIPELINE_POLL_SCAN] == 220);
+    assert(p.phase_ns[DSA_PIPELINE_CONTROL] == 450);
+    assert(p.phase_ns[DSA_PIPELINE_POLL_SCAN] == 0);
     assert(p.phase_ns[DSA_PIPELINE_ACCEPT] == 120);
     assert(p.phase_ns[DSA_PIPELINE_PREPARE] == 130);
     assert(p.phase_ns[DSA_PIPELINE_SUBMIT] == 170);
@@ -132,10 +132,10 @@ int main(int argc, char **argv) {
     assert(p.phase_calls[DSA_PIPELINE_ACCEPT] == 1);
     if (dsa_pipeline_events) {
         assert(p.phase_segments[DSA_PIPELINE_ACCEPT] == 3);
-        assert(p.trace_segments == 15);
+        assert(p.trace_segments == 13);
         assert(p.trace_count + p.trace_dropped == p.trace_segments);
         if (!strcmp(argv[1], "overflow")) {
-            assert(p.trace_count == 2 && p.trace_dropped == 13);
+            assert(p.trace_count == 2 && p.trace_dropped == 11);
             assert(events[1].end_ns == 130); /* Never extend across dropped work. */
         } else {
             assert(events[0].start_ns == 100);
@@ -211,8 +211,8 @@ int main(int argc, char **argv) {
         spec.loader.exec_module(reader)
         subprocess.run([str(self.binary), 'export'], cwd=self.temporary.name, check=True)
         result = reader.validate(pathlib.Path(self.temporary.name)/'trace.bin')
-        self.assertEqual(result['records'], 15)
-        self.assertEqual(result['phases']['accept'], dict(exclusive_ns=120, calls=1, fragments=3))
+        self.assertEqual(result['records'], 13)
+        self.assertEqual(result['phases']['accept_batch'], dict(exclusive_ns=120, calls=1, fragments=3))
 
 
 if __name__ == '__main__':

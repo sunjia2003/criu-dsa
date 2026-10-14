@@ -358,18 +358,18 @@ struct parasite_dsa_stream_slot {
 #define DSA_PIPELINE_TRACE_BYTES_DEFAULT (256U * 1024U * 1024U)
 #define DSA_PIPELINE_TRACE_BYTES_MAX (512U * 1024U * 1024U)
 #define DSA_PIPELINE_TRACE_MAGIC 0x44535054U
-#define DSA_PIPELINE_TRACE_VERSION 1U
+#define DSA_PIPELINE_TRACE_VERSION 2U
 #define DSA_PIPELINE_EVENT_RESUMED 1U
 #define DSA_PIPELINE_TRACE_COMPLETE 1U
 #define DSA_HOST_TRACE_BYTES_DEFAULT (512U * 1024U * 1024U)
 #define DSA_HOST_TRACE_BYTES_MAX (1024U * 1024U * 1024U)
 #define DSA_HOST_TRACE_MAGIC 0x44534854U
-#define DSA_HOST_TRACE_PHASE_NR 17U
+#define DSA_HOST_TRACE_PHASE_NR 3U
 
 enum dsa_pipeline_phase {
-	DSA_PIPELINE_CONTROL,
-	DSA_PIPELINE_POLL_SCAN,
-	DSA_PIPELINE_ACCEPT,
+	DSA_PIPELINE_CONTROL, /* v2: background checks, retirement and PAUSE */
+	DSA_PIPELINE_POLL_SCAN, /* v2: reserved; merged into background */
+	DSA_PIPELINE_ACCEPT, /* v2: successful software-batch intake only */
 	DSA_PIPELINE_PREPARE,
 	DSA_PIPELINE_SUBMIT,
 	DSA_PIPELINE_HARVEST,
@@ -412,7 +412,7 @@ struct dsa_host_trace_file {
 
 _Static_assert(sizeof(struct dsa_pipeline_event) == 32, "DSA pipeline event layout");
 _Static_assert(sizeof(struct dsa_pipeline_trace_file) == 208, "DSA pipeline file layout");
-_Static_assert(sizeof(struct dsa_host_trace_file) == 472, "DSA host trace file layout");
+_Static_assert(sizeof(struct dsa_host_trace_file) == 136, "DSA host trace file layout");
 
 /* Diagnostic observations, not device execution timestamps. First submissions
  * and a completion-ordered tail are retained; this is not an exhaustive trace. */

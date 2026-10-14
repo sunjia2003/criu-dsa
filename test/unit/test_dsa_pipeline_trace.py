@@ -89,6 +89,22 @@ class TraceReaderTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             reader.validate(self.path, log)
 
+    def test_v2_reports_reserved_poll_as_not_collected(self):
+        self.fields[1] = 2
+        self.write()
+        result = reader.validate(self.path)
+        self.assertEqual(result['version'], 2)
+        self.assertEqual(result['phases']['accept_batch']['exclusive_ns'], 60)
+        self.assertFalse(result['phases']['reserved_poll']['collected'])
+        self.assertEqual(result['phases']['reserved_poll']['merged_into'], 'background_check')
+
+    def test_v2_rejects_reserved_phase_events(self):
+        self.fields[1] = 2
+        self.events[1] = (110, 130, 2, 1, 0)
+        self.write()
+        with self.assertRaisesRegex(ValueError, 'Reserved poll phase'):
+            reader.validate(self.path)
+
 
 if __name__ == '__main__':
     unittest.main()

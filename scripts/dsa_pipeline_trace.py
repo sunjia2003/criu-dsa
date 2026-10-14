@@ -14,8 +14,11 @@ MAGIC = 0x44535054
 HEADER = struct.Struct('<4I22Q4I')
 HOST_MAGIC = 0x44534854
 HOST_HEADER = struct.Struct('<4I55Q4I')
+HOST_HEADER_V2 = struct.Struct('<4I13Q4I')
 EVENT = struct.Struct('<3Q2I')
 PHASES = ('control', 'poll_scan', 'accept', 'prepare', 'submit', 'harvest')
+PHASES_V2 = ('background_check', 'reserved_poll', 'accept_batch', 'prepare', 'submit', 'harvest')
+HOST_PHASES_V2 = ('scan_organize', 'pack_publish', 'slot_wait')
 HOST_PHASES = ('control', 'vma_prepare', 'pagemap_read', 'shmem_metadata', 'page_select',
                'lazy_stack', 'parent_coverage', 'hole_metadata', 'page_metadata',
                'raw_tracking', 'desc_append', 'slot_wait', 'desc_sum', 'desc_copy',
@@ -29,22 +32,26 @@ def read_header(path):
         prefix = stream.read(16)
         if len(prefix) != 16:
             raise ValueError('Truncated pipeline trace header')
-        magic = struct.unpack('<4I', prefix)[0]
-        if magic not in (MAGIC, HOST_MAGIC):
-            raise ValueError('Unsupported pipeline trace magic')
-        layout, phases, role = ((HOST_HEADER, HOST_PHASES, 'host') if magic == HOST_MAGIC
-                                else (HEADER, PHASES, 'parasite'))
+        magic, version, _, _ = struct.unpack('<4I', prefix)
+        if magic not in (MAGIC, HOST_MAGIC) or version not in (1, 2):
+            raise ValueError('Unsupported pipeline trace magic/version')
+        if magic == HOST_MAGIC:
+            layout, phases, role = ((HOST_HEADER, HOST_PHASES, 'host') if version == 1
+                                    else (HOST_HEADER_V2, HOST_PHASES_V2, 'host'))
+        else:
+            layout, phases, role = HEADER, PHASES if version == 1 else PHASES_V2, 'parasite'
         data = prefix + stream.read(layout.size-16)
     if len(data) != layout.size:
         raise ValueError('Truncated pipeline trace header')
     fields = layout.unpack(data)
-    if fields[:4] != (magic, 1, layout.size, EVENT.size):
+    if fields[:4] != (magic, version, layout.size, EVENT.size):
         raise ValueError('Unsupported pipeline trace magic/version/layout/endianness')
     n = len(phases)
     return dict(begin_ns=fields[4], end_ns=fields[5], count=fields[6], dropped=fields[7],
                 phase_ns=fields[8:8+n], calls=fields[8+n:8+2*n], segments=fields[8+2*n:8+3*n],
                 pid=fields[8+3*n], clock_valid=fields[9+3*n], capacity=fields[10+3*n],
-                flags=fields[11+3*n], role=role, phases=phases, header_bytes=layout.size)
+                flags=fields[11+3*n], role=role, phases=phases, header_bytes=layout.size,
+                version=version)
 
 
 def iter_events(path):
@@ -79,6 +86,8 @@ def validate(path, dump_log=None):
     for start, end, occurrence, phase, flags in iter_events(path):
         if phase >= len(names) or flags not in (0, RESUMED) or not occurrence:
             raise ValueError('Invalid phase/flags/occurrence')
+        if h['version'] == 2 and h['role'] == 'parasite' and phase == 1:
+            raise ValueError('Reserved poll phase must not contain v2 events')
         if start != last or end < start or end > h['end_ns']:
             raise ValueError('Missing, overlapping, backwards or out-of-window interval')
         if occurrence == len(occurrence_phases)+1:
@@ -101,9 +110,12 @@ def validate(path, dump_log=None):
         raise ValueError('Trace durations do not reproduce exclusive counters')
     if tuple(calls) != h['calls'] or tuple(segments) != h['segments']:
         raise ValueError('Trace invocation/fragment counts do not match counters')
-    result = dict(pid=h['pid'], complete=True, records=seen, role=h['role'],
+    result = dict(pid=h['pid'], complete=True, records=seen, role=h['role'], version=h['version'],
                   phases={name:dict(exclusive_ns=totals[i], calls=calls[i], fragments=segments[i])
                           for i, name in enumerate(names)})
+    if h['version'] == 2 and h['role'] == 'parasite':
+        result['phases']['reserved_poll']['collected'] = False
+        result['phases']['reserved_poll']['merged_into'] = 'background_check'
     prefix = 'scan' if h['role'] == 'host' else 'consumer'
     result.update({prefix+'_begin_ns':h['begin_ns'], prefix+'_end_ns':h['end_ns'],
                    prefix+'_wall_ns':last-h['begin_ns']})
@@ -124,16 +136,17 @@ def verify_log(result, text):
         if len(profiles) != 1 or len(detail) != 1:
             raise ValueError('Expected one Host trace and scan-detail profile for trace PID')
         p, d = profiles[0], detail[0]
-        if p.get('version') != 1 or p.get('clock_valid') != 1 or any(
+        if p.get('version') != result['version'] or p.get('clock_valid') != 1 or any(
                 p.get(key) != result[key] for key in ('scan_begin_ns', 'scan_end_ns')):
             raise ValueError('Host trace and log scan window/clock/version differ')
         if d.get('clock_valid') != 1 or d.get('total_ns') != result['scan_wall_ns'] or d.get('accounted_ns') != result['scan_wall_ns']:
             raise ValueError('Host scan-detail ledger does not close')
         counts = rows('DSA_HOST_TRACE_PHASE_COUNTS')
-        if len(counts) != len(HOST_PHASES) or {row.get('phase') for row in counts} != set(range(len(HOST_PHASES))):
+        names = tuple(result['phases'])
+        if len(counts) != len(names) or {row.get('phase') for row in counts} != set(range(len(names))):
             raise ValueError('Missing or duplicate Host phase-count rows')
         for row in counts:
-            name = HOST_PHASES[row['phase']]
+            name = names[row['phase']]
             phase = result['phases'][name]
             if d.get(name+'_ns') != phase['exclusive_ns'] or any(
                     row.get(source) != phase[target] for source, target in
@@ -147,15 +160,16 @@ def verify_log(result, text):
     if len(profiles) != 1:
         raise ValueError('Expected one aggregate profile for trace PID')
     p = profiles[0]
-    if p.get('version') != 2 or p.get('clock_valid') != 1 or any(
+    if p.get('version') != result['version']+1 or p.get('clock_valid') != 1 or any(
             p.get(key) != result[key] for key in ('consumer_begin_ns', 'consumer_end_ns')):
         raise ValueError('Trace and log lifecycle/clock/version differ')
     counts = rows('DSA_PIPELINE_PHASE_COUNTS')
     if len(counts) != 6 or {row.get('phase') for row in counts} != set(range(6)):
         raise ValueError('Missing or duplicate phase-count log rows')
+    names = tuple(result['phases'])
     for row in counts:
-        phase = result['phases'][PHASES[row['phase']]]
-        key = 'submit_call_ns' if row['phase'] == 4 else PHASES[row['phase']]+'_ns'
+        phase = result['phases'][names[row['phase']]]
+        key = 'submit_call_ns' if row['phase'] == 4 else names[row['phase']]+'_ns'
         if p.get(key) != phase['exclusive_ns'] or any(
                 row.get(source) != phase[target] for source, target in
                 (('calls', 'calls'), ('segments', 'fragments'), ('exclusive_ns', 'exclusive_ns'))):

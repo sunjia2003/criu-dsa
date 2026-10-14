@@ -1868,14 +1868,13 @@ static int dsa_raw_stream_accept_slot(
 	u32 desc_pos = 0;
 	u32 payload_pos = 0;
 	u32 i, j;
-	u64 pipeline_accept = dsa_pipeline_now();
-	u64 ready_observed;
+	u64 pipeline_accept;
+	struct dsa_pipeline_scope pipeline_parent;
 
 	if (dsa_atomic_load_u32(&slot->state) != DSA_STREAM_SLOT_READY ||
 	    slot->seq != seq)
 		return -1;
 	__atomic_thread_fence(__ATOMIC_ACQUIRE);
-	ready_observed = dsa_flow_now_ns();
 	if (!slot->desc_count || slot->desc_count > hdr->slot_desc_cap ||
 	    slot->desc_off < hdr->desc_area_off || slot->desc_off >= hdr->payload_base ||
 	    slot->desc_count * sizeof(*input) > hdr->payload_base - slot->desc_off ||
@@ -1892,8 +1891,11 @@ static int dsa_raw_stream_accept_slot(
 			free_batch[free_count++] = i;
 	if (free_count < needed)
 		return 0;
+	/* Failed capacity checks stay in background; time only actual batch intake. */
+	pipeline_parent = dsa_pipeline_enter(DSA_PIPELINE_ACCEPT);
+	pipeline_accept = dsa_pipeline ? dsa_pipeline->last_ns : dsa_flow_now_ns();
 	if (dsa_consumer_flow.header)
-		dsa_flow_push(&dsa_consumer_flow, ready_observed, DSA_FLOW_ACCEPT, seq,
+		dsa_flow_push(&dsa_consumer_flow, pipeline_accept, DSA_FLOW_ACCEPT, seq,
 			DSA_FLOW_NO_ID, 0, pipeline_accept, slot->desc_count,
 			slot->payload_bytes, needed, 0);
 
@@ -2005,6 +2007,7 @@ static int dsa_raw_stream_accept_slot(
 	}
 	if (slot->payload_off + slot->payload_bytes > a->new_buf_offset)
 		a->new_buf_offset = slot->payload_off + slot->payload_bytes;
+	dsa_pipeline_resume(pipeline_parent);
 	return 1;
 }
 
@@ -2074,7 +2077,6 @@ static int dsa_stream_consume_hw_runway(
 			a->op_ret = -EIO;
 			goto fail;
 		}
-		dsa_pipeline_switch(DSA_PIPELINE_POLL_SCAN);
 		for (i = 0; i < DSA_HW_BATCH_OUTER_DEPTH; i++) {
 			int rc;
 			u64 pipeline_observed;
@@ -2111,7 +2113,6 @@ static int dsa_stream_consume_hw_runway(
 			if (rc > 0)
 				progressed = true;
 		}
-		dsa_pipeline_switch(DSA_PIPELINE_CONTROL);
 		while (retire_seq < accept_seq) {
 			u32 slot_idx = retire_seq % hdr->slot_count;
 			struct parasite_dsa_stream_slot *slot = &slots[slot_idx];
@@ -2130,7 +2131,6 @@ static int dsa_stream_consume_hw_runway(
 		produced = dsa_atomic_load_u32(&hdr->producer_seq);
 		dsa_flow_input_state(produced, accept_seq, active_outer,
 			dsa_atomic_load_u32(&hdr->finish));
-		dsa_pipeline_switch(DSA_PIPELINE_ACCEPT);
 		while (accept_seq < produced) {
 			struct parasite_dsa_stream_slot *slot =
 				&slots[accept_seq % hdr->slot_count];
@@ -2149,7 +2149,6 @@ static int dsa_stream_consume_hw_runway(
 			accept_seq++;
 			progressed = true;
 		}
-		dsa_pipeline_switch(DSA_PIPELINE_CONTROL);
 
 		if (active_outer > a->batch_max_active_outer)
 			a->batch_max_active_outer = active_outer;
