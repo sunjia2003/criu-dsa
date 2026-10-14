@@ -217,6 +217,16 @@ static inline u64 dsa_now_us(void)
 {
 	struct timeval tv;
 
+	/* Full-only intervals use the same validated MONOTONIC clock as the
+	 * chronology. Fallback remains MONOTONIC, so no epoch changes mid-RPC.
+	 * Off/profile retain their existing gettimeofday path. */
+	if (dsa_trace_clock.requested) {
+		struct timespec ts;
+
+		if (dsa_clock_read(&dsa_trace_clock, &ts))
+			return 0;
+		return dsa_trace_clock.last_ns / 1000ULL;
+	}
 	if (sys_gettimeofday(&tv, NULL))
 		return 0;
 
@@ -2316,11 +2326,6 @@ static int dsa_legacy_single_rpc_consume(struct parasite_dsa_dump_pages_args *a,
 #endif
 
 
-/*
- * Batch DSA dump pages to shared buffer
- * This function performs bulk copy of memory pages using DSA hardware acceleration
- * to a shared memory buffer managed by CRIU.
- */
 static int dsa_trace_clock_syscall(clockid_t clock, struct timespec *ts)
 {
 	return (int)sys_clock_gettime(clock, ts);
@@ -2351,6 +2356,7 @@ static void dsa_trace_clock_init(struct parasite_dsa_dump_pages_args *a)
 #endif
 }
 
+/* Copy pages to the shared arena with the asynchronous DSA consumer. */
 static int parasite_dsa_dump_pages(struct parasite_dsa_dump_pages_args *a)
 {
 	struct parasite_dsa_dump_pages_args *orig_args = a;
@@ -2894,12 +2900,14 @@ out_cleanup:
 	dsa_pipeline = NULL;
 	dsa_pipeline_events = NULL;
 	if (dsa_trace_clock.requested)
-		pr_info("DSA_TRACE_CLOCK: version=1 pid=%d requested=%u selected=%u checks=%u errors=%u vdso_reads=%llu syscall_reads=%llu max_bracket_ns=%llu\n",
+		pr_info("DSA_TRACE_CLOCK: version=1 pid=%d requested=%u selected=%u checks=%u errors=%u vdso_reads=%llu syscall_reads=%llu max_bracket_ns=%llu aggregate_monotonic=1 failed=%u\n",
 			(int)sys_getpid(), dsa_trace_clock.requested, dsa_trace_clock.selected,
 			dsa_trace_clock.checks, dsa_trace_clock.errors,
 			(unsigned long long)dsa_trace_clock.vdso_reads,
 			(unsigned long long)dsa_trace_clock.syscall_reads,
-			(unsigned long long)dsa_trace_clock.max_bracket_ns);
+			(unsigned long long)dsa_trace_clock.max_bracket_ns, dsa_trace_clock.failed);
+	dsa_trace_clock.requested = 0;
+	dsa_trace_clock.fast = NULL;
 	return 0;
 }
 

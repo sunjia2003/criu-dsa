@@ -8,7 +8,7 @@ typedef int (*dsa_clock_fn)(clockid_t, struct timespec *);
 struct dsa_trace_clock {
 	dsa_clock_fn fast, fallback;
 	u64 vdso_reads, syscall_reads, max_bracket_ns, last_ns;
-	u32 requested, selected, checks, errors;
+	u32 requested, selected, checks, errors, failed;
 };
 
 static inline int dsa_clock_valid(const struct timespec *ts)
@@ -23,6 +23,8 @@ static inline u64 dsa_clock_ns(const struct timespec *ts)
 
 static inline int dsa_clock_read(struct dsa_trace_clock *c, struct timespec *ts)
 {
+	if (c->failed)
+		return -1;
 	if (c->fast) {
 		c->vdso_reads++;
 		if (!c->fast(CLOCK_MONOTONIC, ts) && dsa_clock_valid(ts) &&
@@ -36,8 +38,11 @@ static inline int dsa_clock_read(struct dsa_trace_clock *c, struct timespec *ts)
 	}
 	c->syscall_reads++;
 	if (c->fallback(CLOCK_MONOTONIC, ts) || !dsa_clock_valid(ts) ||
-	    dsa_clock_ns(ts) < c->last_ns)
+	    dsa_clock_ns(ts) < c->last_ns) {
+		c->errors++;
+		c->failed = 1;
 		return -1;
+	}
 	c->last_ns = dsa_clock_ns(ts);
 	return 0;
 }

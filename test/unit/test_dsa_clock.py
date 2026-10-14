@@ -60,12 +60,17 @@ int main(void) {
   assert(!dsa_clock_read(&c, &ts) && c.syscall_reads == 1);
   slow_broken=1;
   assert(dsa_clock_read(&c, &ts) < 0);
+  assert(c.failed && c.errors == 1);
+  slow_broken=0;
+  assert(dsa_clock_read(&c, &ts) < 0); /* A failed capture is never silently repaired. */
+  slow_broken=1;
   c=(struct dsa_trace_clock){.fallback=syscall_clock,.requested=1};
   dsa_clock_try_vdso(&c, fast_clock);
   assert(!c.fast && !c.selected && !c.checks && c.errors == 1);
   slow_broken=0;
   c=(struct dsa_trace_clock){.fallback=syscall_clock,.last_ns=2000000000ULL};
   assert(dsa_clock_read(&c, &ts) < 0);
+  assert(c.failed && c.errors == 1);
   return 0;
 }
 '''
@@ -86,6 +91,50 @@ int main(void) {
         self.assertIn('DSA_TRACE_CLOCK: version=1 pid=', parasite)
         self.assertIn('static struct dsa_trace_clock dsa_trace_clock;', parasite)
         self.assertNotIn('result_trace_clock', (ROOT/'criu/include/parasite.h').read_text())
+
+    def test_full_microsecond_intervals_keep_clock_domain_on_fallback(self):
+        text=(ROOT/'criu/pie/parasite.c').read_text()
+        helper=text[text.index('static inline u64 dsa_now_us(void)'):
+                    text.index('static u64 dsa_pipeline_mono_ns(void)')]
+        code=r'''
+#include <assert.h>
+#include <stdint.h>
+#include <sys/time.h>
+typedef uint64_t u64;
+typedef uint32_t u32;
+#include "dsa-clock.h"
+static struct dsa_trace_clock dsa_trace_clock;
+static int wall_calls, broken;
+static int mono_clock(clockid_t clock, struct timespec *ts) {
+  assert(clock == CLOCK_MONOTONIC);
+  ts->tv_sec=100; ts->tv_nsec=2345; return 0;
+}
+static int fast_clock(clockid_t clock, struct timespec *ts) {
+  if (broken) return -1;
+  return mono_clock(clock, ts);
+}
+static long sys_gettimeofday(struct timeval *tv, void *tz) {
+  assert(tz == NULL);wall_calls++;tv->tv_sec=42;tv->tv_usec=123;return 0;
+}
+__HELPER__
+int main(void) {
+  assert(dsa_now_us() == 42000123 && wall_calls == 1);
+  dsa_trace_clock=(struct dsa_trace_clock){.requested=1,.fast=fast_clock,.fallback=mono_clock};
+  assert(dsa_now_us() == 100000002 && wall_calls == 1);
+  broken=1;
+  assert(dsa_now_us() == 100000002 && wall_calls == 1);
+  assert(!dsa_trace_clock.fast && dsa_trace_clock.errors == 1);
+  dsa_trace_clock.requested=0;
+  assert(dsa_now_us() == 42000123 && wall_calls == 2);
+  return 0;
+}
+'''.replace('__HELPER__',helper)
+        with tempfile.TemporaryDirectory(prefix='dsa-us-clock-') as temporary:
+            source=Path(temporary)/'clock.c';binary=Path(temporary)/'clock'
+            source.write_text(code)
+            subprocess.run(['cc','-std=gnu11','-O2','-Wall','-Wextra','-Werror',
+                            '-iquote'+str(ROOT/'criu/include'),str(source),'-o',str(binary)],check=True)
+            subprocess.run([str(binary)],check=True)
 
 
 if __name__ == '__main__':
