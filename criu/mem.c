@@ -2078,8 +2078,8 @@ static void dsa_abort_replay_pipe(struct page_pipe *pp, int pipe_fd)
 	}
 }
 
-/* Full-only, disjoint scan-window ledger.  Nested flushes change phase and
- * restore their caller; they are not added a second time to desc_append. */
+/* Full-only, disjoint scan-window ledger. Nested packing and actual waits
+ * stop their caller's ledger and restore it without double counting. */
 enum dsa_scan_detail_phase {
 	DSA_SCAN_ORGANIZE, DSA_SCAN_PACK_PUBLISH, DSA_SCAN_SLOT_WAIT, DSA_SCAN_DETAIL_NR,
 };
@@ -4142,6 +4142,12 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 		cpp_flags |= PP_CHUNK_MODE;
 	if (dsa_strict)
 		cpp_flags |= PP_DSA_SINGLE_PIPE;
+	/* The binary trace already records packing/publication. Do not issue a
+	 * formatted log write for every new IOV during an instrumented scan.
+	 * Keep ordinary CRIU, off/profile and explicit deep debugging unchanged. */
+	if (dsa_desc_scan_active && dsa_sc.scan_profile &&
+	    !dsa_env_enabled("CRIU_DSA_IOV_DEBUG"))
+		cpp_flags |= PP_QUIET_IOV;
 	{
 		struct iovec *pp_iovs = mdc->lazy ? NULL : pargs_iovs(args);
 
