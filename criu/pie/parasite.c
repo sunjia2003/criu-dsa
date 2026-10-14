@@ -2100,6 +2100,7 @@ static int dsa_stream_consume_hw_runway(
 	while (1) {
 		u32 produced;
 		u32 blocked = 0;
+		u32 active_children = 0;
 		bool finished;
 		bool progressed = false;
 
@@ -2115,6 +2116,7 @@ static int dsa_stream_consume_hw_runway(
 			if (!dsa_raw_stream_batches[i].active)
 				continue;
 			if (!dsa_raw_stream_batch_ready(i)) {
+				active_children += dsa_raw_stream_batches[i].child_count;
 				if (++dsa_raw_stream_batches[i].poll_count >= 1000000U) {
 					a->failed_idx = i;
 					a->op_ret = -ETIMEDOUT;
@@ -2142,6 +2144,8 @@ static int dsa_stream_consume_hw_runway(
 			}
 			if (rc > 0)
 				progressed = true;
+			if (dsa_raw_stream_batches[i].active)
+				active_children += dsa_raw_stream_batches[i].child_count;
 		}
 		while (retire_seq < accept_seq) {
 			u32 slot_idx = retire_seq % hdr->slot_count;
@@ -2176,21 +2180,18 @@ static int dsa_stream_consume_hw_runway(
 				break;
 			}
 			accepted_descs += slot->desc_count;
+			/* Successful intake creates exactly desc_count active children;
+			 * they cannot be harvested until the next outer-loop iteration. */
+			active_children += slot->desc_count;
 			accept_seq++;
 			progressed = true;
 		}
 
 		if (active_outer > a->batch_max_active_outer)
 			a->batch_max_active_outer = active_outer;
-		{
-			u32 active_children = 0;
-			for (i = 0; i < DSA_HW_BATCH_OUTER_DEPTH; i++)
-				if (dsa_raw_stream_batches[i].active)
-					active_children +=
-						dsa_raw_stream_batches[i].child_count;
-			if (active_children > a->batch_max_active_children)
-				a->batch_max_active_children = active_children;
-		}
+		/* Same end-of-iteration occupancy as the former second full scan. */
+		if (active_children > a->batch_max_active_children)
+			a->batch_max_active_children = active_children;
 
 		/* finish is the producer's final release token.  Observe it before
 		 * loading producer_seq, otherwise an old sequence sampled just before
