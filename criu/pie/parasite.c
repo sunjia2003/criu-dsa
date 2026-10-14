@@ -369,6 +369,21 @@ static void dsa_flow_cons_event(u32 kind, u32 seq, u32 id,
 	dsa_flow_push(&dsa_consumer_flow, dsa_flow_now_ns(), kind, seq, id, 0, a, b, c, d, e);
 }
 
+/* Only for the prepare/submit boundary immediately sampled by enter/resume.
+ * There must be no intervening flow observation. Share that sample with the
+ * point record instead of reading the clock again; flow-only mode still
+ * obtains its own sample, and disabled diagnostics obtain none. */
+static void dsa_flow_cons_phase_event(u32 kind, u32 seq, u32 id,
+				     u64 a, u64 b, u64 c, u64 d, u64 e)
+{
+	u64 now;
+
+	if (!dsa_consumer_flow.header)
+		return;
+	now = dsa_pipeline ? dsa_pipeline->last_ns : dsa_flow_now_ns();
+	dsa_flow_push(&dsa_consumer_flow, now, kind, seq, id, 0, a, b, c, d, e);
+}
+
 static void dsa_flow_snapshot(u32 produced, u32 accepted, u32 retired,
 			      u32 active, u32 finished, u32 blocked)
 {
@@ -1520,7 +1535,7 @@ static int dsa_raw_stream_batch_prepare(
 	u64 pipeline_begin = dsa_pipeline ? dsa_pipeline->last_ns : 0;
 	u32 i;
 
-	dsa_flow_cons_event(DSA_FLOW_PREPARE_BEGIN, batch->owner_seq, batch->pipeline.id,
+	dsa_flow_cons_phase_event(DSA_FLOW_PREPARE_BEGIN, batch->owner_seq, batch->pipeline.id,
 		batch->child_count, dsa_copy_batch_bytes[batch_idx], 0, 0, 0);
 	if (!batch->child_count ||
 	    batch->child_count > DSA_HW_BATCH_CHILDREN || !active_wq_count ||
@@ -1585,7 +1600,7 @@ static int dsa_raw_stream_batch_prepare(
 			batch->pipeline.prepare_end_ns = end;
 		}
 	}
-	dsa_flow_cons_event(DSA_FLOW_PREPARE_END, batch->owner_seq, batch->pipeline.id,
+	dsa_flow_cons_phase_event(DSA_FLOW_PREPARE_END, batch->owner_seq, batch->pipeline.id,
 		batch->child_count, bytes, batch->prepared_wq_idx, 0, 0);
 	return 0;
 }
@@ -1606,7 +1621,7 @@ static int dsa_raw_stream_batch_submit_released(
 		return -1;
 	pipeline_parent = dsa_pipeline_enter(DSA_PIPELINE_SUBMIT);
 	pipeline_begin = dsa_pipeline ? dsa_pipeline->last_ns : 0;
-	dsa_flow_cons_event(DSA_FLOW_SUBMIT_BEGIN, batch->owner_seq, batch->pipeline.id,
+	dsa_flow_cons_phase_event(DSA_FLOW_SUBMIT_BEGIN, batch->owner_seq, batch->pipeline.id,
 		batch->child_count, batch->prepared_bytes, batch->prepared_wq_idx,
 		a->batch_enq_retries, a->raw_faults);
 	rc = dsa_submit_copy_desc(
@@ -1625,7 +1640,7 @@ static int dsa_raw_stream_batch_submit_released(
 	}
 	if (rc)
 		return rc;
-	dsa_flow_cons_event(DSA_FLOW_SUBMIT_END, batch->owner_seq, batch->pipeline.id,
+	dsa_flow_cons_phase_event(DSA_FLOW_SUBMIT_END, batch->owner_seq, batch->pipeline.id,
 		batch->child_count, batch->prepared_bytes, batch->prepared_wq_idx,
 		a->batch_enq_retries, a->raw_faults);
 	batch->active = 1;
