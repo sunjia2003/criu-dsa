@@ -1577,6 +1577,12 @@ static bool dsa_env_enabled(const char *name)
 			 !strcasecmp(value, "yes") || !strcasecmp(value, "on"));
 }
 
+static bool dsa_trace_vdso_enabled(void)
+{
+	/* Full-only callers retain an explicit syscall-clock escape hatch. */
+	return !getenv("CRIU_DSA_TRACE_VDSO") || dsa_env_enabled("CRIU_DSA_TRACE_VDSO");
+}
+
 static int dsa_dup_inherited_fd(const char *value, const char *label, int *original_fd)
 {
 	char *end = NULL;
@@ -2607,7 +2613,7 @@ static int dsa_stream_layout_init(struct dsa_desc_scan_ctx *sc)
 		sc->dsa_ctx->pipeline_trace->size : 0;
 	sc->rpc_args.pipeline_flow_bytes = sc->scan_profile && sc->dsa_ctx->pipeline_trace ?
 		sc->dsa_ctx->pipeline_trace->flow_size : 0;
-	if (sc->scan_profile && dsa_env_enabled("CRIU_DSA_TRACE_VDSO") &&
+	if (sc->scan_profile && dsa_trace_vdso_enabled() &&
 	    compel_mode_native(sc->ctl)) {
 		/* Inputs are copied privately before the producer reuses RPC scratch. */
 		sc->rpc_args.trace_vdso_enabled = 1;
@@ -4172,7 +4178,7 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	if (dsa_desc_scan_active) {
 		struct page_pipe_buf *first_ppb;
 
-		if (dsa_sc.scan_profile && dsa_env_enabled("CRIU_DSA_TRACE_VDSO") &&
+		if (dsa_sc.scan_profile && dsa_trace_vdso_enabled() &&
 		    compel_mode_native(ctl)) {
 			list_for_each_entry(vma_area, &vma_area_list->h, list) {
 				VmaEntry *entry = vma_area->e;

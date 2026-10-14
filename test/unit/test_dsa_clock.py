@@ -8,6 +8,39 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class ClockTests(unittest.TestCase):
+    def test_production_default_and_explicit_syscall_escape(self):
+        text=(ROOT/'criu/mem.c').read_text()
+        helper=text[text.index('static bool dsa_env_enabled('):
+                    text.index('static int dsa_dup_inherited_fd(')]
+        code=r'''
+#include <stdbool.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <assert.h>
+__HELPER__
+int main(void) {
+  unsetenv("CRIU_DSA_TRACE_VDSO");
+  assert(dsa_trace_vdso_enabled());
+  const char *disabled[]={"0","off","false","", "invalid"};
+  for (unsigned i=0;i<sizeof(disabled)/sizeof(disabled[0]);i++) {
+    setenv("CRIU_DSA_TRACE_VDSO",disabled[i],1);
+    assert(!dsa_trace_vdso_enabled());
+  }
+  const char *enabled[]={"1","true","YES","on"};
+  for (unsigned i=0;i<sizeof(enabled)/sizeof(enabled[0]);i++) {
+    setenv("CRIU_DSA_TRACE_VDSO",enabled[i],1);
+    assert(dsa_trace_vdso_enabled());
+  }
+  return 0;
+}
+'''.replace('__HELPER__',helper)
+        with tempfile.TemporaryDirectory(prefix='dsa-clock-default-') as temporary:
+            source=Path(temporary)/'default.c';binary=Path(temporary)/'default'
+            source.write_text(code)
+            subprocess.run(['cc','-std=gnu11','-Wall','-Wextra','-Werror',str(source),'-o',str(binary)],check=True)
+            subprocess.run([str(binary)],check=True)
+
     def test_production_brackets_and_runtime_fallback(self):
         code = r'''
 #include <stdint.h>
@@ -81,10 +114,10 @@ int main(void) {
                             '-iquote'+str(ROOT/'criu/include'), str(source), '-o', str(binary)], check=True)
             subprocess.run([str(binary)], check=True)
 
-    def test_vdso_is_explicit_full_only_and_clock_results_are_not_rpc_scratch(self):
+    def test_vdso_is_full_only_and_clock_results_are_not_rpc_scratch(self):
         host=(ROOT/'criu/mem.c').read_text()
         parasite=(ROOT/'criu/pie/parasite.c').read_text()
-        self.assertIn('if (sc->scan_profile && dsa_env_enabled("CRIU_DSA_TRACE_VDSO") &&', host)
+        self.assertIn('if (sc->scan_profile && dsa_trace_vdso_enabled() &&', host)
         self.assertIn('compel_mode_native(sc->ctl)', host)
         self.assertIn('a->trace_vdso_enabled && a->pipeline_trace_bytes && a->profile_enabled', parasite)
         self.assertIn('dsa_memzero(&dsa_trace_clock, sizeof(dsa_trace_clock));', parasite)

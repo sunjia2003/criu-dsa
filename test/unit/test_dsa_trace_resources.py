@@ -22,11 +22,11 @@ typedef uint64_t u64;
 #include "dsa-flow.h"
 '''+declarations+'''
 int main(void) {
-  assert(DSA_HOST_TRACE_BYTES_DEFAULT == 8U*1024U*1024U);
-  assert(DSA_PIPELINE_TRACE_BYTES_DEFAULT == 32U*1024U*1024U);
+  assert(DSA_HOST_TRACE_BYTES_DEFAULT == 1U*1024U*1024U);
+  assert(DSA_PIPELINE_TRACE_BYTES_DEFAULT == 8U*1024U*1024U);
   assert(DSA_FLOW_BYTES_DEFAULT == 32U*1024U*1024U);
-  assert(DSA_PIPELINE_TRACE_BYTES_DEFAULT / sizeof(struct dsa_pipeline_event) == 1048576U);
-  assert(DSA_HOST_TRACE_BYTES_DEFAULT / sizeof(struct dsa_pipeline_event) == 262144U);
+  assert(DSA_PIPELINE_TRACE_BYTES_DEFAULT / sizeof(struct dsa_pipeline_event) == 262144U);
+  assert(DSA_HOST_TRACE_BYTES_DEFAULT / sizeof(struct dsa_pipeline_event) == 32768U);
   assert(DSA_HOST_TRACE_BYTES_DEFAULT < DSA_HOST_TRACE_BYTES_MAX);
   assert(DSA_PIPELINE_TRACE_BYTES_DEFAULT < DSA_PIPELINE_TRACE_BYTES_MAX);
   assert(dsa_flow_layout_valid(DSA_PIPELINE_TRACE_BYTES_DEFAULT+DSA_FLOW_BYTES_DEFAULT,
