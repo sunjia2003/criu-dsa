@@ -18,9 +18,11 @@
 #include "int.h"
 #include "types.h"
 #include <compel/plugins/std/syscall.h>
+#include <compel/plugins/std/string.h>
 #include "linux/mount.h"
 #include "parasite.h"
 #include "dsa-flow.h"
+#include "dsa-clock.h"
 #include "fcntl.h"
 #include "prctl.h"
 #include "common/lock.h"
@@ -84,6 +86,7 @@ static u32 dsa_raw_stream_slot_complete[DSA_STREAM_SLOT_COUNT];
 static struct parasite_dsa_pipeline *dsa_pipeline;
 static struct dsa_pipeline_event *dsa_pipeline_events;
 static struct dsa_flow_buffer dsa_consumer_flow;
+static struct dsa_trace_clock dsa_trace_clock;
 static u32 dsa_flow_last_snapshot[6];
 static int dsa_flow_have_snapshot;
 static int dsa_flow_empty_input;
@@ -224,7 +227,8 @@ static u64 dsa_pipeline_mono_ns(void)
 {
 	struct timespec ts;
 
-	if (sys_clock_gettime(CLOCK_MONOTONIC, &ts))
+	if (dsa_trace_clock.requested ? dsa_clock_read(&dsa_trace_clock, &ts) :
+	    sys_clock_gettime(CLOCK_MONOTONIC, &ts))
 		return 0;
 	return (u64)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
@@ -350,15 +354,16 @@ static void dsa_pipeline_record_batch(struct dsa_raw_stream_batch *batch, u64 ob
 
 static u64 dsa_flow_now_ns(void)
 {
-	struct timespec ts;
+	u64 now;
 
 	if (!dsa_consumer_flow.header)
 		return 0;
-	if (sys_clock_gettime(CLOCK_MONOTONIC, &ts)) {
+	now = dsa_pipeline_mono_ns();
+	if (!now) {
 		dsa_consumer_flow.header->clock_valid = 0;
 		return 0;
 	}
-	return (u64)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+	return now;
 }
 
 static void dsa_flow_cons_event(u32 kind, u32 seq, u32 id,
@@ -2316,6 +2321,36 @@ static int dsa_legacy_single_rpc_consume(struct parasite_dsa_dump_pages_args *a,
  * This function performs bulk copy of memory pages using DSA hardware acceleration
  * to a shared memory buffer managed by CRIU.
  */
+static int dsa_trace_clock_syscall(clockid_t clock, struct timespec *ts)
+{
+	return (int)sys_clock_gettime(clock, ts);
+}
+
+static void dsa_trace_clock_init(struct parasite_dsa_dump_pages_args *a)
+{
+	dsa_trace_clock.fallback = dsa_trace_clock_syscall;
+	dsa_trace_clock.requested = a->trace_vdso_enabled && a->pipeline_trace_bytes && a->profile_enabled;
+#if defined(__x86_64__)
+	if (dsa_trace_clock.requested && a->trace_vdso_base &&
+	    a->trace_vdso_size >= 4096 && a->trace_vdso_size <= 1024U * 1024U) {
+		struct vdso_symtable table = VDSO_SYMTABLE_INIT;
+		u32 i;
+
+		if (vdso_fill_symtable(a->trace_vdso_base, a->trace_vdso_size, &table))
+			return;
+		for (i = 0; i < VDSO_SYMBOL_MAX; i++)
+			if (!std_strncmp(table.symbols[i].name, "__vdso_clock_gettime", 32) &&
+			    table.symbols[i].offset != VDSO_BAD_ADDR &&
+			    table.symbols[i].offset < a->trace_vdso_size) {
+				dsa_clock_fn fn = (void *)(unsigned long)(a->trace_vdso_base + table.symbols[i].offset);
+
+				dsa_clock_try_vdso(&dsa_trace_clock, fn);
+				break;
+			}
+	}
+#endif
+}
+
 static int parasite_dsa_dump_pages(struct parasite_dsa_dump_pages_args *a)
 {
 	struct parasite_dsa_dump_pages_args *orig_args = a;
@@ -2358,6 +2393,7 @@ static int parasite_dsa_dump_pages(struct parasite_dsa_dump_pages_args *a)
 	dsa_pipeline = NULL;
 	dsa_pipeline_events = NULL;
 	dsa_memzero(&dsa_consumer_flow, sizeof(dsa_consumer_flow));
+	dsa_memzero(&dsa_trace_clock, sizeof(dsa_trace_clock));
 	dsa_flow_have_snapshot = 0;
 	dsa_flow_empty_input = 0;
 	/* Error cleanup can precede arena/trace mapping. Never inspect uninitialized
@@ -2448,6 +2484,7 @@ static int parasite_dsa_dump_pages(struct parasite_dsa_dump_pages_args *a)
 		goto out_copy_results;
 	}
 
+	dsa_trace_clock_init(a);
 	if (a->profile_enabled)
 		pipeline_rpc_begin_ns = dsa_pipeline_mono_ns();
 	setup_begin_us = dsa_now_us();
@@ -2856,6 +2893,13 @@ out_cleanup:
 	}
 	dsa_pipeline = NULL;
 	dsa_pipeline_events = NULL;
+	if (dsa_trace_clock.requested)
+		pr_info("DSA_TRACE_CLOCK: version=1 pid=%d requested=%u selected=%u checks=%u errors=%u vdso_reads=%llu syscall_reads=%llu max_bracket_ns=%llu\n",
+			(int)sys_getpid(), dsa_trace_clock.requested, dsa_trace_clock.selected,
+			dsa_trace_clock.checks, dsa_trace_clock.errors,
+			(unsigned long long)dsa_trace_clock.vdso_reads,
+			(unsigned long long)dsa_trace_clock.syscall_reads,
+			(unsigned long long)dsa_trace_clock.max_bracket_ns);
 	return 0;
 }
 

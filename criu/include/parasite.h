@@ -515,6 +515,8 @@ struct parasite_dsa_dump_pages_args {
 	u32 profile_enabled;	/* Collect optional aggregate timing */
 	u32 pipeline_trace_bytes; /* Full-only separate memfd, never raw-arena payload */
 	u32 pipeline_flow_bytes; /* Two single-writer event buffers at the memfd tail */
+	u32 trace_vdso_enabled; /* Full-only clock experiment; shared arena layout unchanged */
+	u64 trace_vdso_base, trace_vdso_size;
 	char wq_paths[DSA_DUMP_MAX_WQ][64];  /* WQ paths or empty if using FD */
 
 	/* Output from PARASITE */

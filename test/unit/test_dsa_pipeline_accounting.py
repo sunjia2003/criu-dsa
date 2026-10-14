@@ -43,6 +43,8 @@ static long sys_clock_gettime(int id, struct timespec *ts) {
     return 0;
 }
 __DECLARATIONS__
+#include "dsa-clock.h"
+static struct dsa_trace_clock dsa_trace_clock;
 static struct parasite_dsa_pipeline *dsa_pipeline;
 static struct dsa_pipeline_event *dsa_pipeline_events;
 __HELPERS__
@@ -179,7 +181,8 @@ int main(int argc, char **argv) {
         directory = pathlib.Path(cls.temporary.name)
         c_file, cls.binary = directory / 'accounting.c', directory / 'accounting'
         c_file.write_text(fixture)
-        subprocess.run(['cc', '-std=gnu11', '-O2', '-Wall', '-Wextra', '-Werror', str(c_file), '-o', str(cls.binary)], check=True)
+        subprocess.run(['cc', '-std=gnu11', '-O2', '-Wall', '-Wextra', '-Werror',
+                        '-iquote'+str(ROOT/'criu/include'), str(c_file), '-o', str(cls.binary)], check=True)
 
     def test_fault_recovery_is_exclusive_and_closes(self):
         subprocess.run([str(self.binary), 'exclusive'], check=True)

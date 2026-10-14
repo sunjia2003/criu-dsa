@@ -2149,6 +2149,7 @@ struct dsa_desc_scan_ctx {
 	u64 stream_descs;
 	bool raw_full_prefault;
 	bool scan_profile;
+	u64 trace_vdso_base, trace_vdso_size;
 	struct dsa_scan_detail detail;
 	u64 scan_pages;
 	u64 scan_dump_pages;
@@ -2606,6 +2607,13 @@ static int dsa_stream_layout_init(struct dsa_desc_scan_ctx *sc)
 		sc->dsa_ctx->pipeline_trace->size : 0;
 	sc->rpc_args.pipeline_flow_bytes = sc->scan_profile && sc->dsa_ctx->pipeline_trace ?
 		sc->dsa_ctx->pipeline_trace->flow_size : 0;
+	if (sc->scan_profile && dsa_env_enabled("CRIU_DSA_TRACE_VDSO") &&
+	    compel_mode_native(sc->ctl)) {
+		/* Inputs are copied privately before the producer reuses RPC scratch. */
+		sc->rpc_args.trace_vdso_enabled = 1;
+		sc->rpc_args.trace_vdso_base = sc->trace_vdso_base;
+		sc->rpc_args.trace_vdso_size = sc->trace_vdso_size;
+	}
 
 	for (j = 0; j < (unsigned int)sc->dsa_ctx->wq_count; j++) {
 		size_t path_len;
@@ -4163,6 +4171,20 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 
 	if (dsa_desc_scan_active) {
 		struct page_pipe_buf *first_ppb;
+
+		if (dsa_sc.scan_profile && dsa_env_enabled("CRIU_DSA_TRACE_VDSO") &&
+		    compel_mode_native(ctl)) {
+			list_for_each_entry(vma_area, &vma_area_list->h, list) {
+				VmaEntry *entry = vma_area->e;
+
+				if (vma_entry_is(entry, VMA_AREA_VDSO) &&
+				    (entry->prot & (PROT_READ | PROT_EXEC)) == (PROT_READ | PROT_EXEC)) {
+					dsa_sc.trace_vdso_base = entry->start;
+					dsa_sc.trace_vdso_size = entry->end - entry->start;
+					break;
+				}
+			}
+		}
 
 		if (list_empty(&pp->bufs)) {
 			ret = -1;

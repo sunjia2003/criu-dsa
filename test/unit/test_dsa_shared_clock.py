@@ -27,6 +27,7 @@ class SharedBoundaryClockTests(unittest.TestCase):
 typedef uint32_t u32;
 typedef uint64_t u64;
 #include "dsa-flow.h"
+#include "dsa-clock.h"
 static u64 fake_ns = 100;
 static unsigned calls;
 static int clock_failed;
@@ -43,6 +44,7 @@ __DECLARATIONS__
 static struct parasite_dsa_pipeline *dsa_pipeline;
 static struct dsa_pipeline_event *dsa_pipeline_events;
 static struct dsa_flow_buffer dsa_consumer_flow;
+static struct dsa_trace_clock dsa_trace_clock;
 __LEDGER__
 __FLOW__
 int main(int argc, char **argv) {
