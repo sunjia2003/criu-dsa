@@ -40,3 +40,5 @@ workspace/*
 *.img
 *.csv
 *.png
+/scripts/host_scan_fixture
+/scripts/host_scan_criu
