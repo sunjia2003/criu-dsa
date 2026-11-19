@@ -14,6 +14,7 @@
 #include <string.h>
 #include <time.h>
 #include <pthread.h>
+#include <sched.h>
 #include <linux/memfd.h>
 #include <linux/idxd.h>
 #include <sys/stat.h>
@@ -56,6 +57,9 @@ static uint64_t restore_now_us(void)
 #include "sk-packet.h"
 #include "files-reg.h"
 #include "pagemap-cache.h"
+#include "dsa-host-scan.h"
+#include "dsa-host-prefetch.h"
+#include "dsa-host-perf.h"
 #include "pagemap.h"
 #include "fault-injection.h"
 #include "prctl.h"
@@ -3911,6 +3915,471 @@ static void dsa_desc_scan_emit_summary(struct dsa_desc_scan_ctx *sc)
 		sc->rpc_args.batch_child_submits);
 }
 
+/* Experimental: read-only classification in workers; one ordered emitter. */
+#define DSA_HOST_SCAN_BYTES (2U * 1024U * 1024U)
+#define DSA_HOST_SCAN_WORKERS 2U
+enum dsa_host_page_action { DSA_HOST_SKIP, DSA_HOST_PARENT, DSA_HOST_COPY };
+struct dsa_host_page {
+	u32 offset, action, flags;
+};
+struct dsa_host_worker {
+	struct dsa_host_job job;
+	pmc_t pmc;
+	bool pmc_ready, has_parent;
+	bool timing, perf;
+	bool affinity_set;
+	int assigned_cpu, observed_cpu;
+	struct pstree_item *item;
+	struct vma_area *vma;
+	u64 start, end, visits, elapsed_us, started_us, finished_us, cpu_us;
+	u64 read_wall_us, read_cpu_us;
+	u64 cycles, instructions, perf_enabled_ns, perf_running_ns;
+	u32 result_count, result_worker;
+	struct dsa_host_page *pages;
+};
+struct dsa_host_scan {
+	u32 count;
+	u32 block_bytes;
+	bool timing, spin, cross_vma, primed;
+	const struct list_head *vma_head, *vma_cursor;
+	u64 next_address, sequence;
+	u64 blocks, pages, result_pages, init_us, worker_us, result_wait_us, emit_us;
+	u64 worker_cpu_us;
+	u32 prefetch_depth;
+	bool pool_parent;
+	u64 task_count;
+	struct dsa_host_task *tasks;
+	struct dsa_host_worker *results;
+	struct dsa_prefetch pool;
+	struct dsa_host_worker workers[DSA_HOST_SCAN_WORKERS];
+};
+struct dsa_host_task {
+	struct vma_area *vma;
+	u64 start, end;
+};
+
+static bool dsa_host_scan_eligible(struct vma_area *vma);
+
+static int dsa_host_scan_plan(struct dsa_host_scan *scan, const struct list_head *head)
+{
+	struct vma_area *vma;
+	u64 sequence = 0;
+	u32 i;
+
+	list_for_each_entry(vma, head, list) {
+		if (dsa_host_scan_eligible(vma) && vma->e->end > vma->e->start)
+			scan->task_count += (vma->e->end - vma->e->start - 1) / scan->block_bytes + 1;
+	}
+	if (scan->task_count > SIZE_MAX / sizeof(*scan->tasks))
+		return -1;
+	if (!scan->task_count)
+		return 0;
+	scan->tasks = xmalloc(scan->task_count * sizeof(*scan->tasks));
+	scan->results = xzalloc(scan->prefetch_depth * sizeof(*scan->results));
+	if (!scan->tasks || !scan->results)
+		return -1;
+	list_for_each_entry(vma, head, list) {
+		u64 address;
+
+		if (!dsa_host_scan_eligible(vma))
+			continue;
+		for (address = vma->e->start; address < vma->e->end;) {
+			struct dsa_host_task *task = &scan->tasks[sequence++];
+			task->vma = vma;
+			task->start = address;
+			task->end = min(address + scan->block_bytes, vma->e->end);
+			address = task->end;
+		}
+	}
+	for (i = 0; i < scan->prefetch_depth; i++) {
+		scan->results[i].pages = xmalloc((scan->block_bytes / PAGE_SIZE) * sizeof(struct dsa_host_page));
+		if (!scan->results[i].pages)
+			return -1;
+	}
+	return 0;
+}
+
+static int dsa_host_classify(void *argument)
+{
+	struct dsa_host_worker *worker = argument;
+	VmaEntry entry = *worker->vma->e;
+	u64 address;
+	u64 begin = worker->timing ? dsa_wall_now_us() : 0;
+	struct timespec cpu_start, cpu_end;
+	struct dsa_host_perf_sample perf_start = {}, perf_end = {};
+
+	if (worker->timing && clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_start))
+		return -1;
+	if (worker->perf && dsa_host_perf_read(&perf_start))
+		return -1;
+	if (!worker->affinity_set && worker->assigned_cpu >= 0) {
+		cpu_set_t cpus;
+		CPU_ZERO(&cpus);
+		CPU_SET(worker->assigned_cpu, &cpus);
+		if (pthread_setaffinity_np(pthread_self(), sizeof(cpus), &cpus))
+			return -1;
+		worker->affinity_set = true;
+	}
+	worker->started_us = begin;
+	entry.start = worker->start;
+	entry.end = worker->end;
+	worker->visits = 0;
+	worker->result_count = 0;
+	if (pmc_fill(&worker->pmc, entry.start, entry.end))
+		return -1;
+	if (worker->timing) {
+		struct timespec now;
+		worker->read_wall_us = dsa_wall_delta_us(begin, dsa_wall_now_us());
+		if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now))
+			return -1;
+		worker->read_cpu_us = ((u64)now.tv_sec * 1000000000ULL + now.tv_nsec -
+			((u64)cpu_start.tv_sec * 1000000000ULL + cpu_start.tv_nsec)) / 1000;
+	}
+	for (address = entry.start; address < entry.end; address += PAGE_SIZE) {
+		struct page_info info = {};
+		struct dsa_host_page *page;
+		bool parent_has_page = false;
+
+		if (should_dump_page(&worker->pmc, &entry, address, &info))
+			return -1;
+		worker->visits++;
+		if (info.next != address) {
+			if (info.next <= address || info.next > entry.end)
+				return -1;
+			address = info.next - PAGE_SIZE;
+			continue;
+		}
+		page = &worker->pages[worker->result_count++];
+		page->offset = (address - entry.start) / PAGE_SIZE;
+		page->flags = 0;
+		if (vma_entry_can_be_lazy(&entry) && !is_stack(worker->item, address))
+			page->flags = PPB_LAZY;
+		if (worker->has_parent)
+			parent_has_page = dsa_parent_coverage_contains_range(&dsa_parent_coverage_prev, address, PAGE_SIZE);
+		page->action = worker->has_parent && page_in_parent(info.softdirty) && parent_has_page ?
+			DSA_HOST_PARENT : DSA_HOST_COPY;
+	}
+	if (worker->timing) {
+		worker->finished_us = dsa_wall_now_us();
+		worker->elapsed_us = dsa_wall_delta_us(begin, worker->finished_us);
+		if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_end))
+			return -1;
+		worker->cpu_us = ((u64)cpu_end.tv_sec * 1000000000ULL + cpu_end.tv_nsec -
+				 ((u64)cpu_start.tv_sec * 1000000000ULL + cpu_start.tv_nsec)) / 1000;
+		worker->observed_cpu = sched_getcpu();
+		if (worker->perf) {
+			if (dsa_host_perf_read(&perf_end))
+				return -1;
+			worker->cycles = perf_end.cycles - perf_start.cycles;
+			worker->instructions = perf_end.instructions - perf_start.instructions;
+			worker->perf_enabled_ns = perf_end.enabled_ns - perf_start.enabled_ns;
+			worker->perf_running_ns = perf_end.running_ns - perf_start.running_ns;
+		}
+	}
+	return 0;
+}
+
+static int dsa_host_prefetch_classify(void *context, unsigned int index, uint64_t sequence, void *data)
+{
+	struct dsa_host_scan *scan = context;
+	struct dsa_host_worker *worker = &scan->workers[index], *result = data;
+	struct dsa_host_task *task = &scan->tasks[sequence];
+	int ret;
+
+	worker->vma = task->vma;
+	worker->start = task->start;
+	worker->end = task->end;
+	worker->has_parent = scan->pool_parent;
+	worker->pages = result->pages;
+	ret = dsa_host_classify(worker);
+	if (ret)
+		return ret;
+	result->vma = worker->vma;
+	result->start = worker->start;
+	result->end = worker->end;
+	result->visits = worker->visits;
+	result->result_count = worker->result_count;
+	result->elapsed_us = worker->elapsed_us;
+	result->started_us = worker->started_us;
+	result->finished_us = worker->finished_us;
+	result->cpu_us = worker->cpu_us;
+	result->observed_cpu = worker->observed_cpu;
+	result->read_wall_us = worker->read_wall_us;
+	result->read_cpu_us = worker->read_cpu_us;
+	result->cycles = worker->cycles;
+	result->instructions = worker->instructions;
+	result->perf_enabled_ns = worker->perf_enabled_ns;
+	result->perf_running_ns = worker->perf_running_ns;
+	result->result_worker = index;
+	return 0;
+}
+
+static int dsa_host_prefetch_start(struct dsa_host_scan *scan, bool parent)
+{
+	void *data[32];
+	u32 i;
+
+	for (i = 0; i < scan->prefetch_depth; i++)
+		data[i] = &scan->results[i];
+	scan->pool_parent = parent;
+	scan->pool.spin_limit = dsa_parse_env_u32("CRIU_DSA_HOST_SCAN_PREFETCH_SPIN_LIMIT", 4096, 1, UINT_MAX);
+	return dsa_prefetch_init(&scan->pool, scan->count, scan->prefetch_depth, scan->task_count,
+				 data, scan, dsa_host_prefetch_classify, scan->spin);
+}
+
+static void dsa_host_scan_fini(struct dsa_host_scan *scan)
+{
+	u32 i;
+
+	if (!scan)
+		return;
+	dsa_prefetch_fini(&scan->pool);
+	/* Join every worker before releasing any shared read-only dependency. */
+	for (i = 0; i < scan->count; i++)
+		dsa_host_job_fini(&scan->workers[i].job);
+	for (i = 0; i < scan->count; i++) {
+		if (scan->workers[i].pmc_ready)
+			pmc_fini(&scan->workers[i].pmc);
+		if (!scan->prefetch_depth)
+			xfree(scan->workers[i].pages);
+	}
+	if (scan->results)
+		for (i = 0; i < scan->prefetch_depth; i++)
+			xfree(scan->results[i].pages);
+	xfree(scan->results);
+	xfree(scan->tasks);
+	xfree(scan);
+}
+
+static int dsa_host_scan_init(struct dsa_host_scan **result, struct pstree_item *item,
+			      const struct list_head *head, u32 count)
+{
+	struct dsa_host_scan *scan;
+	u64 begin;
+	u32 i;
+	int cpus[2] = {-1, -1};
+	const char *affinity = getenv("CRIU_DSA_HOST_SCAN_WORKER_CPUS");
+
+	if (!count)
+		return 0;
+	begin = dsa_wall_now_us();
+	scan = xzalloc(sizeof(*scan));
+	if (!scan)
+		return -1;
+	scan->count = count;
+	if (affinity && *affinity) {
+		char trailing;
+		int parsed = sscanf(affinity, "%d,%d%c", &cpus[0], &cpus[1], &trailing);
+		if (parsed < (int)count || parsed > 2)
+			goto fail;
+		for (i = 0; i < count; i++)
+			if (cpus[i] < 0 || cpus[i] >= CPU_SETSIZE)
+				goto fail;
+	}
+	scan->block_bytes = dsa_parse_env_u32("CRIU_DSA_HOST_SCAN_BLOCK_BYTES",
+		DSA_HOST_SCAN_BYTES, PAGE_SIZE, 64U * 1024U * 1024U);
+	if (scan->block_bytes % PAGE_SIZE) {
+		xfree(scan);
+		return -1;
+	}
+	scan->timing = dsa_env_enabled("CRIU_DSA_HOST_SCAN_TIMING");
+	scan->spin = dsa_env_enabled("CRIU_DSA_HOST_SCAN_SPIN");
+	scan->prefetch_depth = dsa_parse_env_u32("CRIU_DSA_HOST_SCAN_PREFETCH_DEPTH", 0, 0, 32);
+	if (scan->prefetch_depth && scan->prefetch_depth < count)
+		goto fail;
+	scan->cross_vma = dsa_env_enabled("CRIU_DSA_HOST_SCAN_CROSS_VMA");
+	scan->vma_head = head;
+	scan->vma_cursor = head->next;
+	for (i = 0; i < count; i++) {
+		struct dsa_host_worker *worker = &scan->workers[i];
+
+		worker->item = item;
+		worker->assigned_cpu = cpus[i];
+		worker->timing = scan->timing;
+		worker->perf = scan->timing && dsa_env_enabled("CRIU_DSA_HOST_SCAN_PERF");
+		if (!scan->prefetch_depth) {
+			worker->pages = xmalloc((scan->block_bytes / PAGE_SIZE) * sizeof(*worker->pages));
+			if (!worker->pages)
+				goto fail;
+		}
+		if (pmc_init(&worker->pmc, item->pid->real, head, scan->block_bytes))
+			goto fail;
+		worker->pmc_ready = true;
+		if (!scan->prefetch_depth && dsa_host_job_init(&worker->job, dsa_host_classify, worker, scan->spin))
+			goto fail;
+	}
+	if (scan->prefetch_depth && dsa_host_scan_plan(scan, head))
+		goto fail;
+	scan->init_us = dsa_wall_delta_us(begin, dsa_wall_now_us());
+	*result = scan;
+	return 0;
+fail:
+	dsa_host_scan_fini(scan);
+	return -1;
+}
+
+static int dsa_host_scan_assign(struct dsa_host_worker *worker, struct vma_area *vma,
+			       u64 start, bool has_parent, u32 block_bytes)
+{
+	worker->vma = vma;
+	worker->start = start;
+	worker->end = min(start + block_bytes, vma->e->end);
+	worker->has_parent = has_parent;
+	return dsa_host_job_submit(&worker->job);
+}
+
+static bool dsa_host_scan_eligible(struct vma_area *vma);
+
+/* Advance only on the owner thread. Workers see immutable VMA metadata. */
+static int dsa_host_scan_assign_next(struct dsa_host_scan *scan,
+				     struct dsa_host_worker *worker, bool has_parent)
+{
+	while (scan->vma_cursor != scan->vma_head) {
+		struct vma_area *vma = list_entry(scan->vma_cursor, struct vma_area, list);
+		u64 start;
+
+		if (!dsa_host_scan_eligible(vma) || vma->e->start >= vma->e->end) {
+			scan->vma_cursor = scan->vma_cursor->next;
+			continue;
+		}
+		start = max(scan->next_address, vma->e->start);
+		if (dsa_host_scan_assign(worker, vma, start, has_parent, scan->block_bytes))
+			return -1;
+		scan->next_address = worker->end;
+		if (worker->end == vma->e->end)
+			scan->vma_cursor = scan->vma_cursor->next;
+		return 1;
+	}
+	return 0;
+}
+
+static int dsa_host_scan_vma(struct dsa_host_scan *scan, struct vma_area *vma,
+			     struct page_pipe *pp, bool has_parent, struct dsa_desc_scan_ctx *sc)
+{
+	u64 next = vma->e->start, address, sequence = 0;
+	u64 visits = 0, pages[3] = {};
+	u32 i;
+	int ret;
+
+	if (scan->prefetch_depth) {
+		if (!scan->primed && dsa_host_prefetch_start(scan, has_parent))
+			return -1;
+		scan->primed = true;
+	} else if (scan->cross_vma) {
+		if (!scan->primed) {
+			for (i = 0; i < scan->count; i++) {
+				if (dsa_host_scan_assign_next(scan, &scan->workers[i], has_parent) < 0)
+					return -1;
+			}
+			scan->primed = true;
+		}
+	} else {
+		for (i = 0; i < scan->count && next < vma->e->end; i++) {
+			if (dsa_host_scan_assign(&scan->workers[i], vma, next, has_parent, scan->block_bytes))
+				return -1;
+			next = scan->workers[i].end;
+		}
+	}
+	for (address = vma->e->start; address < vma->e->end; sequence++) {
+		u32 worker_index = (scan->cross_vma ? scan->sequence : sequence) % scan->count;
+		struct dsa_host_worker *worker = &scan->workers[worker_index];
+		u64 begin = scan->timing ? dsa_wall_now_us() : 0, emit_begin = 0;
+		u32 index;
+
+		if (scan->prefetch_depth) {
+			void *result;
+			if (dsa_prefetch_wait(&scan->pool, scan->sequence, &result))
+				return -1;
+			worker = result;
+			worker_index = worker->result_worker;
+		} else if (dsa_host_job_wait(&worker->job))
+			return -1;
+		if (worker->vma != vma || worker->start != address)
+			return -1;
+		if (scan->timing) {
+			emit_begin = dsa_wall_now_us();
+			scan->result_wait_us += dsa_wall_delta_us(begin, emit_begin);
+			scan->worker_us += worker->elapsed_us;
+			scan->worker_cpu_us += worker->cpu_us;
+		}
+		sc->scan_pages += worker->visits;
+		visits += worker->visits;
+		for (index = 0; index < worker->result_count; index++) {
+			struct dsa_host_page *page = &worker->pages[index];
+			u64 page_address = worker->start + (u64)page->offset * PAGE_SIZE;
+			int st;
+
+			if (page->action == DSA_HOST_PARENT) {
+				ret = page_pipe_add_hole(pp, page_address, PP_HOLE_PARENT);
+				st = 0;
+			} else if (page->action == DSA_HOST_COPY) {
+				ret = page_pipe_add_page_unbounded(pp, page_address, page->flags);
+				if (!ret)
+					ret = dsa_desc_scan_batch_append(sc, page_address, PAGE_SIZE);
+				st = page->flags & PPB_LAZY && opts.lazy_pages ? 1 : 2;
+			} else
+				return -1;
+			if (ret)
+				return ret;
+			if (!st) {
+				sc->scan_hole_pages++;
+			} else if (st == 1) {
+				sc->scan_lazy_pages++;
+			} else {
+				sc->scan_dump_pages++;
+			}
+			pages[st]++;
+		}
+		address = worker->end;
+		scan->blocks++;
+		scan->pages += (worker->end - worker->start) / PAGE_SIZE;
+		scan->result_pages += worker->result_count;
+		if (scan->timing) {
+			u64 emit_end = dsa_wall_now_us();
+			scan->emit_us += dsa_wall_delta_us(emit_begin, emit_end);
+			/* Opt-in explanatory trace only; excluded from performance cohorts. */
+			pr_info("DSA_HOST_SCAN_BLOCK: worker=%u vma_start=%llu start=%llu end=%llu classify_start_us=%llu classify_end_us=%llu classify_cpu_us=%llu consume_start_us=%llu consume_end_us=%llu worker_cpu=%d sequence=%llu read_wall_us=%llu read_cpu_us=%llu cycles=%llu instructions=%llu perf_enabled_ns=%llu perf_running_ns=%llu\n",
+				worker_index, (unsigned long long)vma->e->start,
+				(unsigned long long)worker->start, (unsigned long long)worker->end,
+				(unsigned long long)worker->started_us,
+				(unsigned long long)worker->finished_us, (unsigned long long)worker->cpu_us,
+				(unsigned long long)emit_begin, (unsigned long long)emit_end,
+				worker->observed_cpu, (unsigned long long)(scan->blocks - 1),
+				(unsigned long long)worker->read_wall_us, (unsigned long long)worker->read_cpu_us,
+				(unsigned long long)worker->cycles, (unsigned long long)worker->instructions,
+				(unsigned long long)worker->perf_enabled_ns, (unsigned long long)worker->perf_running_ns);
+		}
+		if (scan->prefetch_depth) {
+			dsa_prefetch_release(&scan->pool, scan->sequence++);
+			continue;
+		}
+		dsa_host_job_release(&worker->job);
+		if (scan->cross_vma) {
+			scan->sequence++;
+			if (dsa_host_scan_assign_next(scan, worker, has_parent) < 0)
+				return -1;
+		} else if (next < vma->e->end) {
+			if (dsa_host_scan_assign(worker, vma, next, has_parent, scan->block_bytes))
+				return -1;
+			next = worker->end;
+		}
+	}
+	cnt_add(CNT_PAGES_SCANNED, visits);
+	cnt_add(CNT_PAGES_SKIPPED_PARENT, pages[0]);
+	cnt_add(CNT_PAGES_LAZY, pages[1]);
+	cnt_add(CNT_PAGES_WRITTEN, pages[2]);
+	return 0;
+}
+
+static bool dsa_host_scan_eligible(struct vma_area *vma)
+{
+	return vma_area_is_private(vma, kdat.task_size) &&
+		vma_entry_is(vma->e, VMA_AREA_REGULAR) && vma_entry_is(vma->e, VMA_ANON_PRIVATE) &&
+		(vma->e->prot & PROT_READ) && !(vma->e->flags & (MAP_HUGETLB | MAP_DROPPABLE)) &&
+		!should_dump_entire_vma(vma->e) && !vma_entry_is(vma->e, VMA_AREA_VVAR) &&
+		!vma_entry_is(vma->e, VMA_AREA_GUARD);
+}
+
 static int generate_iovs_dsa_desc_scan(struct pstree_item *item,
 				       struct vma_area *vma,
 				       struct page_pipe *pp,
@@ -4007,6 +4476,11 @@ static int generate_vma_iovs_dsa_desc_scan(struct pstree_item *item,
 {
 	u64 vaddr;
 	int ret;
+	bool host_timing = dsa_env_enabled("CRIU_DSA_HOST_SCAN_TIMING");
+	u64 read_begin = 0, read_wall_us = 0, read_cpu_us = 0, loop_begin = 0;
+	struct timespec cpu_begin = {}, cpu_read = {}, cpu_end = {};
+	bool host_perf = host_timing && dsa_env_enabled("CRIU_DSA_HOST_SCAN_PERF");
+	struct dsa_host_perf_sample perf_begin = {}, perf_read = {}, perf_end = {};
 
 	if (!vma_area_is_private(vma, kdat.task_size) && !vma_area_is(vma, VMA_ANON_SHARED))
 		return 0;
@@ -4030,8 +4504,25 @@ static int generate_vma_iovs_dsa_desc_scan(struct pstree_item *item,
 		has_parent = false;
 	}
 
+	if (host_timing) {
+		read_begin = dsa_wall_now_us();
+		if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_begin))
+			return -1;
+		if (host_perf && dsa_host_perf_read(&perf_begin))
+			return -1;
+	}
 	if (pmc_get_map(pmc, vma))
 		return -1;
+	if (host_timing) {
+		read_wall_us = dsa_wall_delta_us(read_begin, dsa_wall_now_us());
+		if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_read))
+			return -1;
+		if (host_perf && dsa_host_perf_read(&perf_read))
+			return -1;
+		read_cpu_us = ((u64)cpu_read.tv_sec * 1000000000ULL + cpu_read.tv_nsec -
+			((u64)cpu_begin.tv_sec * 1000000000ULL + cpu_begin.tv_nsec)) / 1000;
+		loop_begin = dsa_wall_now_us();
+	}
 
 	if (vma_area_is(vma, VMA_ANON_SHARED)) {
 		return add_shmem_area(item->pid->real, vma->e, pmc);
@@ -4040,6 +4531,25 @@ static int generate_vma_iovs_dsa_desc_scan(struct pstree_item *item,
 	vaddr = vma->e->start;
 	ret = generate_iovs_dsa_desc_scan(item, vma, pp, pmc, &vaddr,
 					 has_parent, sc);
+	if (host_timing) {
+		u64 end = dsa_wall_now_us(), loop_cpu;
+		if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_end))
+			return -1;
+		if (host_perf && dsa_host_perf_read(&perf_end))
+			return -1;
+		loop_cpu = ((u64)cpu_end.tv_sec * 1000000000ULL + cpu_end.tv_nsec -
+			((u64)cpu_read.tv_sec * 1000000000ULL + cpu_read.tv_nsec)) / 1000;
+		pr_info("DSA_HOST_SCALAR: vma_start=%llu read_wall_us=%llu read_cpu_us=%llu loop_wall_us=%llu loop_cpu_us=%llu read_cycles=%llu read_instructions=%llu loop_cycles=%llu loop_instructions=%llu perf_enabled_ns=%llu perf_running_ns=%llu\n",
+			(unsigned long long)vma->e->start, (unsigned long long)read_wall_us,
+			(unsigned long long)read_cpu_us, (unsigned long long)dsa_wall_delta_us(loop_begin, end),
+			(unsigned long long)loop_cpu,
+			(unsigned long long)(perf_read.cycles - perf_begin.cycles),
+			(unsigned long long)(perf_read.instructions - perf_begin.instructions),
+			(unsigned long long)(perf_end.cycles - perf_read.cycles),
+			(unsigned long long)(perf_end.instructions - perf_read.instructions),
+			(unsigned long long)(perf_end.enabled_ns - perf_begin.enabled_ns),
+			(unsigned long long)(perf_end.running_ns - perf_begin.running_ns));
+	}
 
 	if (ret == -EAGAIN) {
 		pr_err("DSA desc-scan got unexpected EAGAIN\n");
@@ -4070,6 +4580,7 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	bool dsa_desc_scan_ready = false;
 	bool dsa_ctx_deferred = false;
 	struct dsa_dump_ctx *dsa_ctx = NULL;
+	struct dsa_host_scan *host_scan = NULL;
 	struct dsa_desc_scan_ctx dsa_sc = {
 		.dsa_pipe_fd = -1,
 		.scan_profile = dsa_scan_profile_enabled(),
@@ -4326,6 +4837,11 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 		has_parent = !!xfer.parent && !possible_pid_reuse;
 	if (mdc->parent_ie)
 		parent_predump_mode = mdc->parent_ie->pre_dump_mode;
+	if (dsa_desc_scan_active && dsa_host_scan_init(&host_scan, item, &vma_area_list->h,
+			dsa_parse_env_u32("CRIU_DSA_HOST_SCAN_THREADS", 0, 0, DSA_HOST_SCAN_WORKERS))) {
+		ret = -1;
+		goto out_xfer;
+	}
 
 	memdump_timeline_switch(timeline, MEMDUMP_PHASE_SCAN_BUILD);
 	if (dsa_desc_scan_active)
@@ -4336,7 +4852,9 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 		if (vma_area_is(vma_area, VMA_AREA_GUARD))
 			continue;
 
-		if (dsa_desc_scan_active)
+		if (host_scan && dsa_host_scan_eligible(vma_area))
+			ret = dsa_host_scan_vma(host_scan, vma_area, pp, has_parent, &dsa_sc);
+		else if (dsa_desc_scan_active)
 			ret = generate_vma_iovs_dsa_desc_scan(item, vma_area, pp,
 						      &pmc, has_parent,
 						      mdc->pre_dump,
@@ -4354,6 +4872,18 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 		dsa_scan_detail_end(&dsa_sc);
 		scan_build_us = dsa_wall_delta_us(scan_build_start_us, dsa_wall_now_us());
 		dsa_sc.scan_wall_us = scan_build_us;
+	}
+	if (host_scan) {
+		pr_info("DSA_HOST_SCAN: version=9 workers=%u block_bytes=%u blocks=%llu pages=%llu result_pages=%llu init_us=%llu scan_build_us=%llu timing=%u worker_us=%llu result_wait_us=%llu emit_us=%llu spin=%u cross_vma=%u prefetch_depth=%u worker_cpu_us=%llu spin_limit=%u\n",
+			host_scan->count, host_scan->block_bytes, (unsigned long long)host_scan->blocks,
+			(unsigned long long)host_scan->pages, (unsigned long long)host_scan->result_pages,
+			(unsigned long long)host_scan->init_us,
+			(unsigned long long)scan_build_us, host_scan->timing,
+			(unsigned long long)host_scan->worker_us, (unsigned long long)host_scan->result_wait_us,
+			(unsigned long long)host_scan->emit_us, host_scan->spin, host_scan->cross_vma,
+			host_scan->prefetch_depth, (unsigned long long)host_scan->worker_cpu_us, host_scan->pool.spin_limit);
+		dsa_host_scan_fini(host_scan);
+		host_scan = NULL;
 	}
 
 	if (dsa_desc_scan_active && dsa_desc_scan_ready) {
@@ -4532,6 +5062,8 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 
 	/* Success path intentionally keeps async writer running. */
 out_xfer:
+	dsa_host_scan_fini(host_scan);
+	host_scan = NULL;
 	memdump_timeline_switch(timeline, MEMDUMP_PHASE_CLEANUP);
 	if (ret && async_started) {
 		int wait_ret;

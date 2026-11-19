@@ -43,6 +43,7 @@
 #include "memfd.h"
 #include "hugetlb.h"
 #include "pidfd.h"
+#include "smaps-prefetch.h"
 
 #include "protobuf.h"
 #include "images/fdinfo.pb-c.h"
@@ -816,15 +817,25 @@ int parse_smaps(pid_t pid, struct vm_area_list *vma_area_list, dump_filemap_t du
 
 	DIR *map_files_dir = NULL;
 	struct bfd f;
+	char *prefetched = NULL, *next = NULL, *input_end = NULL;
+	size_t prefetched_length = 0;
+	int input_status;
 
 	vm_area_list_init(vma_area_list);
 
-	f.fd = open_proc(pid, "smaps");
-	if (f.fd < 0)
+	input_status = smaps_prefetch_take(pid, &prefetched, &prefetched_length);
+	if (input_status < 0)
 		goto err_n;
-
-	if (bfdopenr(&f))
-		goto err_n;
+	if (input_status) {
+		next = prefetched;
+		input_end = prefetched + prefetched_length;
+	} else {
+		f.fd = open_proc(pid, "smaps");
+		if (f.fd < 0)
+			goto err_n;
+		if (bfdopenr(&f))
+			goto err_n;
+	}
 
 	map_files_dir = opendir_proc(pid, "map_files");
 	if (!map_files_dir) /* old kernel? */
@@ -835,7 +846,22 @@ int parse_smaps(pid_t pid, struct vm_area_list *vma_area_list, dump_filemap_t du
 		bool eof;
 		char *str;
 
-		str = breadline(&f);
+		if (prefetched) {
+			char *newline;
+
+			str = next < input_end ? next : NULL;
+			if (str) {
+				newline = memchr(next, '\n', input_end - next);
+				if (newline) {
+					*newline = '\0';
+					next = newline + 1;
+				} else {
+					next = input_end;
+				}
+			}
+		} else {
+			str = breadline(&f);
+		}
 		if (IS_ERR(str))
 			goto err;
 		eof = (str == NULL);
@@ -919,8 +945,10 @@ int parse_smaps(pid_t pid, struct vm_area_list *vma_area_list, dump_filemap_t du
 	ret = 0;
 
 err:
-	bclose(&f);
+	if (!prefetched)
+		bclose(&f);
 err_n:
+	free(prefetched);
 	close_safe(&vm_file_fd);
 	if (map_files_dir)
 		closedir(map_files_dir);
