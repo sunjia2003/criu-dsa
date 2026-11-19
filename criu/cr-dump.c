@@ -44,6 +44,7 @@
 #include "namespaces.h"
 #include "image.h"
 #include "proc_parse.h"
+#include "smaps-prefetch.h"
 #include "parasite.h"
 #include "parasite-syscall.h"
 #include "compel/ptrace.h"
@@ -2533,6 +2534,9 @@ static int cr_dump_finish(int ret)
 {
 	int post_dump_ret = 0;
 	bool dsa_live_mode = dsa_live_dump_active();
+
+	if (smaps_prefetch_cleanup())
+		ret = -1;
 
 	frozen_timeline_switch(FROZEN_PHASE_FINISH_PRE_UNFREEZE);
 

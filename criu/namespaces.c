@@ -28,6 +28,7 @@
 #include "cgroup.h"
 #include "fdstore.h"
 #include "kerndat.h"
+#include "smaps-prefetch.h"
 #include "util-caps.h"
 #include "filesystems.h"
 
@@ -1671,7 +1672,10 @@ int collect_namespaces(bool for_dump)
 	if (ret < 0)
 		return ret;
 
+	if (for_dump && smaps_prefetch_start())
+		return -1;
 	ret = collect_net_namespaces(for_dump);
+	smaps_prefetch_network_done();
 	if (ret < 0)
 		return ret;
 
